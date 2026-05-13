@@ -114,6 +114,18 @@ const owner = ac.newRole({
   ...adminAc.statements,
 }) as Role;
 
+// Better Auth's organization plugin defaults new members to role "member".
+// Without an explicit mapping here, those rows resolve to zero permissions
+// and every UI page throws `Access denied to: ...`. We mirror `user` for
+// now — the three explicit roles above already share wildcard access, so
+// `member` joining them keeps the runtime contract consistent. A narrower
+// member role (read-only on most resources, write on their own per-user
+// connection tokens) is a separate task.
+const member = ac.newRole({
+  self: ["*"],
+  ...adminAc.statements,
+}) as Role;
+
 const scopes = Object.values(getToolsByCategory())
   .map((tool) => tool.map((t) => `self:${t.name}`))
   .flat();
@@ -229,6 +241,7 @@ const plugins = [
       user,
       admin,
       owner,
+      member,
     },
     sendInvitationEmail,
   }),
