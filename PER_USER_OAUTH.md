@@ -244,7 +244,33 @@ Missing:
 
 ---
 
-### 10. Documentation in `apps/docs/`
+### 10. Roles UI: editing a builtin role 400s with `THAT_ROLE_NAME_IS_ALREADY_TAKEN`
+
+Pre-existing bug, not introduced here, but surfaces during the same QA
+flow so it's tracked next to it. Steps to reproduce: navigate to
+`/<org>/settings/roles?role=builtin-user`, change any permission,
+click Save.
+
+Root cause: when the user first edits a built-in role,
+`org-role-detail.tsx:1353-1357` calls
+`orgAuth.organization.createRole({ role: formData.role.slug, ... })` to
+materialise a custom version in the DB. The slug (`user`, `admin`,
+`owner`, and now `member`) is already in the static `roles: {}` map in
+`apps/mesh/src/auth/index.ts`, so Better Auth's Dynamic Access Control
+rejects the create with
+`[Dynamic Access Control] The role name "X" is already taken by a
+pre-defined role`.
+
+Workaround: create a brand-new custom role with a different slug
+instead of editing the built-in.
+
+Proper fix options:
+- The UI namespaces the shadow row (e.g. `user@<orgId>` or
+  `user-custom`) on first edit, then merges static + custom on read.
+- Or remove the builtins from the static config entirely and bootstrap
+  them in the DB on first org creation, letting Dynamic AC own them.
+
+### 11. Documentation in `apps/docs/`
 
 The Studio docs site (`apps/docs/`) doesn't mention per-user
 connections. When the feature lands, add a page covering:
