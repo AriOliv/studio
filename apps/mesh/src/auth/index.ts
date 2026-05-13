@@ -31,6 +31,7 @@ import {
 import {
   adminAc,
   defaultStatements,
+  memberAc,
 } from "@decocms/better-auth/plugins/organization/access";
 
 import { getConfig } from "@/core/config";
@@ -116,14 +117,34 @@ const owner = ac.newRole({
 
 // Better Auth's organization plugin defaults new members to role "member".
 // Without an explicit mapping here, those rows resolve to zero permissions
-// and every UI page throws `Access denied to: ...`. We mirror `user` for
-// now — the three explicit roles above already share wildcard access, so
-// `member` joining them keeps the runtime contract consistent. A narrower
-// member role (read-only on most resources, write on their own per-user
-// connection tokens) is a separate task.
+// and every UI page throws `Access denied to: ...`. We give members a
+// narrow, principle-of-least-privilege scope: only the read tools needed
+// to navigate the org and the write tools needed to manage their own
+// per-user OAuth tokens. They must NOT be able to mutate connections,
+// change other members' roles, or escalate to admin (which they could do
+// if we'd just mirrored `user`/`admin`/`owner`'s wildcard).
+//
+// Organization-level perms come from better-auth's `memberAc` (read-only:
+// list members, read org, etc — no role/member/invitation mutations).
 const member = ac.newRole({
-  self: ["*"],
-  ...adminAc.statements,
+  self: [
+    // Discovery — see the catalog of connections and virtual MCPs.
+    "COLLECTION_CONNECTIONS_LIST",
+    "COLLECTION_CONNECTIONS_GET",
+    "COLLECTION_VIRTUAL_MCP_LIST",
+    "COLLECTION_VIRTUAL_MCP_GET",
+    // Own-account management.
+    "ORGANIZATION_LIST",
+    "ORGANIZATION_GET",
+    "ORGANIZATION_MEMBER_LIST",
+    "API_KEY_CREATE",
+    "API_KEY_LIST",
+  ],
+  // Note: per-user OAuth token write/read goes through the
+  // `/oauth-token` REST routes, not MCP tools. Those routes already
+  // scope every query by `userId = ctx.auth.user.id`, so a member can
+  // only touch their OWN row — no `self:` permission needed.
+  ...memberAc.statements,
 }) as Role;
 
 const scopes = Object.values(getToolsByCategory())
