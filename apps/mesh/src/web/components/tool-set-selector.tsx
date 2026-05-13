@@ -188,6 +188,10 @@ export function ToolSetSelector({
     limit: PAGE_SIZE,
     offset: 0,
     ...(includeVirtual && { include_virtual: true }),
+    // Tool selector renders one checkbox per downstream tool, so the
+    // server has to populate `connection.tools` (which is null by
+    // default to keep plain navigation lists cheap).
+    include_tools: true,
   };
   const argsKey = JSON.stringify(toolArguments);
 
@@ -213,6 +217,7 @@ export function ToolSetSelector({
           limit: PAGE_SIZE,
           offset: pageParam,
           ...(includeVirtual && { include_virtual: true }),
+          include_tools: true,
         },
       });
       return result.structuredContent as CollectionListOutput<ConnectionEntity>;
