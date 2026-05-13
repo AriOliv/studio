@@ -35,7 +35,7 @@ export async function buildCloneInfo(
   vault: CredentialVault,
 ): Promise<GitHubCloneInfo> {
   const tokenStorage = new DownstreamTokenStorage(db, vault);
-  const token = await tokenStorage.get(connectionId);
+  const token = await tokenStorage.get(connectionId, null);
   if (!token) {
     throw new Error(
       "No GitHub token found. Ensure the mcp-github connection is authenticated.",

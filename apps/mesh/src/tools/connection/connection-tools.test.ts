@@ -186,6 +186,7 @@ describe("Connection Tools", () => {
       const tokenStorage = new DownstreamTokenStorage(database.db, vault);
       await tokenStorage.upsert({
         connectionId: connection.id,
+        userId: null,
         accessToken: "oauth-access-token",
         refreshToken: null,
         scope: null,

@@ -114,6 +114,7 @@ describe("MCP Proxy null-org bypass", () => {
         title: "Victim Connection",
         connection_type: "HTTP",
         connection_url: "https://example.com/mcp",
+        auth_mode: "shared",
         status: "active",
         pinned: false,
         created_at: now,

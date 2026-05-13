@@ -39,12 +39,13 @@ export async function refreshAndStore(
     // must not nuke the user's auth — that turns every blip in the upstream
     // OAuth server into a forced manual reconnect.
     if (result.permanent === true) {
-      await tokenStorage.delete(token.connectionId);
+      await tokenStorage.delete(token.connectionId, token.userId);
     }
     return null;
   }
   await tokenStorage.upsert({
     connectionId: token.connectionId,
+    userId: token.userId,
     accessToken: result.accessToken,
     refreshToken: result.refreshToken ?? token.refreshToken,
     scope: result.scope ?? token.scope,

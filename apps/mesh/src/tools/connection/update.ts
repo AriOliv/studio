@@ -235,7 +235,9 @@ export const COLLECTION_CONNECTIONS_UPDATE = defineTool({
     if (!tokenForToolFetch) {
       try {
         const tokenStorage = new DownstreamTokenStorage(ctx.db, ctx.vault);
-        const cachedToken = await tokenStorage.get(id);
+        // Tool-discovery probe: use the shared token regardless of auth_mode.
+        // Per-user tokens are only resolved at proxy time (see headers.ts).
+        const cachedToken = await tokenStorage.get(id, null);
         if (cachedToken?.accessToken) {
           tokenForToolFetch = cachedToken.accessToken;
         }

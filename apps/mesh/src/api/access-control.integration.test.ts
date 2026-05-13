@@ -256,6 +256,7 @@ describe("Access Control Integration Tests", () => {
         connection_token: null,
         connection_headers: null,
         oauth_config: null,
+        auth_mode: "shared",
         metadata: null,
         bindings: null,
         status: "active",

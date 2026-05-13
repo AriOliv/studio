@@ -12,6 +12,10 @@
  */
 
 import { clientFromConnection, serverFromConnection } from "@/mcp-clients";
+import {
+  isPerUserAuthorizationRequiredError,
+  renderPerUserAuthorizationRequired,
+} from "@/mcp-clients/outbound/errors";
 import { SpanStatusCode } from "@opentelemetry/api";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { Context, Hono } from "hono";
@@ -31,6 +35,12 @@ type Variables = {
 type ProxyEnv = { Variables: Variables };
 
 const handleError = (err: Error, c: Context) => {
+  // Per-user OAuth: the caller hasn't authorised their own account yet for
+  // this connection. Surface a 401 with an actionable URL so clients can
+  // show "Connect your <provider>" instead of a generic 500.
+  if (isPerUserAuthorizationRequiredError(err)) {
+    return renderPerUserAuthorizationRequired(err);
+  }
   if (err.message.includes("not found")) {
     return c.json({ error: err.message }, 404);
   }

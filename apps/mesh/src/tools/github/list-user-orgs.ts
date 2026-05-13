@@ -40,7 +40,7 @@ export const GITHUB_LIST_USER_ORGS = defineTool({
     await ctx.access.check();
 
     const tokenStorage = new DownstreamTokenStorage(ctx.db, ctx.vault);
-    let token = await tokenStorage.get(input.connectionId);
+    let token = await tokenStorage.get(input.connectionId, null);
     if (!token) {
       throw new Error(
         "No GitHub token found. Ensure the mcp-github connection is authenticated.",
@@ -60,7 +60,7 @@ export const GITHUB_LIST_USER_ORGS = defineTool({
         throw new Error(RECONNECT_ERROR);
       }
       accessToken = refreshed;
-      token = (await tokenStorage.get(input.connectionId)) ?? token;
+      token = (await tokenStorage.get(input.connectionId, null)) ?? token;
     }
 
     const installations: Array<{
@@ -97,7 +97,7 @@ export const GITHUB_LIST_USER_ORGS = defineTool({
       // only deletes on a definitive `400 invalid_grant`. Transient OAuth
       // failures leave the row intact so a later request can recover.
       if (res.status === 401) {
-        const current = await tokenStorage.get(input.connectionId);
+        const current = await tokenStorage.get(input.connectionId, null);
         if (!current || !canRefresh(current)) {
           throw new Error(RECONNECT_ERROR);
         }

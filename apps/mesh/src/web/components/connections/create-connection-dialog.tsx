@@ -31,6 +31,7 @@ import {
   FormMessage,
 } from "@deco/ui/components/form.tsx";
 import { Input } from "@deco/ui/components/input.tsx";
+import { Switch } from "@deco/ui/components/switch.tsx";
 import {
   Select,
   SelectContent,
@@ -102,6 +103,7 @@ export function CreateConnectionDialog({
       stdio_args: "",
       stdio_cwd: "",
       env_vars: [],
+      auth_mode: "shared",
     },
   });
 
@@ -262,6 +264,7 @@ export function CreateConnectionDialog({
         app_id: null,
         connection_headers: connectionParameters,
         oauth_config: null,
+        auth_mode: data.auth_mode,
         configuration_state: null,
         metadata: null,
         tools: null,
@@ -549,6 +552,32 @@ export function CreateConnectionDialog({
               <Input placeholder="My Connection" {...field} />
             </FormControl>
             <FormMessage />
+          </FormItem>
+        )}
+      />
+
+      <FormField
+        control={form.control}
+        name="auth_mode"
+        render={({ field }) => (
+          <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+            <div className="space-y-0.5 pr-4">
+              <FormLabel className="text-sm">Per-user authentication</FormLabel>
+              <p className="text-xs text-muted-foreground">
+                When enabled, each member of your org authorises this connection
+                with their own account. Audit logs at the provider show the real
+                person acting. Disable to share a single org-wide token
+                (admin-managed).
+              </p>
+            </div>
+            <FormControl>
+              <Switch
+                checked={field.value === "per_user"}
+                onCheckedChange={(checked) =>
+                  field.onChange(checked ? "per_user" : "shared")
+                }
+              />
+            </FormControl>
           </FormItem>
         )}
       />

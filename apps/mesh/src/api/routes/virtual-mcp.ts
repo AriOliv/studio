@@ -20,6 +20,10 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { Hono } from "hono";
 import type { MeshContext } from "../../core/mesh-context";
 import { MCP_TOOL_CALL_TIMEOUT_MS } from "@/core/constants";
+import {
+  isPerUserAuthorizationRequiredError,
+  renderPerUserAuthorizationRequired,
+} from "../../mcp-clients/outbound/errors";
 import { createVirtualClientFrom } from "../../mcp-clients/virtual-mcp";
 import type { Env } from "../hono-env";
 import { guardResponseStream } from "../utils/stream-guard";
@@ -200,6 +204,11 @@ export async function handleVirtualMcpRequest(
     );
   } catch (error) {
     const err = error as Error;
+    // Per-user OAuth: a tool in the aggregated set requires the caller to
+    // authorise their own account first. Bubble the actionable 401 up.
+    if (isPerUserAuthorizationRequiredError(err)) {
+      return renderPerUserAuthorizationRequired(err);
+    }
     console.error("[virtual-mcp] Error handling virtual MCP request:", err);
     return c.json(
       { error: "Internal server error", message: err.message },

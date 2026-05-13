@@ -80,6 +80,7 @@ const mockTokenGet = mock(
   async (_connectionId: string): Promise<DownstreamToken | null> => ({
     id: "dtok_1",
     connectionId: "conn_github_1",
+    userId: null,
     accessToken: "ghu_test_token_123",
     refreshToken: null,
     scope: null,
@@ -97,11 +98,11 @@ const mockTokenDelete = mock(async (_connectionId: string) => {});
 
 mock.module("../../storage/downstream-token", () => ({
   DownstreamTokenStorage: class MockDownstreamTokenStorage extends RealDownstreamTokenStorage {
-    override async get(connectionId: string) {
+    override async get(connectionId: string, userId: string | null) {
       if (connectionId === "conn_github_1") {
         return mockTokenGet(connectionId);
       }
-      return super.get(connectionId);
+      return super.get(connectionId, userId);
     }
     override async upsert(data: DownstreamTokenData) {
       if (data.connectionId === "conn_github_1") {
@@ -109,6 +110,7 @@ mock.module("../../storage/downstream-token", () => ({
         return {
           id: "dtok_1",
           connectionId: data.connectionId,
+          userId: data.userId,
           accessToken: data.accessToken,
           refreshToken: data.refreshToken,
           scope: data.scope,
@@ -122,12 +124,12 @@ mock.module("../../storage/downstream-token", () => ({
       }
       return super.upsert(data);
     }
-    override async delete(connectionId: string) {
+    override async delete(connectionId: string, userId: string | null) {
       if (connectionId === "conn_github_1") {
         await mockTokenDelete(connectionId);
         return;
       }
-      return super.delete(connectionId);
+      return super.delete(connectionId, userId);
     }
   },
 }));
@@ -276,6 +278,7 @@ describe("VM_START", () => {
     mockTokenGet.mockImplementation(async () => ({
       id: "dtok_1",
       connectionId: "conn_github_1",
+      userId: null,
       accessToken: "ghu_test_token_123",
       refreshToken: null,
       scope: null,
@@ -501,6 +504,7 @@ describe("VM_START", () => {
     mockTokenGet.mockImplementation(async () => ({
       id: "dtok_1",
       connectionId: "conn_github_1",
+      userId: null,
       accessToken: "ghu_stale_token",
       refreshToken: "ghr_refresh_123",
       scope: "repo",
@@ -646,6 +650,7 @@ describe("VM_START", () => {
     mockTokenGet.mockImplementation(async () => ({
       id: "dtok_1",
       connectionId: "conn_github_1",
+      userId: null,
       accessToken: "ghu_stale_token",
       refreshToken: "ghr_refresh_123",
       scope: "repo",

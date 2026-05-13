@@ -1302,6 +1302,7 @@ function OrgMcpsContent() {
       stdio_args: "",
       stdio_cwd: "",
       env_vars: [],
+      auth_mode: "shared",
     },
   });
 

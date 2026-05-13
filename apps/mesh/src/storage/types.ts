@@ -199,6 +199,12 @@ export interface MCPConnectionTable {
   // OAuth config for downstream MCP (if MCP supports OAuth)
   oauth_config: JsonObject<OAuthConfig> | null;
 
+  // Authentication mode:
+  //   - "shared":  one downstream token shared across the org (legacy).
+  //   - "per_user": each member authorises with their own account; tokens
+  //                  are keyed by (connection_id, user_id).
+  auth_mode: "shared" | "per_user";
+
   // Configuration state (for MESH_CONFIGURATION feature)
   configuration_state: string | null; // Encrypted JSON state
   configuration_scopes: JsonArray<string[]> | null; // Array of scope strings
@@ -338,11 +344,16 @@ export interface OAuthRefreshTokenTable {
 }
 
 /**
- * Downstream Token table definition - Cache tokens from downstream MCPs
+ * Downstream Token table definition - Cache tokens from downstream MCPs.
+ *
+ * Uniqueness is enforced by two partial indexes:
+ *   - one row per connection where userId IS NULL  (shared / org-wide token)
+ *   - one row per (connection, user) where userId IS NOT NULL (per-user token)
  */
 export interface DownstreamTokenTable {
   id: string; // Primary key
-  connectionId: string; // Foreign key (unique - one token per connection)
+  connectionId: string;
+  userId: string | null; // NULL = shared token for the connection
   accessToken: string; // Encrypted
   refreshToken: string | null; // Encrypted
   scope: string | null;
@@ -403,11 +414,15 @@ export interface OAuthRefreshToken {
 }
 
 /**
- * Downstream Token entity - Runtime representation
+ * Downstream Token entity - Runtime representation.
+ *
+ * `userId` is null for tokens shared across the org (legacy / `auth_mode = "shared"`)
+ * and a user id for tokens scoped to a single member (`auth_mode = "per_user"`).
  */
 export interface DownstreamToken {
   id: string;
   connectionId: string;
+  userId: string | null;
   accessToken: string;
   refreshToken: string | null;
   scope: string | null;

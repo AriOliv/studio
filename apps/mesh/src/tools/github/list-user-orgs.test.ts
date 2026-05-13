@@ -192,7 +192,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
   beforeEach(async () => {
     fetchCalls = [];
     mockRefreshAccessToken.mockReset();
-    await tokenStorage.delete(connectionId);
+    await tokenStorage.delete(connectionId, null);
   });
 
   afterEach(() => {
@@ -202,6 +202,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
   it("returns installations on happy path with valid token", async () => {
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "valid-token",
       refreshToken: "rt",
       scope: "repo",
@@ -244,6 +245,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
   it("proactively refreshes an expired token before fetching", async () => {
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "stale-token",
       refreshToken: "rt",
       scope: "repo",
@@ -270,7 +272,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
     expect(fetchCalls).toHaveLength(1);
     expect(fetchCalls[0]?.headers["authorization"]).toBe("Bearer fresh-token");
 
-    const persisted = await tokenStorage.get(connectionId);
+    const persisted = await tokenStorage.get(connectionId, null);
     expect(persisted?.accessToken).toBe("fresh-token");
     expect(persisted?.refreshToken).toBe("rt2");
   });
@@ -278,6 +280,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
   it("deletes the cached token and throws when proactive refresh fails permanently (invalid_grant)", async () => {
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "stale-token",
       refreshToken: "rt",
       scope: "repo",
@@ -301,7 +304,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
       GITHUB_LIST_USER_ORGS.execute({ connectionId }, ctx),
     ).rejects.toThrow(/reconnect/i);
 
-    expect(await tokenStorage.get(connectionId)).toBeNull();
+    expect(await tokenStorage.get(connectionId, null)).toBeNull();
     expect(fetchCalls).toHaveLength(0);
   });
 
@@ -310,6 +313,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
     // wipe the user's auth — the refresh_token might still be valid.
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "stale-token",
       refreshToken: "rt",
       scope: "repo",
@@ -333,7 +337,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
       GITHUB_LIST_USER_ORGS.execute({ connectionId }, ctx),
     ).rejects.toThrow(/reconnect/i);
 
-    const persisted = await tokenStorage.get(connectionId);
+    const persisted = await tokenStorage.get(connectionId, null);
     expect(persisted).not.toBeNull();
     expect(persisted?.refreshToken).toBe("rt");
     expect(fetchCalls).toHaveLength(0);
@@ -342,6 +346,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
   it("reactively refreshes on 401 from GitHub and retries once", async () => {
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "seemingly-valid-token",
       refreshToken: "rt",
       scope: "repo",
@@ -385,7 +390,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
     );
     expect(fetchCalls[1]?.headers["authorization"]).toBe("Bearer fresh-token");
 
-    const persisted = await tokenStorage.get(connectionId);
+    const persisted = await tokenStorage.get(connectionId, null);
     expect(persisted?.accessToken).toBe("fresh-token");
   });
 
@@ -396,6 +401,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
     // error so the user re-OAuths, which will overwrite the row anyway.
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "seemingly-valid-token",
       refreshToken: "rt",
       scope: "repo",
@@ -423,7 +429,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
     ).rejects.toThrow(/reconnect/i);
 
     expect(fetchCalls).toHaveLength(2);
-    const persisted = await tokenStorage.get(connectionId);
+    const persisted = await tokenStorage.get(connectionId, null);
     expect(persisted).not.toBeNull();
     expect(persisted?.accessToken).toBe("fresh-token");
   });
@@ -431,6 +437,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
   it("deletes the token and throws when reactive refresh fails permanently", async () => {
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "seemingly-valid-token",
       refreshToken: "rt",
       scope: "repo",
@@ -455,7 +462,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
     ).rejects.toThrow(/reconnect/i);
 
     expect(fetchCalls).toHaveLength(1);
-    expect(await tokenStorage.get(connectionId)).toBeNull();
+    expect(await tokenStorage.get(connectionId, null)).toBeNull();
   });
 
   it("preserves the cached token when reactive refresh fails transiently", async () => {
@@ -464,6 +471,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
     // be valid — keep it so the next request can try to refresh again.
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "seemingly-valid-token",
       refreshToken: "rt",
       scope: "repo",
@@ -488,7 +496,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
     ).rejects.toThrow(/reconnect/i);
 
     expect(fetchCalls).toHaveLength(1);
-    const persisted = await tokenStorage.get(connectionId);
+    const persisted = await tokenStorage.get(connectionId, null);
     expect(persisted).not.toBeNull();
     expect(persisted?.refreshToken).toBe("rt");
   });
@@ -507,6 +515,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
   it("still propagates non-401 GitHub errors", async () => {
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "valid-token",
       refreshToken: "rt",
       scope: "repo",
@@ -534,6 +543,7 @@ describe("GITHUB_LIST_USER_ORGS", () => {
   it("reactively refreshes on 401 that surfaces on a later page", async () => {
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "seemingly-valid-token",
       refreshToken: "rt",
       scope: "repo",

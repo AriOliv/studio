@@ -3,6 +3,15 @@
  *
  * Handles CRUD operations for downstream MCP OAuth tokens.
  * Supports token caching and refresh for OAuth-enabled MCP connections.
+ *
+ * Tokens are keyed by (connection_id, user_id):
+ *   - `userId = null`   → shared token (one per connection, used when the
+ *                          connection's auth_mode is "shared")
+ *   - `userId = <uuid>` → per-user token (one per (connection, user) pair,
+ *                          used when auth_mode is "per_user")
+ *
+ * The two cases are enforced by partial unique indexes on the database
+ * (see migration 078).
  */
 
 import type { Kysely } from "kysely";
@@ -15,6 +24,8 @@ import { generatePrefixedId } from "@/shared/utils/generate-id";
  */
 export interface DownstreamTokenData {
   connectionId: string;
+  /** Null for shared tokens; user id for per-user tokens. */
+  userId: string | null;
   accessToken: string;
   refreshToken: string | null;
   scope: string | null;
@@ -30,19 +41,29 @@ export interface DownstreamTokenData {
  */
 export interface DownstreamTokenStoragePort {
   /**
-   * Get cached token for a connection
+   * Get the cached token for a (connection, user) pair. Pass `userId = null`
+   * to look up the shared token.
    */
-  get(connectionId: string): Promise<DownstreamToken | null>;
+  get(
+    connectionId: string,
+    userId: string | null,
+  ): Promise<DownstreamToken | null>;
 
   /**
-   * Save or update a token
+   * Save or update a token. Identity is (connectionId, userId).
    */
   upsert(data: DownstreamTokenData): Promise<DownstreamToken>;
 
   /**
-   * Delete token for a connection
+   * Delete the token for a (connection, user) pair.
    */
-  delete(connectionId: string): Promise<void>;
+  delete(connectionId: string, userId: string | null): Promise<void>;
+
+  /**
+   * Delete every token attached to a connection (shared + all per-user
+   * tokens). Used when a connection is removed.
+   */
+  deleteByConnection(connectionId: string): Promise<void>;
 
   /**
    * Check if token is expired or will expire within buffer time
@@ -59,12 +80,20 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
     private vault: CredentialVault,
   ) {}
 
-  async get(connectionId: string): Promise<DownstreamToken | null> {
-    const row = await this.db
+  async get(
+    connectionId: string,
+    userId: string | null,
+  ): Promise<DownstreamToken | null> {
+    const base = this.db
       .selectFrom("downstream_tokens")
       .selectAll()
-      .where("connectionId", "=", connectionId)
-      .executeTakeFirst();
+      .where("connectionId", "=", connectionId);
+
+    const query = userId
+      ? base.where("userId", "=", userId)
+      : base.where("userId", "is", null);
+
+    const row = await query.executeTakeFirst();
 
     if (!row) return null;
 
@@ -85,12 +114,16 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
 
     // Use transaction to prevent race conditions during upsert
     return await this.db.transaction().execute(async (trx) => {
-      // Check for existing token within transaction
-      const existing = await trx
+      // Look up existing token for this (connection, user) pair
+      const existingBase = trx
         .selectFrom("downstream_tokens")
         .select(["id", "createdAt"])
-        .where("connectionId", "=", data.connectionId)
-        .executeTakeFirst();
+        .where("connectionId", "=", data.connectionId);
+
+      const existing = await (data.userId
+        ? existingBase.where("userId", "=", data.userId)
+        : existingBase.where("userId", "is", null)
+      ).executeTakeFirst();
 
       if (existing) {
         // Update existing token
@@ -112,6 +145,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
         return {
           id: existing.id,
           connectionId: data.connectionId,
+          userId: data.userId,
           accessToken: data.accessToken,
           refreshToken: data.refreshToken,
           scope: data.scope,
@@ -132,6 +166,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
         .values({
           id,
           connectionId: data.connectionId,
+          userId: data.userId,
           accessToken: encryptedAccessToken,
           refreshToken: encryptedRefreshToken,
           scope: data.scope,
@@ -147,6 +182,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
       return {
         id,
         connectionId: data.connectionId,
+        userId: data.userId,
         accessToken: data.accessToken,
         refreshToken: data.refreshToken,
         scope: data.scope,
@@ -160,7 +196,18 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
     });
   }
 
-  async delete(connectionId: string): Promise<void> {
+  async delete(connectionId: string, userId: string | null): Promise<void> {
+    const base = this.db
+      .deleteFrom("downstream_tokens")
+      .where("connectionId", "=", connectionId);
+
+    await (userId
+      ? base.where("userId", "=", userId)
+      : base.where("userId", "is", null)
+    ).execute();
+  }
+
+  async deleteByConnection(connectionId: string): Promise<void> {
     await this.db
       .deleteFrom("downstream_tokens")
       .where("connectionId", "=", connectionId)
@@ -199,6 +246,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
   private async decryptToken(row: {
     id: string;
     connectionId: string;
+    userId: string | null;
     accessToken: string;
     refreshToken: string | null;
     scope: string | null;
@@ -220,6 +268,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
     return {
       id: row.id,
       connectionId: row.connectionId,
+      userId: row.userId,
       accessToken,
       refreshToken,
       scope: row.scope,

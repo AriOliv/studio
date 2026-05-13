@@ -119,6 +119,7 @@ describe("org-scoped API coexistence", () => {
         title: "Test Connection",
         connection_type: "HTTP",
         connection_url: "https://example.test",
+        auth_mode: "shared",
         status: "active",
         pinned: false,
         created_at: now,

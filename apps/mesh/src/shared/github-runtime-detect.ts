@@ -48,7 +48,10 @@ export async function detectRepoRuntime(
   db: Kysely<Database>,
   vault: CredentialVault,
 ): Promise<DetectedRuntime | null> {
-  const token = await new DownstreamTokenStorage(db, vault).get(connectionId);
+  const token = await new DownstreamTokenStorage(db, vault).get(
+    connectionId,
+    null,
+  );
   if (!token) return null;
 
   // Detection runs against the repo's default branch, not the caller's VM

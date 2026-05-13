@@ -62,9 +62,10 @@ describe("refreshAndStore", () => {
 
   beforeEach(async () => {
     mockRefreshAccessToken.mockReset();
-    await tokenStorage.delete(connectionId);
+    await tokenStorage.delete(connectionId, null);
     await tokenStorage.upsert({
       connectionId,
+      userId: null,
       accessToken: "stale",
       refreshToken: "rt",
       scope: "repo",
@@ -84,12 +85,12 @@ describe("refreshAndStore", () => {
       error: "Failed to process token request",
     });
 
-    const token = await tokenStorage.get(connectionId);
+    const token = await tokenStorage.get(connectionId, null);
     expect(token).not.toBeNull();
     const result = await refreshAndStore(token!, tokenStorage);
 
     expect(result).toBeNull();
-    const after = await tokenStorage.get(connectionId);
+    const after = await tokenStorage.get(connectionId, null);
     expect(after).not.toBeNull();
     expect(after?.refreshToken).toBe("rt");
   });
@@ -103,12 +104,12 @@ describe("refreshAndStore", () => {
       error: "refresh token revoked",
     });
 
-    const token = await tokenStorage.get(connectionId);
+    const token = await tokenStorage.get(connectionId, null);
     expect(token).not.toBeNull();
     const result = await refreshAndStore(token!, tokenStorage);
 
     expect(result).toBeNull();
-    expect(await tokenStorage.get(connectionId)).toBeNull();
+    expect(await tokenStorage.get(connectionId, null)).toBeNull();
   });
 
   it("preserves the cached token when refresh result lacks the permanent flag (defensive: legacy callers)", async () => {
@@ -120,11 +121,11 @@ describe("refreshAndStore", () => {
       error: "something broke",
     });
 
-    const token = await tokenStorage.get(connectionId);
+    const token = await tokenStorage.get(connectionId, null);
     const result = await refreshAndStore(token!, tokenStorage);
 
     expect(result).toBeNull();
-    expect(await tokenStorage.get(connectionId)).not.toBeNull();
+    expect(await tokenStorage.get(connectionId, null)).not.toBeNull();
   });
 
   it("stores the refreshed token on success", async () => {
@@ -136,11 +137,11 @@ describe("refreshAndStore", () => {
       scope: "repo",
     });
 
-    const token = await tokenStorage.get(connectionId);
+    const token = await tokenStorage.get(connectionId, null);
     const result = await refreshAndStore(token!, tokenStorage);
 
     expect(result).toBe("fresh");
-    const after = await tokenStorage.get(connectionId);
+    const after = await tokenStorage.get(connectionId, null);
     expect(after?.accessToken).toBe("fresh");
     expect(after?.refreshToken).toBe("rt2");
   });

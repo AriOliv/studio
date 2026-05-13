@@ -9,6 +9,7 @@ export interface ConnectionCardData {
   description?: string | null;
   icon?: string | null;
   status?: "active" | "inactive" | "error";
+  auth_mode?: "shared" | "per_user";
 }
 
 export interface ConnectionCardProps {
@@ -72,9 +73,16 @@ export function ConnectionCard({
 
           {/* Title and Description */}
           <div className="flex flex-col gap-1">
-            <h3 className="text-sm font-medium text-foreground truncate">
-              {connection.title}
-            </h3>
+            <div className="flex items-center gap-2 min-w-0">
+              <h3 className="text-sm font-medium text-foreground truncate">
+                {connection.title}
+              </h3>
+              {connection.auth_mode === "per_user" && (
+                <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Per-user
+                </span>
+              )}
+            </div>
             <p className="text-sm text-muted-foreground line-clamp-2">
               {connection.description || "No description"}
             </p>

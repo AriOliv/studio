@@ -7,11 +7,46 @@ import {
   type ConnectionEntity,
 } from "@decocms/mesh-sdk";
 import { Button } from "@deco/ui/components/button.tsx";
+import { Switch } from "@deco/ui/components/switch.tsx";
 import { Key01, File06, Loading01 } from "@untitledui/icons";
 import { Suspense } from "react";
 import { useWatch, type useForm } from "react-hook-form";
 import { McpConfigurationForm } from "./mcp-configuration-form";
 import type { ConnectionFormData } from "./schema";
+
+/**
+ * Switch that lets an admin flip a connection between "shared" (one
+ * org-wide downstream token) and "per_user" (each member authorises with
+ * their own account). Always shown at the top of the settings tab so the
+ * policy stays visible regardless of auth state.
+ */
+function AuthModeToggle({
+  form,
+}: {
+  form: ReturnType<typeof useForm<ConnectionFormData>>;
+}) {
+  const value = useWatch({ control: form.control, name: "auth_mode" });
+  return (
+    <div className="flex items-start justify-between rounded-lg border p-3 mb-4">
+      <div className="space-y-0.5 pr-4">
+        <div className="text-sm font-medium">Per-user authentication</div>
+        <p className="text-xs text-muted-foreground">
+          When enabled, each member of your org authorises this connection with
+          their own account. Audit logs at the provider show the real person
+          acting. Disable to share a single org-wide token.
+        </p>
+      </div>
+      <Switch
+        checked={value === "per_user"}
+        onCheckedChange={(checked) =>
+          form.setValue("auth_mode", checked ? "per_user" : "shared", {
+            shouldDirty: true,
+          })
+        }
+      />
+    </div>
+  );
+}
 
 interface SettingsTabProps {
   connection: ConnectionEntity;
@@ -59,23 +94,41 @@ function useMcpConfiguration(connectionId: string) {
 interface OAuthAuthenticationStateProps {
   onAuthenticate: () => void | Promise<void>;
   buttonText?: string;
+  isPerUser?: boolean;
+  connectionTitle?: string;
 }
 
 export function OAuthAuthenticationState({
   onAuthenticate,
-  buttonText = "Authenticate",
+  buttonText,
+  isPerUser = false,
+  connectionTitle,
 }: OAuthAuthenticationStateProps) {
+  const headline = isPerUser
+    ? "Connect your account"
+    : "Authentication Required";
+  const description = isPerUser
+    ? `This connection runs each tool call as the member who triggered it. ` +
+      `Authorise with your own ${connectionTitle ?? "provider"} account to start ` +
+      `using these tools — your activity will show up in the provider's audit log under your name.`
+    : "This connection requires OAuth authentication to access resources.";
+  const cta =
+    buttonText ??
+    (isPerUser
+      ? `Connect ${connectionTitle ?? "your account"}`
+      : "Authenticate");
+
   return (
     <div className="flex-1 flex items-center justify-center">
       <div className="flex flex-col items-center gap-4 max-w-md text-center">
         <div className="flex flex-col gap-2">
-          <h3 className="text-sm font-semibold">Authentication Required</h3>
+          <h3 className="text-sm font-semibold">{headline}</h3>
           <p className="text-xs text-muted-foreground max-w-md text-center">
-            This connection requires OAuth authentication to access resources.
+            {description}
           </p>
         </div>
         <Button onClick={onAuthenticate} size="default">
-          {buttonText}
+          {cta}
         </Button>
       </div>
     </div>
@@ -220,7 +273,13 @@ function SettingsTabContent(props: SettingsTabProps) {
       return <ServerErrorState />;
     }
     if (supportsOAuth) {
-      return <OAuthAuthenticationState onAuthenticate={onAuthenticate} />;
+      return (
+        <OAuthAuthenticationState
+          onAuthenticate={onAuthenticate}
+          isPerUser={connection.auth_mode === "per_user"}
+          connectionTitle={connection.title}
+        />
+      );
     }
     return (
       <ManualAuthRequiredState
@@ -272,7 +331,10 @@ function SettingsTabContent(props: SettingsTabProps) {
 
 export function SettingsTab(props: SettingsTabProps) {
   return (
-    <div className="flex-1 flex h-full">
+    <div className="flex-1 flex flex-col h-full">
+      <div className="px-4 pt-4">
+        <AuthModeToggle form={props.form} />
+      </div>
       <SettingsTabContent {...props} />
     </div>
   );

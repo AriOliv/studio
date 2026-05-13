@@ -23,7 +23,7 @@ describe("DownstreamTokenStorage", () => {
 
     // Create test connections required by FK constraints
     const now = new Date().toISOString();
-    for (const connId of ["c1", "conn_atomic"]) {
+    for (const connId of ["c1", "conn_atomic", "conn_dual", "conn_iso"]) {
       await sql`
         INSERT INTO connections (id, organization_id, created_by, title, connection_type, connection_url, status, created_at, updated_at)
         VALUES (${connId}, 'org_test', 'user_test', ${connId}, 'HTTP', 'https://test.com', 'active', ${now}, ${now})
@@ -43,6 +43,7 @@ describe("DownstreamTokenStorage", () => {
     const token = {
       id: "test",
       connectionId: "c1",
+      userId: null,
       accessToken: "at",
       refreshToken: null,
       scope: null,
@@ -63,6 +64,7 @@ describe("DownstreamTokenStorage", () => {
     const token = {
       id: "test",
       connectionId: "c1",
+      userId: null,
       accessToken: "at",
       refreshToken: null,
       scope: null,
@@ -80,9 +82,10 @@ describe("DownstreamTokenStorage", () => {
     expect(storage.isExpired(token, 5 * 60 * 1000)).toBe(true);
   });
 
-  it("should upsert token atomically", async () => {
+  it("should upsert shared token atomically", async () => {
     const data: DownstreamTokenData = {
       connectionId: "conn_atomic",
+      userId: null,
       accessToken: "access_1",
       refreshToken: "refresh_1",
       scope: "scope_1",
@@ -96,6 +99,7 @@ describe("DownstreamTokenStorage", () => {
     const t1 = await storage.upsert(data);
     expect(t1.accessToken).toBe("access_1");
     expect(t1.clientId).toBe("client_1");
+    expect(t1.userId).toBeNull();
 
     // Update
     const data2 = { ...data, accessToken: "access_2", clientId: "client_2" };
@@ -105,11 +109,73 @@ describe("DownstreamTokenStorage", () => {
     expect(t2.accessToken).toBe("access_2");
     expect(t2.clientId).toBe("client_2");
 
-    // Check DB count
+    // Check DB count for this connection — still one shared row
     const count = await database.db
       .selectFrom("downstream_tokens")
       .select(database.db.fn.count("id").as("c"))
+      .where("connectionId", "=", "conn_atomic")
       .executeTakeFirst();
     expect(Number(count?.c)).toBe(1);
+  });
+
+  it("should isolate per-user tokens for the same connection", async () => {
+    const base: Omit<DownstreamTokenData, "userId" | "accessToken"> = {
+      connectionId: "conn_iso",
+      refreshToken: null,
+      scope: null,
+      expiresAt: null,
+      clientId: null,
+      clientSecret: null,
+      tokenEndpoint: null,
+    };
+
+    await storage.upsert({ ...base, userId: "user_1", accessToken: "tok-1" });
+    await storage.upsert({ ...base, userId: "user_123", accessToken: "tok-2" });
+
+    const t1 = await storage.get("conn_iso", "user_1");
+    const t2 = await storage.get("conn_iso", "user_123");
+
+    expect(t1?.accessToken).toBe("tok-1");
+    expect(t2?.accessToken).toBe("tok-2");
+
+    // Looking up a user that never authorised returns null
+    expect(await storage.get("conn_iso", "user_test")).toBeNull();
+    // Shared lookup returns null because we only stored per-user rows
+    expect(await storage.get("conn_iso", null)).toBeNull();
+
+    // Per-user delete leaves the other user's token intact
+    await storage.delete("conn_iso", "user_1");
+    expect(await storage.get("conn_iso", "user_1")).toBeNull();
+    expect(await storage.get("conn_iso", "user_123")).not.toBeNull();
+
+    // deleteByConnection wipes both
+    await storage.deleteByConnection("conn_iso");
+    expect(await storage.get("conn_iso", "user_123")).toBeNull();
+  });
+
+  it("should allow shared and per-user tokens to coexist for the same connection", async () => {
+    const base: Omit<DownstreamTokenData, "userId" | "accessToken"> = {
+      connectionId: "conn_dual",
+      refreshToken: null,
+      scope: null,
+      expiresAt: null,
+      clientId: null,
+      clientSecret: null,
+      tokenEndpoint: null,
+    };
+
+    await storage.upsert({ ...base, userId: null, accessToken: "shared" });
+    await storage.upsert({ ...base, userId: "user_1", accessToken: "ceo" });
+
+    expect((await storage.get("conn_dual", null))?.accessToken).toBe("shared");
+    expect((await storage.get("conn_dual", "user_1"))?.accessToken).toBe("ceo");
+
+    // Two rows total: one shared, one per-user.
+    const count = await database.db
+      .selectFrom("downstream_tokens")
+      .select(database.db.fn.count("id").as("c"))
+      .where("connectionId", "=", "conn_dual")
+      .executeTakeFirst();
+    expect(Number(count?.c)).toBe(2);
   });
 });
