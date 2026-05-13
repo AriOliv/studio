@@ -60,6 +60,8 @@ keeping the same single MCP gateway URL for the whole team.
 ## Branch commits
 
 ```
+d5f28b7f0 fix(roles): include connection tools in the role permission editor
+008ea5308 docs(per-user-oauth): track open follow-ups for this feature branch
 7314572e9 fix(auth): narrow `member` role permissions (intent, not yet enforced)
 89111d58c fix(virtual-mcp): resolve org from path-scoped ctx, not just legacy headers
 52f0e1ca9 fix(auth): map `member` role so new org members have permissions
