@@ -1237,7 +1237,11 @@ interface RoleDetailPageProps {
 export function RoleDetailPage(props: RoleDetailPageProps) {
   const { locator } = useProjectContext();
   const orgAuth = useOrgAuthClient();
-  const connections = useConnections();
+  // Role editor needs the full tool catalog of each connection so the
+  // admin can toggle individual tools. Without `includeTools` the list
+  // tool returns connections with `tools: null` and only the
+  // hardcoded-tools entries (e.g. local Dev Assets) render.
+  const connections = useConnections({ includeTools: true });
 
   const { data: membersData, isPending: membersPending } = useQuery({
     queryKey: KEYS.members(locator),

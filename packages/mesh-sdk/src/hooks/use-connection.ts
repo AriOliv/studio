@@ -41,6 +41,12 @@ export interface UseConnectionsOptions
    * Filter by computed connection slug (matches app_name, or slug derived from connection_url/title).
    */
   slug?: string;
+  /**
+   * Populate the `tools` field on each connection. Use when the caller
+   * needs the tool catalog (e.g. role permission editor) — leave undefined
+   * for plain navigation lists to avoid the per-connection round-trip.
+   */
+  includeTools?: boolean;
 }
 
 /**
@@ -50,7 +56,8 @@ export interface UseConnectionsOptions
  * @returns Suspense query result with connections as ConnectionEntity[]
  */
 export function useConnections(options: UseConnectionsOptions = {}) {
-  const { binding, includeVirtual, slug, ...collectionOptions } = options;
+  const { binding, includeVirtual, slug, includeTools, ...collectionOptions } =
+    options;
 
   // Build additional tool args for the COLLECTION_CONNECTIONS_LIST tool
   const additionalToolArgs: Record<string, unknown> = {
@@ -67,6 +74,10 @@ export function useConnections(options: UseConnectionsOptions = {}) {
 
   if (slug !== undefined) {
     additionalToolArgs.slug = slug;
+  }
+
+  if (includeTools !== undefined) {
+    additionalToolArgs.include_tools = includeTools;
   }
 
   const finalOptions: UseCollectionListOptions<ConnectionEntity> = {

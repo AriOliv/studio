@@ -94,6 +94,16 @@ const ConnectionListInputSchema = CollectionListInputSchema.extend({
     .describe(
       "Filter by connection slug. Matches against app_name, or a slug derived from connection_url or title.",
     ),
+  include_tools: z
+    .boolean()
+    .optional()
+    .describe(
+      "Populate the `tools` field on each connection. Reads from the NATS " +
+        "MCP-list cache first (cheap) and falls back to a live listTools() " +
+        "call. Use when the caller needs the tool catalog (e.g. the role " +
+        "permission editor) — leave undefined for plain navigation lists " +
+        "to avoid the per-connection round-trip.",
+    ),
 });
 
 /**
@@ -160,9 +170,11 @@ export const COLLECTION_CONNECTIONS_LIST = defineTool({
         offset: needsBindingFilter ? undefined : offset,
       });
 
-    // Only fetch tools from MCP servers when we need them for binding filtering.
-    // This avoids expensive live listTools() calls on every page load.
-    if (bindingChecker) {
+    // Fetch tools from MCP servers when (a) we need them to evaluate a
+    // binding filter, or (b) the caller explicitly asked for them via
+    // `include_tools` (e.g. the role permission editor needs the full
+    // tool catalog to render checkboxes).
+    if (bindingChecker || input.include_tools) {
       const cache = getMcpListCache();
       const selfId = WellKnownOrgMCPId.SELF(organization.id);
       await Promise.all(
