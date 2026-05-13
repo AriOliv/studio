@@ -48,20 +48,28 @@ export async function handleVirtualMcpRequest(
   const ctx = c.get("meshContext");
 
   try {
-    // Prefer x-org-id header (no DB lookup) over x-org-slug (requires DB lookup)
-    const orgId = c.req.header("x-org-id");
-    const orgSlug = c.req.header("x-org-slug");
+    // Org resolution order:
+    //   1. ctx.organization (set by resolveOrgFromPath for the canonical
+    //      `/api/:org/mcp` mount — the path Claude Desktop and the rest of
+    //      the modern client use). No DB lookup needed.
+    //   2. x-org-id header (legacy unscoped mount — still here so existing
+    //      integrations keep working during the deprecation window).
+    //   3. x-org-slug header (legacy with DB lookup).
+    const headerOrgId = c.req.header("x-org-id");
+    const headerOrgSlug = c.req.header("x-org-slug");
 
-    const organizationId = orgId
-      ? orgId
-      : orgSlug
-        ? await ctx.db
-            .selectFrom("organization")
-            .select("id")
-            .where("slug", "=", orgSlug)
-            .executeTakeFirst()
-            .then((org) => org?.id)
-        : null;
+    const organizationId = ctx.organization?.id
+      ? ctx.organization.id
+      : headerOrgId
+        ? headerOrgId
+        : headerOrgSlug
+          ? await ctx.db
+              .selectFrom("organization")
+              .select("id")
+              .where("slug", "=", headerOrgSlug)
+              .executeTakeFirst()
+              .then((org) => org?.id)
+          : null;
 
     const virtualId = virtualMcpId
       ? virtualMcpId
