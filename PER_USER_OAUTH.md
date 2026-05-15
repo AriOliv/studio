@@ -76,6 +76,8 @@ Numbered so it's easy to pick one and ship it.
 
 ### 1. **\[security blocker\]** `member` can still self-promote to `admin`
 
+Filed upstream: [decocms/studio#3388](https://github.com/decocms/studio/issues/3388).
+
 Symptom: a user with role `member` calling
 `ORGANIZATION_MEMBER_UPDATE_ROLE` via `/api/<org>/mcp/self` succeeds —
 the role on the DB row gets flipped to `admin`. Reproduced in this
