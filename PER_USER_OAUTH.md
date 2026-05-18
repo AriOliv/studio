@@ -76,6 +76,14 @@ Numbered so it's easy to pick one and ship it.
 
 ### 1. **\[security blocker\]** `member` can still self-promote to `admin`
 
+> **✅ Fixed by `c17706dc6` and reinforced by `14cf5d3ee` / `d357d8a4c`.**
+> Root cause: `BUILTIN_ROLES` in `apps/mesh/src/auth/roles.ts`
+> included `"user"`, which is the Better Auth admin-plugin default
+> for fresh signups, so the bypass at
+> `apps/mesh/src/core/context-factory.ts:251-255` fired for new org
+> members. `"user"` removed from the array. Filed upstream as
+> decocms/studio#3388.
+
 Filed upstream: [decocms/studio#3388](https://github.com/decocms/studio/issues/3388).
 
 Symptom: a user with role `member` calling
@@ -218,6 +226,12 @@ out:
 
 ### 8. Role design: scope `member` further
 
+> **Status (after `runbooks/strict-rbac/` Phases 1-3 landed):** the
+> `member` role is now scoped to read-only on connections / virtual
+> MCPs plus its own per-user OAuth tokens. `tools/list` filtering
+> and UI hiding both respect this. Remaining gap is per-connection
+> grants — see follow-up #2.
+
 The `member` role currently has read access to all connections
 (`COLLECTION_CONNECTIONS_LIST`, `COLLECTION_CONNECTIONS_GET`,
 `COLLECTION_VIRTUAL_MCP_LIST/GET`) so they can navigate to a
@@ -296,3 +310,19 @@ connections. When the feature lands, add a page covering:
   can't test as user B.
 - Embedded postgres port rotates on each restart. Find it with
   `ps aux | grep "postgres -D" | grep -oE "\-p [0-9]+"`.
+
+---
+
+## Operating the strict access model
+
+After the `runbooks/strict-rbac/` work landed, the contract is:
+
+- **Owner / admin** — full control of org settings, connections,
+  virtual MCPs, roles and members.
+- **Member** — can: browse connection and virtual-MCP catalogues,
+  open a connection to authorise their own per-user OAuth, see
+  org info. Cannot: create / edit / delete connections or virtual
+  MCPs, invite or remove members, change roles, manage AI
+  providers, or access any `/<org>/settings/*` page.
+- **Per-connection grants** (future) — admin will be able to scope
+  "user X can use connection Y only". Tracked as follow-up #2.
