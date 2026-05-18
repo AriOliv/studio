@@ -33,6 +33,7 @@ import {
   useProjectContext,
 } from "@decocms/mesh-sdk";
 import { useAiProviderKeys } from "@/web/hooks/collections/use-ai-providers";
+import { useCurrentMemberRole } from "@/web/hooks/use-current-member-role";
 import { useNavigate } from "@tanstack/react-router";
 import { AddConnectionDialog } from "@/web/views/virtual-mcp/add-connection-dialog";
 import { track } from "@/web/lib/posthog-client";
@@ -221,10 +222,11 @@ function CreditChip() {
 }
 
 function CreditChipConditional() {
+  const { canManageAIProviders } = useCurrentMemberRole();
   const keys = useAiProviderKeys();
   const hasDecoKey = keys.some((k) => k.providerId === "deco");
 
-  if (!hasDecoKey) return null;
+  if (!canManageAIProviders || !hasDecoKey) return null;
 
   return <CreditChip />;
 }
@@ -333,6 +335,8 @@ function SettingsButton() {
 }
 
 export function SidebarInboxFooter() {
+  const { canManageOrg } = useCurrentMemberRole();
+
   return (
     <SidebarFooter className="px-2 pb-3 gap-1">
       <SilentErrorBoundary>
@@ -342,7 +346,7 @@ export function SidebarInboxFooter() {
       </SilentErrorBoundary>
       <ConnectionsButton />
       <InboxButton />
-      <SettingsButton />
+      {canManageOrg && <SettingsButton />}
       <SidebarMenu>
         <SidebarMenuItem>
           <AccountPopover />

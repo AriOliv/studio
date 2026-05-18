@@ -14,10 +14,15 @@ import {
 
 interface ProjectCardProps {
   project: VirtualMCPEntity;
+  canManage?: boolean;
   onDeleteClick?: (e: React.MouseEvent) => void;
 }
 
-export function ProjectCard({ project, onDeleteClick }: ProjectCardProps) {
+export function ProjectCard({
+  project,
+  canManage = true,
+  onDeleteClick,
+}: ProjectCardProps) {
   const navigateToAgent = useNavigateToAgent();
 
   return (
@@ -41,39 +46,41 @@ export function ProjectCard({ project, onDeleteClick }: ProjectCardProps) {
               className="shrink-0 shadow-sm"
             />
             {/* pointer-events-auto re-enables the dropdown */}
-            <div className="relative z-10 pointer-events-auto transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm" className="h-8 w-8 p-0">
-                    <DotsVertical size={20} />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuItem
-                    onClick={() =>
-                      navigateToAgent(project.id, {
-                        search: { main: "settings" },
-                      })
-                    }
-                  >
-                    <Settings02 size={16} />
-                    Settings
-                  </DropdownMenuItem>
-                  {onDeleteClick && (
+            {canManage && (
+              <div className="relative z-10 pointer-events-auto transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm" className="h-8 w-8 p-0">
+                      <DotsVertical size={20} />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
                     <DropdownMenuItem
-                      variant="destructive"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDeleteClick(e);
-                      }}
+                      onClick={() =>
+                        navigateToAgent(project.id, {
+                          search: { main: "settings" },
+                        })
+                      }
                     >
-                      <Trash01 size={16} />
-                      Delete
+                      <Settings02 size={16} />
+                      Settings
                     </DropdownMenuItem>
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
+                    {onDeleteClick && (
+                      <DropdownMenuItem
+                        variant="destructive"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onDeleteClick(e);
+                        }}
+                      >
+                        <Trash01 size={16} />
+                        Delete
+                      </DropdownMenuItem>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            )}
           </div>
 
           {/* Title and Description */}

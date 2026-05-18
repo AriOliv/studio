@@ -34,6 +34,7 @@ import { useOrgAuthClient } from "@/web/hooks/use-org-auth-client";
 import { useProjectContext } from "@decocms/mesh-sdk";
 import { KEYS } from "@/web/lib/query-keys";
 import { useOrganizationRoles } from "@/web/hooks/use-organization-roles";
+import { useCurrentMemberRole } from "@/web/hooks/use-current-member-role";
 
 interface InviteMemberDialogProps {
   trigger: React.ReactNode;
@@ -65,6 +66,7 @@ export function InviteMemberDialog({ trigger }: InviteMemberDialogProps) {
   const { locator } = useProjectContext();
   const orgAuth = useOrgAuthClient();
   const queryClient = useQueryClient();
+  const { canManageMembers } = useCurrentMemberRole();
 
   // Get the active organization from session
   const { data: session } = authClient.useSession();
@@ -178,6 +180,8 @@ export function InviteMemberDialog({ trigger }: InviteMemberDialogProps) {
   };
 
   const isFormValid = validEmails.length > 0 && !!selectedRole;
+
+  if (!canManageMembers) return null;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>

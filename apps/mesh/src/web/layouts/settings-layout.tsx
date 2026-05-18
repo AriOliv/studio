@@ -46,6 +46,7 @@ import { pluginSettingsSidebarItems } from "@/web/index";
 import { useStatusSounds } from "../hooks/use-status-sounds";
 import { authClient } from "@/web/lib/auth-client";
 import { track } from "@/web/lib/posthog-client";
+import { useCurrentMemberRole } from "@/web/hooks/use-current-member-role";
 
 interface SettingsNavItem {
   key: string;
@@ -62,6 +63,8 @@ interface SettingsNavGroup {
 function useSettingsSidebarGroups(): SettingsNavGroup[] {
   const currentProject = useProjectContext().project;
   const enabledPlugins = currentProject.enabledPlugins ?? [];
+  const { canManageOrg, canManageAIProviders, canManageMembers, canEditRoles } =
+    useCurrentMemberRole();
 
   const enabledSettingsItems = pluginSettingsSidebarItems
     .filter((item) => enabledPlugins.includes(item.pluginId))
@@ -71,24 +74,32 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
     {
       label: "Organization",
       items: [
-        {
-          key: "general",
-          label: "General",
-          icon: <Building02 size={14} />,
-          to: "/$org/settings/general",
-        },
-        {
-          key: "brand-context",
-          label: "Brand Context",
-          icon: <BookOpen01 size={14} />,
-          to: "/$org/settings/brand-context",
-        },
-        {
-          key: "ai-providers",
-          label: "AI Providers",
-          icon: <CpuChip01 size={14} />,
-          to: "/$org/settings/ai-providers",
-        },
+        ...(canManageOrg
+          ? [
+              {
+                key: "general",
+                label: "General",
+                icon: <Building02 size={14} />,
+                to: "/$org/settings/general",
+              },
+              {
+                key: "brand-context",
+                label: "Brand Context",
+                icon: <BookOpen01 size={14} />,
+                to: "/$org/settings/brand-context",
+              },
+            ]
+          : []),
+        ...(canManageAIProviders
+          ? [
+              {
+                key: "ai-providers",
+                label: "AI Providers",
+                icon: <CpuChip01 size={14} />,
+                to: "/$org/settings/ai-providers",
+              },
+            ]
+          : []),
       ],
     },
     {
@@ -129,37 +140,51 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
           icon: <BarChart10 size={14} />,
           to: "/$org/settings/monitor",
         },
-        {
-          key: "members",
-          label: "Members",
-          icon: <Users03 size={14} />,
-          to: "/$org/settings/members",
-        },
-        {
-          key: "roles",
-          label: "Roles",
-          icon: <Shield01 size={14} />,
-          to: "/$org/settings/roles",
-        },
-        {
-          key: "sso",
-          label: "Security",
-          icon: <Lock01 size={14} />,
-          to: "/$org/settings/sso",
-        },
+        ...(canManageMembers
+          ? [
+              {
+                key: "members",
+                label: "Members",
+                icon: <Users03 size={14} />,
+                to: "/$org/settings/members",
+              },
+            ]
+          : []),
+        ...(canEditRoles
+          ? [
+              {
+                key: "roles",
+                label: "Roles",
+                icon: <Shield01 size={14} />,
+                to: "/$org/settings/roles",
+              },
+            ]
+          : []),
+        ...(canManageOrg
+          ? [
+              {
+                key: "sso",
+                label: "Security",
+                icon: <Lock01 size={14} />,
+                to: "/$org/settings/sso",
+              },
+            ]
+          : []),
       ],
     },
     {
       label: "Extensions",
-      items: [
-        {
-          key: "features",
-          label: "Plugins",
-          icon: <Zap size={14} />,
-          to: "/$org/settings/features",
-        },
-        ...enabledSettingsItems,
-      ],
+      items: canManageOrg
+        ? [
+            {
+              key: "features",
+              label: "Plugins",
+              icon: <Zap size={14} />,
+              to: "/$org/settings/features",
+            },
+            ...enabledSettingsItems,
+          ]
+        : [],
     },
     {
       label: "Account",
@@ -174,7 +199,7 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
     },
   ];
 
-  return groups;
+  return groups.filter((group) => group.items.length > 0);
 }
 
 export function SettingsSidebar() {

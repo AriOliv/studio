@@ -81,6 +81,7 @@ import { AiResearchRecruitModal } from "@/web/components/home/ai-research-recrui
 import { useThreadActions } from "@/web/components/chat/task";
 import { readCachedTaskBranch } from "@/web/lib/read-cached-task-branch";
 import { useNavigateToAgentThread } from "@/web/hooks/use-navigate-to-agent-thread";
+import { useCurrentMemberRole } from "@/web/hooks/use-current-member-role";
 
 /**
  * Hook for "spawn task on this vMCP" buttons (used by the browse-agents
@@ -139,6 +140,7 @@ function AgentListItem({
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
   const navigateToAgentThread = useNavigateToAgentThread(org);
+  const { canManageVirtualMcps } = useCurrentMemberRole();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const isActive = pathname.startsWith(`/${org}/${agent.id}`);
   const [buttonRect, setButtonRect] = useState<DOMRect | null>(null);
@@ -216,20 +218,24 @@ function AgentListItem({
         </ContextMenuTrigger>
 
         <ContextMenuContent>
-          <ContextMenuItem
-            onClick={() => {
-              const taskId = crypto.randomUUID();
-              navigate({
-                to: "/$org/$taskId",
-                params: { org, taskId },
-                search: { virtualmcpid: agent.id },
-              });
-            }}
-          >
-            <Settings02 size={14} />
-            Settings
-          </ContextMenuItem>
-          <ContextMenuSeparator />
+          {canManageVirtualMcps && (
+            <>
+              <ContextMenuItem
+                onClick={() => {
+                  const taskId = crypto.randomUUID();
+                  navigate({
+                    to: "/$org/$taskId",
+                    params: { org, taskId },
+                    search: { virtualmcpid: agent.id },
+                  });
+                }}
+              >
+                <Settings02 size={14} />
+                Settings
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+            </>
+          )}
           <ContextMenuItem
             onClick={() => {
               onUnpin();
@@ -377,6 +383,7 @@ function PinAgentPopoverContent({
   const { createVirtualMCP, isCreating } = useCreateVirtualMCP({
     navigateOnCreate: true,
   });
+  const { canManageVirtualMcps } = useCurrentMemberRole();
   const [preferences] = usePreferences();
 
   const navigateToNewTask = useNavigateToNewTaskWithBranchCarry(org.slug);
@@ -509,25 +516,27 @@ function PinAgentPopoverContent({
         </div>
         <div className="grid grid-cols-3 gap-1">
           {/* Create new button */}
-          <button
-            type="button"
-            disabled={isCreating}
-            onClick={async () => {
-              track("agent_create_new_clicked", { source: "browse_popover" });
-              await createVirtualMCP();
-              onClose();
-            }}
-            className="flex flex-col items-center gap-2 p-3 rounded-xl transition-colors hover:bg-accent cursor-pointer group disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <div className="w-12 h-12 rounded-xl border-2 border-dashed border-border flex items-center justify-center shrink-0 transition-transform group-hover:scale-105">
-              <Plus size={16} className="text-muted-foreground" />
-            </div>
-            <span className="text-xs leading-tight text-center text-muted-foreground group-hover:text-foreground">
-              Create new
-            </span>
-          </button>
+          {canManageVirtualMcps && (
+            <button
+              type="button"
+              disabled={isCreating}
+              onClick={async () => {
+                track("agent_create_new_clicked", { source: "browse_popover" });
+                await createVirtualMCP();
+                onClose();
+              }}
+              className="flex flex-col items-center gap-2 p-3 rounded-xl transition-colors hover:bg-accent cursor-pointer group disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <div className="w-12 h-12 rounded-xl border-2 border-dashed border-border flex items-center justify-center shrink-0 transition-transform group-hover:scale-105">
+                <Plus size={16} className="text-muted-foreground" />
+              </div>
+              <span className="text-xs leading-tight text-center text-muted-foreground group-hover:text-foreground">
+                Create new
+              </span>
+            </button>
+          )}
 
-          {preferences.experimental_vibecode && (
+          {canManageVirtualMcps && preferences.experimental_vibecode && (
             <button
               type="button"
               onClick={() => {

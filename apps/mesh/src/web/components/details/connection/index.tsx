@@ -58,6 +58,7 @@ import { toast } from "sonner";
 
 import { DeleteConnectionDialogs } from "@/web/components/delete-connection-dialogs";
 import { useDeleteConnection } from "@/web/hooks/use-delete-connection";
+import { useCurrentMemberRole } from "@/web/hooks/use-current-member-role";
 import { ViewLayout } from "../layout";
 import { ConnectionActivity } from "./connection-activity.tsx";
 import { ConnectionAgentsPanel } from "./connection-agents-panel.tsx";
@@ -266,6 +267,7 @@ function ConnectionInspectorViewWithConnection({
   const [configureInstance, setConfigureInstance] =
     useState<ConnectionEntity | null>(null);
   const [isAddingInstance, setIsAddingInstance] = useState(false);
+  const { canManageConnections } = useCurrentMemberRole();
 
   const authStatus = useMCPAuthStatus({
     connectionId: connectionId,
@@ -433,11 +435,13 @@ function ConnectionInspectorViewWithConnection({
 
   return (
     <>
-      <DeleteConnectionDialogs {...deleteConnection} />
+      {canManageConnections && (
+        <DeleteConnectionDialogs {...deleteConnection} />
+      )}
 
       {/* Settings Sheet */}
       <Sheet
-        open={configureInstance !== null}
+        open={canManageConnections && configureInstance !== null}
         onOpenChange={(open) => {
           if (!open) setConfigureInstance(null);
         }}
@@ -535,18 +539,20 @@ function ConnectionInspectorViewWithConnection({
                   Undo
                 </Button>
               )}
-              <Button
-                variant="outline"
-                className="gap-2 text-muted-foreground hover:text-destructive hover:border-destructive"
-                onClick={() => {
-                  const inst = configureInstance ?? connection;
-                  setConfigureInstance(null);
-                  deleteConnection.requestDelete(inst);
-                }}
-              >
-                <Trash01 size={15} />
-                Delete
-              </Button>
+              {canManageConnections && (
+                <Button
+                  variant="outline"
+                  className="gap-2 text-muted-foreground hover:text-destructive hover:border-destructive"
+                  onClick={() => {
+                    const inst = configureInstance ?? connection;
+                    setConfigureInstance(null);
+                    deleteConnection.requestDelete(inst);
+                  }}
+                >
+                  <Trash01 size={15} />
+                  Delete
+                </Button>
+              )}
             </div>
           </Form>
         </SheetContent>
@@ -576,7 +582,9 @@ function ConnectionInspectorViewWithConnection({
                   onAuthenticate={(inst) => handleAuthenticateForId(inst.id)}
                   onDelete={(inst) => deleteConnection.requestDelete(inst)}
                   isAdding={isAddingInstance}
+                  canManage={canManageConnections}
                   onAdd={async () => {
+                    if (!canManageConnections) return;
                     setIsAddingInstance(true);
                     try {
                       const base = siblings[0] ?? connection;

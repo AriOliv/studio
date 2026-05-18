@@ -20,6 +20,7 @@ import "../../index.css";
 
 import { authClient } from "@/web/lib/auth-client";
 import { LOCALSTORAGE_KEYS } from "@/web/lib/localstorage-keys";
+import { requireAdminRole } from "@/web/lib/require-admin-role";
 
 import { sourcePlugins } from "./plugins.ts";
 import type {
@@ -332,6 +333,9 @@ const monitoringRoute = createRoute({
 const settingsGeneralRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/general",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/general.tsx"),
   ),
@@ -340,6 +344,9 @@ const settingsGeneralRoute = createRoute({
 const settingsFeaturesRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/features",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/features.tsx"),
   ),
@@ -348,6 +355,9 @@ const settingsFeaturesRoute = createRoute({
 const settingsBrandContextRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/brand-context",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/brand-context.tsx"),
   ),
@@ -356,6 +366,9 @@ const settingsBrandContextRoute = createRoute({
 const settingsAiProvidersRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/ai-providers",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/ai-providers.tsx"),
   ),
@@ -364,6 +377,9 @@ const settingsAiProvidersRoute = createRoute({
 const settingsMembersRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/members",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/members.tsx"),
   ),
@@ -372,6 +388,9 @@ const settingsMembersRoute = createRoute({
 const settingsRolesRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/roles",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/roles.tsx"),
   ),
@@ -385,6 +404,9 @@ const settingsRolesRoute = createRoute({
 const settingsSsoRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/sso",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(() => import("./routes/orgs/settings/sso.tsx")),
 });
 
@@ -399,6 +421,9 @@ const settingsProfileRoute = createRoute({
 const settingsStoreRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/store",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/store.tsx"),
   ),
@@ -407,6 +432,9 @@ const settingsStoreRoute = createRoute({
 const settingsRegistryRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/registry",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/registry.tsx"),
   ),
@@ -415,6 +443,9 @@ const settingsRegistryRoute = createRoute({
 const settingsStoreRegistryRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/store/registry",
+  beforeLoad: async ({ params }) => {
+    await requireAdminRole({ org: params.org });
+  },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/store-registry.tsx"),
   ),

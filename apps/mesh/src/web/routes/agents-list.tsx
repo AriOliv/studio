@@ -30,6 +30,7 @@ import {
 import { Button } from "@deco/ui/components/button.tsx";
 import { Card } from "@deco/ui/components/card.tsx";
 import { SearchInput } from "@deco/ui/components/search-input.tsx";
+import { cn } from "@deco/ui/lib/utils.ts";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -38,9 +39,11 @@ import { FolderClosed, Plus } from "@untitledui/icons";
 import { toast } from "sonner";
 import { GitHubRepoPicker } from "@/web/components/github-repo-picker.tsx";
 import { track } from "@/web/lib/posthog-client";
+import { useCurrentMemberRole } from "@/web/hooks/use-current-member-role";
 
 export default function AgentsListPage() {
   const { org } = useProjectContext();
+  const { canManageVirtualMcps } = useCurrentMemberRole();
   const agents = useVirtualMCPs();
   const actions = useVirtualMCPActions();
   const navigateToAgent = useNavigateToAgent();
@@ -145,39 +148,41 @@ export default function AgentsListPage() {
                   }
                 }}
               />
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button size="sm">
-                    <Plus size={14} />
-                    Create Agent
-                  </Button>
-                </DropdownMenuTrigger>
-                <CreateAgentDropdownContent
-                  onCreateFromScratch={() => {
-                    track("agent_create_clicked", {
-                      source: "agents_list",
-                      method: "scratch",
-                    });
-                    createVirtualMCP();
-                  }}
-                  onImportGitHub={() => {
-                    track("agent_create_clicked", {
-                      source: "agents_list",
-                      method: "github",
-                    });
-                    setGithubPickerOpen(true);
-                  }}
-                  onImportDeco={() => {
-                    track("agent_create_clicked", {
-                      source: "agents_list",
-                      method: "deco",
-                    });
-                    setImportDecoOpen(true);
-                  }}
-                  isCreating={isCreating}
-                  align="end"
-                />
-              </DropdownMenu>
+              {canManageVirtualMcps && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button size="sm">
+                      <Plus size={14} />
+                      Create Agent
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <CreateAgentDropdownContent
+                    onCreateFromScratch={() => {
+                      track("agent_create_clicked", {
+                        source: "agents_list",
+                        method: "scratch",
+                      });
+                      createVirtualMCP();
+                    }}
+                    onImportGitHub={() => {
+                      track("agent_create_clicked", {
+                        source: "agents_list",
+                        method: "github",
+                      });
+                      setGithubPickerOpen(true);
+                    }}
+                    onImportDeco={() => {
+                      track("agent_create_clicked", {
+                        source: "agents_list",
+                        method: "deco",
+                      });
+                      setImportDecoOpen(true);
+                    }}
+                    isCreating={isCreating}
+                    align="end"
+                  />
+                </DropdownMenu>
+              )}
             </div>
           </div>
 
@@ -194,6 +199,7 @@ export default function AgentsListPage() {
                     : "Create an agent to get started."
                 }
                 actions={
+                  canManageVirtualMcps &&
                   !search && (
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
@@ -245,11 +251,15 @@ export default function AgentsListPage() {
                   <ProjectCard
                     key={agent.id}
                     project={agent}
-                    onDeleteClick={() =>
-                      setDeleteTarget({
-                        id: agent.id,
-                        title: agent.title,
-                      })
+                    canManage={canManageVirtualMcps}
+                    onDeleteClick={
+                      canManageVirtualMcps
+                        ? () =>
+                            setDeleteTarget({
+                              id: agent.id,
+                              title: agent.title,
+                            })
+                        : undefined
                     }
                   />
                 ))}
@@ -266,8 +276,16 @@ export default function AgentsListPage() {
                 {filteredTemplates.map((template) => (
                   <Card
                     key={template.id}
-                    className="relative transition-colors group overflow-hidden flex flex-col h-full hover:bg-muted/50 cursor-pointer"
-                    onClick={() => handleTemplateClick(template.id)}
+                    className={cn(
+                      "relative transition-colors group overflow-hidden flex flex-col h-full",
+                      canManageVirtualMcps &&
+                        "hover:bg-muted/50 cursor-pointer",
+                    )}
+                    onClick={() => {
+                      if (canManageVirtualMcps) {
+                        handleTemplateClick(template.id);
+                      }
+                    }}
                   >
                     <div className="flex flex-col flex-1">
                       <div className="flex flex-col gap-3 p-4.5">

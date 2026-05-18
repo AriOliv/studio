@@ -14,6 +14,7 @@ import { useInfiniteScroll } from "@/web/hooks/use-infinite-scroll";
 import { useLocalStorage } from "@/web/hooks/use-local-storage";
 import { LOCALSTORAGE_KEYS } from "@/web/lib/localstorage-keys";
 import { useEnabledRegistries } from "@/web/hooks/use-enabled-registries";
+import { useCurrentMemberRole } from "@/web/hooks/use-current-member-role";
 import { useListState } from "@/web/hooks/use-list-state";
 import { authClient } from "@/web/lib/auth-client";
 import { useAuthConfig } from "@/web/providers/auth-config-provider";
@@ -524,6 +525,7 @@ function CatalogItemCard({
   connectingItemId,
   onNavigateConnected,
   onConnect,
+  canConnect,
 }: {
   item: RegistryItem;
   allConnections: ConnectionEntity[];
@@ -531,6 +533,7 @@ function CatalogItemCard({
   connectingItemId: string | null;
   onNavigateConnected: (conn: ConnectionEntity) => void;
   onConnect: (item: RegistryItem) => void;
+  canConnect: boolean;
 }) {
   const [communityWarningOpen, setCommunityWarningOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<"connect" | null>(null);
@@ -568,7 +571,9 @@ function CatalogItemCard({
       }
       return;
     }
-    handleConnect();
+    if (canConnect) {
+      handleConnect();
+    }
   };
 
   const handleConnect = () => {
@@ -611,7 +616,7 @@ function CatalogItemCard({
               <span className="text-xs text-muted-foreground font-normal">
                 Connected
               </span>
-            ) : (
+            ) : canConnect ? (
               <Button
                 variant="outline"
                 size="sm"
@@ -628,7 +633,7 @@ function CatalogItemCard({
                   "Connect"
                 )}
               </Button>
-            )}
+            ) : null}
           </div>
         }
       />
@@ -677,6 +682,7 @@ function ConnectionResults({
 
   const actions = useConnectionActions();
   const connections = useConnections(listState);
+  const { canManageConnections, canManageVirtualMcps } = useCurrentMemberRole();
 
   const deleteConnection = useDeleteConnection();
 
@@ -766,6 +772,7 @@ function ConnectionResults({
     activeTab === "connected" || isSearching ? grouped : [];
 
   const handleInlineConnect = async (item: RegistryItem) => {
+    if (!canManageConnections) return;
     if (!org || !session?.user?.id) return;
     track("connection_add_clicked", {
       action: "connect_new",
@@ -1017,18 +1024,22 @@ function ConnectionResults({
       <DeleteConnectionDialogs {...deleteConnection} />
 
       {/* Bulk action dialogs */}
-      <BulkDeleteDialog
-        open={bulkDeleteOpen}
-        onOpenChange={setBulkDeleteOpen}
-        count={selectedIds.size}
-        onConfirm={handleBulkDelete}
-      />
-      <AddToAgentDialog
-        open={addToAgentOpen}
-        onOpenChange={setAddToAgentOpen}
-        agents={agents}
-        onConfirm={handleAddToAgent}
-      />
+      {canManageConnections && (
+        <BulkDeleteDialog
+          open={bulkDeleteOpen}
+          onOpenChange={setBulkDeleteOpen}
+          count={selectedIds.size}
+          onConfirm={handleBulkDelete}
+        />
+      )}
+      {canManageConnections && canManageVirtualMcps && (
+        <AddToAgentDialog
+          open={addToAgentOpen}
+          onOpenChange={setAddToAgentOpen}
+          agents={agents}
+          onConfirm={handleAddToAgent}
+        />
+      )}
 
       {/* Cards */}
       {mergedDiscovery.isInitialLoading && activeTab === "all" ? (
@@ -1058,7 +1069,9 @@ function ConnectionResults({
               description={
                 listState.search
                   ? `No Connections match "${listState.search}"`
-                  : "Create a connection to get started."
+                  : canManageConnections
+                    ? "Create a connection to get started."
+                    : "No connections found."
               }
             />
           ) : (
@@ -1109,7 +1122,7 @@ function ConnectionResults({
                     headerActionsAlwaysVisible
                     headerActions={
                       <div className="flex items-center gap-1">
-                        {selectionMode ? (
+                        {canManageConnections && selectionMode ? (
                           <Checkbox
                             checked={isSelected}
                             onCheckedChange={() => toggleSelect(connection.id)}
@@ -1158,25 +1171,29 @@ function ConnectionResults({
                                 <Eye size={16} />
                                 Open
                               </DropdownMenuItem>
-                              <DropdownMenuItem
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  toggleSelect(connection.id);
-                                }}
-                              >
-                                <CheckSquare size={16} />
-                                Select
-                              </DropdownMenuItem>
-                              <DropdownMenuItem
-                                variant="destructive"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  deleteConnection.requestDelete(connection);
-                                }}
-                              >
-                                <Trash01 size={16} />
-                                Delete
-                              </DropdownMenuItem>
+                              {canManageConnections && (
+                                <DropdownMenuItem
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    toggleSelect(connection.id);
+                                  }}
+                                >
+                                  <CheckSquare size={16} />
+                                  Select
+                                </DropdownMenuItem>
+                              )}
+                              {canManageConnections && (
+                                <DropdownMenuItem
+                                  variant="destructive"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    deleteConnection.requestDelete(connection);
+                                  }}
+                                >
+                                  <Trash01 size={16} />
+                                  Delete
+                                </DropdownMenuItem>
+                              )}
                             </DropdownMenuContent>
                           </DropdownMenu>
                         </div>
@@ -1203,6 +1220,7 @@ function ConnectionResults({
                     })
                   }
                   onConnect={handleInlineConnect}
+                  canConnect={canManageConnections}
                 />
               ))}
               {(activeTab === "all" || isSearching) &&
@@ -1224,7 +1242,7 @@ function ConnectionResults({
       )}
 
       {/* Floating bulk action bar */}
-      {selectionMode && (
+      {canManageConnections && selectionMode && (
         <BulkActionBar
           count={selectedIds.size}
           total={filteredConnections.length}
@@ -1233,7 +1251,9 @@ function ConnectionResults({
           }}
           onDeselectAll={() => setSelectedIds(new Set())}
           onDelete={() => setBulkDeleteOpen(true)}
-          onAddToAgent={() => setAddToAgentOpen(true)}
+          onAddToAgent={() => {
+            if (canManageVirtualMcps) setAddToAgentOpen(true);
+          }}
           onToggleStatus={handleBulkToggleStatus}
           onCancel={exitSelectionMode}
         />
@@ -1260,6 +1280,7 @@ function OrgMcpsContent() {
   });
 
   const actions = useConnectionActions();
+  const { canManageConnections } = useCurrentMemberRole();
 
   // Tab state
   type ConnectionTab = "connected" | "all";
@@ -1324,9 +1345,10 @@ function OrgMcpsContent() {
     });
 
   // Create dialog state is derived from search params
-  const isCreating = search.action === "create";
+  const isCreating = canManageConnections && search.action === "create";
 
   const openCreateDialog = () => {
+    if (!canManageConnections) return;
     track("connections_custom_dialog_opened", {
       source: "connections_page",
     });
@@ -1346,6 +1368,7 @@ function OrgMcpsContent() {
   };
 
   const onSubmit = async (data: ConnectionFormData) => {
+    if (!canManageConnections) return;
     // Determine actual connection_type, connection_url, and connection_headers based on ui_type
     let connectionType: "HTTP" | "SSE" | "Websocket" | "STDIO";
     let connectionUrl: string | null = null;
@@ -1520,14 +1543,14 @@ function OrgMcpsContent() {
     }
   };
 
-  const ctaButton = (
+  const ctaButton = canManageConnections ? (
     <div className="flex items-center gap-2">
       <Button variant="outline" onClick={openCreateDialog}>
         <Plus size={14} className="sm:hidden" />
         <span className="hidden sm:inline">Custom Connection</span>
       </Button>
     </div>
-  );
+  ) : null;
 
   return (
     <>
