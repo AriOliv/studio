@@ -7,6 +7,7 @@
 import { Hono } from "hono";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { MeshContext } from "../../core/mesh-context";
+import { getAllowedToolsForRole } from "../../auth/role-tools";
 import { managementMCP } from "../../tools";
 
 // Define Hono variables type
@@ -26,7 +27,14 @@ export const createSelfRoutes = () => {
    * Exposes all PROJECT_* and CONNECTION_* tools via MCP protocol
    */
   app.all("/", async (c) => {
-    const server = await managementMCP(c.get("meshContext"));
+    const ctx = c.get("meshContext");
+    const allowed = getAllowedToolsForRole(ctx.access.getRole());
+    const server = await managementMCP(
+      ctx,
+      allowed.mode === "explicit"
+        ? (name) => allowed.names.has(name)
+        : undefined,
+    );
     const transport = new WebStandardStreamableHTTPServerTransport({
       enableJsonResponse:
         c.req.raw.headers.get("Accept")?.includes("application/json") ?? false,

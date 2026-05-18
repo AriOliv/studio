@@ -194,7 +194,10 @@ export type MCPMeshTools = typeof ALL_TOOLS;
 // Derive tool name type from ALL_TOOLS
 export type ToolNameFromTools = (typeof ALL_TOOLS)[number]["name"];
 
-export const managementMCP = async (ctx: MeshContext) => {
+export const managementMCP = async (
+  ctx: MeshContext,
+  toolFilter?: (name: string) => boolean,
+) => {
   // Get enabled plugins for this organization to filter plugin tools
   // Check both org settings (legacy) and all virtual MCPs
   let enabledPlugins: string[] | null = null;
@@ -218,7 +221,10 @@ export const managementMCP = async (ctx: MeshContext) => {
 
   // Filter tools based on enabled plugins
   // Core tools are always included, plugin tools only if their plugin is enabled
-  const filteredTools = filterToolsByEnabledPlugins(ALL_TOOLS, enabledPlugins);
+  const filteredTools = filterToolsByEnabledPlugins(
+    ALL_TOOLS,
+    enabledPlugins,
+  ).filter((tool) => toolFilter?.(tool.name) ?? true);
 
   // Create MCP server directly
   const server = new McpServer(

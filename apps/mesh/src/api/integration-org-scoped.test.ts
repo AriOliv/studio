@@ -20,6 +20,8 @@ import {
 } from "bun:test";
 import { sql } from "kysely";
 import { auth } from "../auth";
+import { MEMBER_SELF_TOOLS } from "../auth/role-tools";
+import { createBoundAuthClient } from "../core/context-factory";
 import {
   closeTestDatabase,
   createTestDatabase,
@@ -80,6 +82,17 @@ function mockApiKey(userId: string, orgId: string, orgSlug: string) {
     },
     // oxlint-disable-next-line no-explicit-any
   } as never);
+}
+
+function installDenyHasPermission() {
+  const api = auth.api as typeof auth.api & {
+    hasPermission?: (args: unknown) => Promise<{ success: boolean }>;
+  };
+  const original = api.hasPermission;
+  api.hasPermission = vi.fn(async () => ({ success: false }));
+  return () => {
+    api.hasPermission = original;
+  };
 }
 
 describe("org-scoped API coexistence", () => {
@@ -207,6 +220,170 @@ describe("org-scoped API coexistence", () => {
     );
 
     expect(res.status).toBe(403);
+  });
+
+  it("user default role does not bypass bound permission checks", async () => {
+    const restoreHasPermission = installDenyHasPermission();
+    try {
+      const boundAuth = createBoundAuthClient({
+        auth,
+        headers: new Headers(),
+        role: "user",
+      });
+
+      const allowed = await boundAuth.hasPermission(
+        { self: ["ORGANIZATION_MEMBER_UPDATE_ROLE"] },
+        { organizationId: "org_1" },
+      );
+
+      expect(allowed).toBe(false);
+    } finally {
+      restoreHasPermission();
+    }
+  });
+
+  it("member cannot self-promote via ORGANIZATION_MEMBER_UPDATE_ROLE", async () => {
+    const restoreHasPermission = installDenyHasPermission();
+    const now = new Date().toISOString();
+
+    await sql`
+      INSERT INTO "user" (id, email, "emailVerified", name, role, "createdAt", "updatedAt")
+      VALUES ('user_member_phase1', 'member@phase1.test', 0, 'Member Phase 1', 'user', ${now}, ${now})
+      ON CONFLICT (id) DO NOTHING
+    `.execute(database.db);
+    await sql`
+      INSERT INTO "member" (id, "userId", "organizationId", role, "createdAt")
+      VALUES ('member_phase1_member', 'user_member_phase1', 'org_1', 'member', ${now})
+      ON CONFLICT (id) DO NOTHING
+    `.execute(database.db);
+
+    const updateMemberRoleSpy = vi
+      .spyOn(auth.api, "updateMemberRole")
+      .mockImplementation((async ({
+        body,
+      }: {
+        body: {
+          memberId: string;
+          organizationId: string;
+          role: string[];
+        };
+      }) => {
+        const nextRole = body.role[0] ?? "member";
+        await database.db
+          .updateTable("member")
+          .set({ role: nextRole })
+          .where("id", "=", body.memberId)
+          .execute();
+        return {
+          id: body.memberId,
+          organizationId: body.organizationId,
+          userId: "user_member_phase1",
+          role: nextRole,
+          createdAt: now,
+          user: {
+            email: "member@phase1.test",
+            name: "Member Phase 1",
+          },
+        };
+      }) as never);
+
+    mockApiKey("user_member_phase1", "org_1", "org_1");
+
+    try {
+      const res = await app.fetch(
+        new Request("http://test/api/org_1/mcp/org_1_self", {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer test-key",
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: {
+              name: "ORGANIZATION_MEMBER_UPDATE_ROLE",
+              arguments: {
+                memberId: "member_phase1_member",
+                role: ["admin"],
+              },
+            },
+          }),
+        }),
+      );
+
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
+      expect(body.result?.isError).toBe(true);
+      // Either the access check denies (Phase 1) or the tools/list filter
+      // (Phase 2) hid the tool entirely so the SDK reports "not found".
+      // Both outcomes prove the bypass is closed; the regex accepts both.
+      expect(JSON.stringify(body)).toMatch(/forbid|denied|access|not found/i);
+      expect(updateMemberRoleSpy).not.toHaveBeenCalled();
+
+      const after = await database.db
+        .selectFrom("member")
+        .select("role")
+        .where("id", "=", "member_phase1_member")
+        .executeTakeFirst();
+      expect(after?.role).toBe("member");
+    } finally {
+      restoreHasPermission();
+    }
+  });
+
+  it("member tools/list excludes admin-only management tools", async () => {
+    const now = new Date().toISOString();
+
+    await sql`
+      INSERT INTO "user" (id, email, "emailVerified", name, role, "createdAt", "updatedAt")
+      VALUES ('user_owner_phase2', 'owner@phase2.test', 0, 'Owner Phase 2', 'user', ${now}, ${now})
+      ON CONFLICT (id) DO NOTHING
+    `.execute(database.db);
+    await sql`
+      INSERT INTO "member" (id, "userId", "organizationId", role, "createdAt")
+      VALUES ('member_phase2_owner', 'user_owner_phase2', 'org_1', 'owner', ${now})
+      ON CONFLICT (id) DO NOTHING
+    `.execute(database.db);
+
+    const callList = async (userId: string) => {
+      mockApiKey(userId, "org_1", "org_1");
+      const res = await app.fetch(
+        new Request("http://test/api/org_1/mcp/org_1_self", {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer test-key",
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/list",
+          }),
+        }),
+      );
+      const body = (await res.json()) as {
+        result?: { tools?: Array<{ name: string }> };
+      };
+      return new Set((body.result?.tools ?? []).map((tool) => tool.name));
+    };
+
+    const memberTools = await callList("user_1");
+    const ownerTools = await callList("user_owner_phase2");
+
+    expect(memberTools.has("ORGANIZATION_MEMBER_UPDATE_ROLE")).toBe(false);
+    expect(memberTools.has("COLLECTION_CONNECTIONS_CREATE")).toBe(false);
+    expect(memberTools.has("COLLECTION_VIRTUAL_MCP_CREATE")).toBe(false);
+
+    for (const toolName of MEMBER_SELF_TOOLS) {
+      expect(memberTools.has(toolName)).toBe(true);
+    }
+
+    expect(ownerTools.size).toBeGreaterThan(memberTools.size);
+    expect(ownerTools.has("ORGANIZATION_MEMBER_UPDATE_ROLE")).toBe(true);
   });
 
   it("well-known prefix discovery for org-scoped MCP resolves the right org", async () => {

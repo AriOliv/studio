@@ -20,6 +20,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { Hono } from "hono";
 import type { MeshContext } from "../../core/mesh-context";
 import { MCP_TOOL_CALL_TIMEOUT_MS } from "@/core/constants";
+import { getAllowedToolsForRole } from "../../auth/role-tools";
 import {
   isPerUserAuthorizationRequiredError,
   renderPerUserAuthorizationRequired,
@@ -195,6 +196,13 @@ export async function handleVirtualMcpRequest(
           : undefined,
       toolCallTimeoutMs: MCP_TOOL_CALL_TIMEOUT_MS,
     });
+
+    const allowed = getAllowedToolsForRole(ctx.access.getRole());
+    if (allowed.mode === "explicit") {
+      // TODO(per-connection-grants): once Studio has connection-level grants,
+      // filter aggregator tools by the caller's user/role and connection grant.
+      void allowed;
+    }
 
     // Create transport
     const transport = new WebStandardStreamableHTTPServerTransport({

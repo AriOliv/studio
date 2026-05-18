@@ -21,6 +21,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { Context, Hono } from "hono";
 import { endTime, startTime } from "hono/timing";
 import type { MeshContext } from "../../core/mesh-context";
+import { getAllowedToolsForRole } from "../../auth/role-tools";
 import { managementMCP } from "../../tools";
 import { guardResponseStream } from "../utils/stream-guard";
 import { handleAuthError } from "./oauth-proxy";
@@ -87,7 +88,13 @@ export const createProxyRoutes = () => {
       if (!ctx.organization || ctx.organization.id !== selfOrgId) {
         return c.json({ error: "Connection not found" }, 404);
       }
-      const server = await managementMCP(ctx);
+      const allowed = getAllowedToolsForRole(ctx.access.getRole());
+      const server = await managementMCP(
+        ctx,
+        allowed.mode === "explicit"
+          ? (name) => allowed.names.has(name)
+          : undefined,
+      );
       const transport = new WebStandardStreamableHTTPServerTransport({
         enableJsonResponse:
           c.req.raw.headers.get("Accept")?.includes("application/json") ??
