@@ -154,6 +154,7 @@ export const SlashMention = ({ editor, virtualMcpId }: SlashMentionProps) => {
   // extension is read by `MentionNodeView`; we dispatch through a ref so the
   // stored callback always uses the latest closure without needing useEffect.
   const requestEditRef = useRef<(req: EditMentionRequest) => void>(() => {});
+  // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- intentional latest-closure ref pattern from upstream #3384; upstream main currently fails this same line (lint rule landed in #3399 after the chip-edit feature)
   requestEditRef.current = async (req: EditMentionRequest) => {
     if (!client) return;
     try {
