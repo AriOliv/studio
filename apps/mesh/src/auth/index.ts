@@ -139,6 +139,12 @@ const member = ac.newRole({
     "ORGANIZATION_MEMBER_LIST",
     "API_KEY_CREATE",
     "API_KEY_LIST",
+    // Chat UI dependencies — read-only on AI providers / models /
+    // keys. Without these the chat panel crashes (the AI providers
+    // suspense query returns undefined). Mutations remain admin-only.
+    "AI_PROVIDERS_LIST",
+    "AI_PROVIDER_KEY_LIST",
+    "AI_PROVIDERS_LIST_MODELS",
   ],
   // Note: per-user OAuth token write/read goes through the
   // `/oauth-token` REST routes, not MCP tools. Those routes already

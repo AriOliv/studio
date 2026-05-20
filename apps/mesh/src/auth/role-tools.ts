@@ -4,6 +4,12 @@ import { ADMIN_ROLES } from "./roles";
 /**
  * Member's allowed management-MCP surface. Keep in sync with the `member`
  * role's `self` permissions in auth/index.ts.
+ *
+ * AI provider catalog reads (`AI_PROVIDERS_LIST`, `AI_PROVIDER_KEY_LIST`,
+ * `AI_PROVIDERS_LIST_MODELS`) are included so the chat UI can pick a
+ * model and show the credit chip. Mutations on AI providers (create /
+ * update / delete keys, simple-mode tier configuration) remain
+ * admin-only.
  */
 export const MEMBER_SELF_TOOLS = [
   "COLLECTION_CONNECTIONS_LIST",
@@ -15,6 +21,10 @@ export const MEMBER_SELF_TOOLS = [
   "ORGANIZATION_MEMBER_LIST",
   "API_KEY_CREATE",
   "API_KEY_LIST",
+  // Chat UI dependencies — read-only.
+  "AI_PROVIDERS_LIST",
+  "AI_PROVIDER_KEY_LIST",
+  "AI_PROVIDERS_LIST_MODELS",
 ] as const;
 
 export type AllowedTools =
