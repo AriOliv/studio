@@ -251,10 +251,8 @@ export function ChatContextPanel({
   );
 
   const { messages } = useChatStream();
-  const { tasks, taskId } = useChatTask();
+  const { activeTask } = useChatTask();
   const { selectedModel, selectedVirtualMcp } = useChatPrefs();
-
-  const activeTask = tasks.find((t) => t.id === taskId);
 
   const stats = calculateUsageStats(
     messages as Array<{
@@ -279,8 +277,9 @@ export function ChatContextPanel({
     lastAssistantMessage?.metadata?.modelLimits?.contextWindow ??
     selectedModel?.limits?.contextWindow ??
     null;
-  const contextFillTokens =
-    lastAssistantUsage?.contextTokens ?? lastAssistantUsage?.totalTokens ?? 0;
+  // Per-turn context size only — cumulative `totalTokens` would read as
+  // if the model's window is far fuller than it actually is.
+  const contextFillTokens = lastAssistantUsage?.contextTokens ?? 0;
 
   const usagePct =
     contextWindow && contextWindow > 0

@@ -394,6 +394,9 @@ function ConnectionInspectorViewWithConnection({
     await queryClient.invalidateQueries({
       queryKey: KEYS.isMCPAuthenticated(mcpProxyUrl.href, null),
     });
+    await queryClient.invalidateQueries({
+      queryKey: KEYS.mcpClientPrefix(),
+    });
 
     toast.success("Authentication successful");
   };
@@ -581,8 +584,22 @@ function ConnectionInspectorViewWithConnection({
                   onConfigure={(inst) => setConfigureInstance(inst)}
                   onAuthenticate={(inst) => handleAuthenticateForId(inst.id)}
                   onDelete={(inst) => deleteConnection.requestDelete(inst)}
+                  onToggleStatus={async (inst, status) => {
+                    try {
+                      await connectionActions.update.mutateAsync({
+                        id: inst.id,
+                        data: { status },
+                      });
+                      toast.success(
+                        status === "active"
+                          ? "Connection enabled"
+                          : "Connection disabled",
+                      );
+                    } catch {
+                      toast.error("Failed to update connection");
+                    }
+                  }}
                   isAdding={isAddingInstance}
-                  canManage={canManageConnections}
                   onAdd={async () => {
                     if (!canManageConnections) return;
                     setIsAddingInstance(true);

@@ -22,10 +22,13 @@ const BASE_THREAD: Thread = {
   run_owner_pod: null,
   run_config: null,
   run_started_at: null,
-  inflight_async_jobs: null,
   virtual_mcp_id: "",
   branch: null,
+  sandbox_provider_kind: null,
+  harness_id: null,
   metadata: {},
+  message_storage_version: 1,
+  link_transport: null,
 };
 
 const NOW = new Date("2025-01-01T01:00:00.000Z").getTime(); // 1hr after base
@@ -96,5 +99,12 @@ describe("normalizeThreadForResponse", () => {
       NOW,
     );
     expect(result.hidden).toBe(true);
+  });
+
+  test("strips internal runtime fields from API responses", () => {
+    const result = normalizeThreadForResponse(BASE_THREAD, NOW);
+    expect(result).not.toHaveProperty("context_start_message_id");
+    expect(result).not.toHaveProperty("run_owner_pod");
+    expect(result).not.toHaveProperty("run_started_at");
   });
 });

@@ -1,9 +1,7 @@
-import { DEFAULT_LOGO, usePublicConfig } from "@/web/hooks/use-public-config";
 import {
   SidebarContent,
   SidebarGroup,
   SidebarGroupContent,
-  SidebarHeader,
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
@@ -12,31 +10,8 @@ import {
 import { cn } from "@deco/ui/lib/utils.ts";
 import { type ReactNode, Suspense } from "react";
 import { SidebarCollapsibleGroup } from "./sidebar-group";
+import { SidebarLogoHeader } from "./sidebar-logo-header";
 import type { NavigationSidebarItem, SidebarSection } from "./types";
-
-function MobileLogoHeader() {
-  const config = usePublicConfig();
-  const logo = config.logo ?? DEFAULT_LOGO;
-  const lightSrc = typeof logo === "string" ? logo : logo.light;
-  const darkSrc = typeof logo === "string" ? logo : logo.dark;
-
-  return (
-    <SidebarHeader className="flex items-center justify-center shrink-0 px-2 pb-0">
-      <div className="flex w-full aspect-square items-center justify-center">
-        <img
-          src={lightSrc}
-          alt="Logo"
-          className="size-6 object-contain dark:hidden"
-        />
-        <img
-          src={darkSrc}
-          alt="Logo"
-          className="size-6 object-contain hidden dark:block"
-        />
-      </div>
-    </SidebarHeader>
-  );
-}
 
 function MobileNavigationItem({
   item,
@@ -54,9 +29,10 @@ function MobileNavigationItem({
         }}
         isActive={item.isActive}
         tooltip={item.label}
-        className="bg-muted/75"
+        className="h-10! text-sm!"
       >
-        <span className="[&>svg]:size-8">{item.icon}</span>
+        <span className="[&>svg]:size-5 shrink-0">{item.icon}</span>
+        <span>{item.label}</span>
       </SidebarMenuButton>
     </SidebarMenuItem>
   );
@@ -105,6 +81,8 @@ function MobileSectionRenderer({
           </SidebarGroupContent>
         </SidebarGroup>
       );
+    case "custom":
+      return section.content;
   }
 }
 
@@ -131,8 +109,8 @@ export function MobileNavigationSidebar({
       className="bg-sidebar flex h-full w-full flex-col"
       data-sidebar="sidebar"
     >
-      <Suspense fallback={<div className="h-10 shrink-0" />}>
-        <MobileLogoHeader />
+      <Suspense fallback={<div className="h-12 shrink-0" />}>
+        <SidebarLogoHeader onToggle={onClose} />
       </Suspense>
       <SidebarContent className="flex flex-col flex-1 px-2 py-2 gap-0">
         {sections.map((section, index) => (
@@ -142,7 +120,11 @@ export function MobileNavigationSidebar({
             onClose={onClose}
           />
         ))}
-        {additionalContent}
+        {additionalContent && (
+          <div className="mt-3 flex flex-col flex-1 min-h-0">
+            {additionalContent}
+          </div>
+        )}
       </SidebarContent>
       {footer}
     </div>

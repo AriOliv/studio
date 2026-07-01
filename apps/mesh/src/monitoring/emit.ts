@@ -14,7 +14,8 @@
  */
 
 import type { Context } from "@opentelemetry/api";
-import { SeverityNumber, logs } from "@opentelemetry/api-logs";
+import { SeverityNumber } from "@opentelemetry/api-logs";
+import { getMonitoringLogger } from "./logger";
 import { RegexRedactor } from "./redactor";
 import { MONITORING_LOG_ATTR, MONITORING_LOG_TYPE_VALUE } from "./schema";
 import { truncateString } from "./truncate-string";
@@ -35,7 +36,7 @@ export interface EmitMonitoringLogParams {
   userAgent: string | null;
   virtualMcpId: string | null;
   properties: Record<string, unknown> | null;
-  /** Override the mesh.monitoring.type attribute. Defaults to "tool_call". */
+  /** Override the studio.monitoring.type attribute. Defaults to "tool_call". */
   type?: string;
 }
 
@@ -52,14 +53,23 @@ export function emitMonitoringLog(
   try {
     if (!params.organizationId) return;
 
-    // Apply PII redaction to input, output, and error message
-    const redactedInput = redactor.redact(params.toolArguments ?? {});
-    const redactedOutput = redactor.redact(params.result ?? {});
+    // Truncate BEFORE redacting so redaction cost is bounded by the storage
+    // cap (~64 KB) instead of the full object-graph size. Redacting the
+    // serialized + truncated string still covers both keys and values, since
+    // they all appear in the JSON text. Redacting the raw object first walked
+    // the entire (potentially multi-MB) result through 5 regexes synchronously,
+    // stalling the event loop before truncation threw most of it away.
+    const redactedInput = redactor.redactString(
+      truncateString(JSON.stringify(params.toolArguments ?? {})),
+    );
+    const redactedOutput = redactor.redactString(
+      truncateString(JSON.stringify(params.result ?? {})),
+    );
     const redactedErrorMessage = params.errorMessage
-      ? redactor.redactString(params.errorMessage)
+      ? redactor.redactString(truncateString(params.errorMessage))
       : "";
 
-    logs.getLogger("mesh.monitoring", "1.0.0").emit({
+    getMonitoringLogger().emit({
       severityNumber: params.isError
         ? SeverityNumber.ERROR
         : SeverityNumber.INFO,
@@ -71,12 +81,8 @@ export function emitMonitoringLog(
         [MONITORING_LOG_ATTR.CONNECTION_ID]: params.connectionId,
         [MONITORING_LOG_ATTR.CONNECTION_TITLE]: "",
         [MONITORING_LOG_ATTR.TOOL_NAME]: params.toolName,
-        [MONITORING_LOG_ATTR.INPUT]: truncateString(
-          JSON.stringify(redactedInput),
-        ),
-        [MONITORING_LOG_ATTR.OUTPUT]: truncateString(
-          JSON.stringify(redactedOutput),
-        ),
+        [MONITORING_LOG_ATTR.INPUT]: redactedInput,
+        [MONITORING_LOG_ATTR.OUTPUT]: redactedOutput,
         [MONITORING_LOG_ATTR.IS_ERROR]: params.isError,
         [MONITORING_LOG_ATTR.ERROR_MESSAGE]: redactedErrorMessage,
         [MONITORING_LOG_ATTR.DURATION_MS]: params.duration,

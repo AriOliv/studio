@@ -1,3 +1,8 @@
+---
+name: pdf
+description: Read and extract text from .pdf files, page by page. Use when the user uploads or references a PDF to read or summarize.
+---
+
 # pdf — PDF documents
 
 Use this skill to read text from `.pdf` files.
@@ -9,7 +14,7 @@ Use this skill to read text from `.pdf` files.
 Print text content from a `.pdf`, page by page.
 
 ```
-python /mnt/skills/public/pdf/extract.py <path-to-file.pdf>
+python org/public/core/pdf/extract.py <path-to-file.pdf>
 ```
 
 Output is plain text with `--- page N ---` separators. PDFs that are pure

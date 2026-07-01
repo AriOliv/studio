@@ -17,10 +17,14 @@ import {
   UserAskInputSchema,
   UserAskOutputSchema,
   userAskTool,
-} from "./user-ask";
+} from "@decocms/harness/decopilot/built-in-tools/user-ask";
 
+const mockProvider = { thinkingModel: {} as never } as never;
 const mockParams: BuiltinToolParams = {
-  provider: { thinkingModel: {} as never } as never,
+  provider: mockProvider,
+  imageProvider: mockProvider,
+  webSearchProvider: mockProvider,
+  deepResearchProvider: mockProvider,
   organization: { id: "org_test" } as never,
   models: {
     connectionId: "conn_test",
@@ -29,6 +33,7 @@ const mockParams: BuiltinToolParams = {
   toolOutputMap: new Map(),
   pendingImages: [],
   taskId: "task_test",
+  agentId: "agent-test",
   passthroughClient: {
     listTools: () => Promise.resolve({ tools: [] }),
     callTool: () => Promise.resolve({ content: [] }),

@@ -1,4 +1,4 @@
-import type { MeshContext } from "@/core/mesh-context";
+import type { StudioContext } from "@/core/studio-context";
 import type { SimpleModeTier } from "@/tools/organization/schema";
 import {
   pickSimpleModeDefaults,
@@ -33,7 +33,7 @@ export interface ResolvedTier {
 const METADATA_FETCH_TIMEOUT_MS = 5_000;
 
 async function fetchModelList(
-  ctx: MeshContext,
+  ctx: StudioContext,
   keyId: string,
   orgId: string,
 ): Promise<AiProviderModel[]> {
@@ -69,8 +69,10 @@ function pickSlotForTier(
       return defaults.chat.thinking;
     case "image":
       return defaults.image;
-    case "web_research":
-      return defaults.webResearch;
+    case "web_search":
+      return defaults.webSearch;
+    case "deep_research":
+      return defaults.deepResearch;
   }
 }
 
@@ -89,7 +91,7 @@ function metaFromCatalogEntry(
 }
 
 export async function resolveTier(
-  ctx: MeshContext,
+  ctx: StudioContext,
   tier: SimpleModeTier,
 ): Promise<ResolvedTier> {
   const orgId = ctx.organization?.id;
@@ -150,4 +152,43 @@ export async function resolveTier(
       picked.title,
     ),
   };
+}
+
+/**
+ * Resolve a concrete (credentialId, modelId) pair into a ResolvedTier,
+ * enriching it with catalog metadata when available. Used by automations that
+ * pin a specific model instead of an org tier preset. Unlike `resolveTier`
+ * this never consults org settings or default-picks — the caller has already
+ * chosen the exact model + credential.
+ */
+export async function resolveSpecificModel(
+  ctx: StudioContext,
+  credentialId: string,
+  modelId: string,
+): Promise<ResolvedTier> {
+  const orgId = ctx.organization?.id;
+  if (!orgId) {
+    throw new Error("resolveSpecificModel called without an organization");
+  }
+  const catalog = await fetchModelList(ctx, credentialId, orgId).catch(
+    () => [] as AiProviderModel[],
+  );
+  return {
+    credentialId,
+    modelId,
+    modelMeta: metaFromCatalogEntry(catalog, modelId),
+  };
+}
+
+export async function tryResolveTier(
+  ctx: StudioContext,
+  tier: SimpleModeTier,
+): Promise<ResolvedTier | null> {
+  try {
+    return await resolveTier(ctx, tier);
+  } catch (err) {
+    if (err instanceof TierUnavailableError) return null;
+    console.warn(`[resolveTier] tier "${tier}" resolution failed:`, err);
+    return null;
+  }
 }

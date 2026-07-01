@@ -12,6 +12,8 @@ import {
 } from "@decocms/mesh-sdk";
 import { toast } from "sonner";
 import { KEYS } from "../lib/query-keys";
+import { useStudioTools } from "../lib/studio-tools";
+import type { ToolInput } from "@/tools/io-types";
 
 // ============================================================================
 // Trigger List Hook
@@ -120,13 +122,14 @@ export interface AutomationListItem {
 
 export interface AutomationTrigger {
   id: string;
-  type: "cron" | "event";
+  type: "cron" | "event" | "webhook";
   cron_expression: string | null;
   connection_id: string | null;
   event_type: string | null;
   params: Record<string, string> | null;
   last_run_at: string | null;
   next_run_at: string | null;
+  api_key_id: string | null;
   created_at: string;
 }
 
@@ -141,8 +144,17 @@ export interface AutomationDetail {
   messages: unknown[];
   models: {
     tier?: "fast" | "smart" | "thinking";
+    // Specific-model override (coexists with tier; takes precedence when set).
+    modelId?: string;
+    credentialId?: string;
+    modelTitle?: string;
     [key: string]: unknown;
   };
+  // Tool allowlist (model-facing/raw tool names). null = all of the agent's
+  // tools.
+  tools: string[] | null;
+  // Parent agent-loop step cap. null = platform default (PARENT_STEP_LIMIT).
+  maxAgentSteps: number | null;
   temperature: number;
   triggers: AutomationTrigger[];
 }
@@ -155,25 +167,17 @@ type AutomationListOutput = { automations: AutomationListItem[] };
 
 export function useAutomations(virtualMcpId?: string | null) {
   const { org } = useProjectContext();
-  const client = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
+  const studio = useStudioTools();
 
   return useQuery({
     queryKey: KEYS.automations(org.id, virtualMcpId),
     queryFn: async () => {
-      const args: Record<string, unknown> =
+      const payload = (await studio.call(
+        "AUTOMATION_LIST",
         virtualMcpId !== undefined && virtualMcpId !== null
           ? { virtual_mcp_id: virtualMcpId }
-          : {};
-      const result = (await client.callTool({
-        name: "AUTOMATION_LIST",
-        arguments: args,
-      })) as { structuredContent?: unknown };
-      const payload = (result.structuredContent ??
-        result) as AutomationListOutput;
+          : {},
+      )) as AutomationListOutput;
       return payload.automations;
     },
     staleTime: 10_000,
@@ -184,25 +188,65 @@ type AutomationGetOutput = { automation: AutomationDetail | null };
 
 export function useAutomation(id: string) {
   const { org } = useProjectContext();
-  const client = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
+  const studio = useStudioTools();
 
   return useQuery({
     queryKey: KEYS.automation(org.id, id),
     queryFn: async () => {
-      const result = (await client.callTool({
-        name: "AUTOMATION_GET",
-        arguments: { id },
-      })) as { structuredContent?: unknown };
-      const payload = (result.structuredContent ??
-        result) as AutomationGetOutput;
+      const payload = (await studio.call("AUTOMATION_GET", {
+        id,
+      })) as AutomationGetOutput;
       return payload.automation;
     },
     enabled: !!id,
     staleTime: 10_000,
+  });
+}
+
+// ============================================================================
+// Run stats hook
+// ============================================================================
+
+export interface AutomationRunStats {
+  runs: {
+    total: number;
+    completed: number;
+    failed: number;
+    inProgress: number;
+  };
+  usage: {
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    costUsd: number;
+    sampledRuns: number;
+    truncated: boolean;
+  };
+}
+
+export function useAutomationRunStats(
+  automationId: string,
+  range?: { startDate?: string; endDate?: string },
+) {
+  const { org } = useProjectContext();
+  const studio = useStudioTools();
+
+  return useQuery({
+    queryKey: KEYS.automationRunStats(
+      org.id,
+      automationId,
+      JSON.stringify(range ?? {}),
+    ),
+    queryFn: async () => {
+      return (await studio.call("AUTOMATION_RUN_STATS", {
+        automation_id: automationId,
+        ...(range?.startDate ? { startDate: range.startDate } : {}),
+        ...(range?.endDate ? { endDate: range.endDate } : {}),
+      })) as AutomationRunStats;
+    },
+    enabled: !!automationId,
+    staleTime: 30_000,
   });
 }
 
@@ -227,11 +271,7 @@ export function buildDefaultAutomationInput(virtualMcpId: string) {
 
 export function useAutomationActions() {
   const { org } = useProjectContext();
-  const client = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
+  const studio = useStudioTools();
   const queryClient = useQueryClient();
 
   const invalidateAll = () =>
@@ -242,14 +282,10 @@ export function useAutomationActions() {
 
   const create = useMutation({
     mutationFn: async (input: Record<string, unknown>) => {
-      const result = (await client.callTool({
-        name: "AUTOMATION_CREATE",
-        arguments: input,
-      })) as { structuredContent?: unknown };
-      return (result.structuredContent ?? result) as {
-        id: string;
-        name: string;
-      };
+      return (await studio.call(
+        "AUTOMATION_CREATE",
+        input as ToolInput<"AUTOMATION_CREATE">,
+      )) as { id: string; name: string };
     },
     onSuccess: () => {
       invalidateAll();
@@ -263,11 +299,10 @@ export function useAutomationActions() {
 
   const update = useMutation({
     mutationFn: async (input: Record<string, unknown>) => {
-      const result = (await client.callTool({
-        name: "AUTOMATION_UPDATE",
-        arguments: input,
-      })) as { structuredContent?: unknown };
-      return (result.structuredContent ?? result) as { id: string };
+      return (await studio.call(
+        "AUTOMATION_UPDATE",
+        input as ToolInput<"AUTOMATION_UPDATE">,
+      )) as { id: string };
     },
     onSuccess: (_data, variables) => {
       invalidateAll();
@@ -284,11 +319,9 @@ export function useAutomationActions() {
 
   const remove = useMutation({
     mutationFn: async (id: string) => {
-      const result = (await client.callTool({
-        name: "AUTOMATION_DELETE",
-        arguments: { id },
-      })) as { structuredContent?: unknown };
-      return (result.structuredContent ?? result) as { success: boolean };
+      return (await studio.call("AUTOMATION_DELETE", { id })) as {
+        success: boolean;
+      };
     },
     onSuccess: (_data, id) => {
       queryClient.removeQueries({ queryKey: KEYS.automation(org.id, id) });
@@ -303,21 +336,14 @@ export function useAutomationActions() {
 
   const triggerAdd = useMutation({
     mutationFn: async (input: Record<string, unknown>) => {
-      const result = (await client.callTool({
-        name: "AUTOMATION_TRIGGER_ADD",
-        arguments: input,
-      })) as {
-        structuredContent?: unknown;
-        isError?: boolean;
-        content?: Array<{ text?: string }>;
-      };
-      if (result.isError) {
-        const message = result.content?.[0]?.text ?? "Failed to add trigger";
-        throw new Error(message);
-      }
-      return (result.structuredContent ?? result) as {
+      return (await studio.call(
+        "AUTOMATION_TRIGGER_ADD",
+        input as ToolInput<"AUTOMATION_TRIGGER_ADD">,
+      )) as {
         id: string;
         automation_id: string;
+        // Only set for webhook triggers. Plaintext token is shown only once.
+        webhook?: { url: string; token: string } | null;
       };
     },
     onSuccess: (data) => {
@@ -326,16 +352,18 @@ export function useAutomationActions() {
     },
   });
 
-  const triggerRemove = useMutation({
+  const triggerRotateToken = useMutation({
     mutationFn: async (input: {
       trigger_id: string;
       automation_id: string;
     }) => {
-      const result = (await client.callTool({
-        name: "AUTOMATION_TRIGGER_REMOVE",
-        arguments: { trigger_id: input.trigger_id },
-      })) as { structuredContent?: unknown };
-      return (result.structuredContent ?? result) as { success: boolean };
+      return (await studio.call("AUTOMATION_TRIGGER_ROTATE_TOKEN", {
+        trigger_id: input.trigger_id,
+      })) as {
+        trigger_id: string;
+        url: string;
+        token: string;
+      };
     },
     onSuccess: (_data, variables) => {
       invalidateAll();
@@ -343,5 +371,51 @@ export function useAutomationActions() {
     },
   });
 
-  return { create, update, remove, triggerAdd, triggerRemove };
+  const triggerRemove = useMutation({
+    mutationFn: async (input: {
+      trigger_id: string;
+      automation_id: string;
+    }) => {
+      return (await studio.call("AUTOMATION_TRIGGER_REMOVE", {
+        trigger_id: input.trigger_id,
+      })) as { success: boolean };
+    },
+    onSuccess: (_data, variables) => {
+      invalidateAll();
+      invalidateOne(variables.automation_id);
+    },
+  });
+
+  const run = useMutation({
+    mutationFn: async (id: string) => {
+      return (await studio.call("AUTOMATION_RUN", { id })) as {
+        threadId?: string;
+        error?: string;
+        skipped?: string;
+      };
+    },
+    onSuccess: (data) => {
+      if (data.skipped) {
+        toast.info(`Automation skipped: ${data.skipped}`);
+      } else if (data.error) {
+        toast.error(`Automation failed: ${data.error}`);
+      } else {
+        toast.success("Automation triggered");
+      }
+    },
+    onError: (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      toast.error(`Failed to run automation: ${message}`);
+    },
+  });
+
+  return {
+    create,
+    update,
+    remove,
+    triggerAdd,
+    triggerRemove,
+    triggerRotateToken,
+    run,
+  };
 }

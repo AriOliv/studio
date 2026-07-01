@@ -1,5 +1,4 @@
 import {
-  BASIC_USAGE_TOOLS,
   getCapabilitySections,
   isCapabilityEnabled,
   toggleCapabilityInTools,
@@ -73,12 +72,7 @@ import {
 // ============================================================================
 
 export type RoleEditorTarget =
-  | {
-      kind: "builtin";
-      role: "owner" | "admin" | "user";
-      storedId?: string;
-      storedPermission?: Record<string, string[]>;
-    }
+  | { kind: "builtin"; role: "owner" | "admin" | "user" }
   | { kind: "custom"; role: OrganizationRole }
   | { kind: "new" };
 
@@ -788,7 +782,7 @@ function AddMemberDialog({
 
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent className="sm:max-w-md p-0 overflow-hidden">
+      <AlertDialogContent className="sm:max-w-md p-0">
         <AlertDialogHeader className="px-6 pt-6">
           <AlertDialogTitle>Add Members to Role</AlertDialogTitle>
           <AlertDialogDescription>
@@ -892,6 +886,7 @@ function MembersTabContent({
   memberIds,
   onMemberIdsChange,
   readOnly = false,
+  readOnlyMessage = "Owner membership cannot be changed",
   searchQuery,
   addMemberDialogOpen,
   onAddMemberDialogOpenChange,
@@ -899,6 +894,7 @@ function MembersTabContent({
   memberIds: string[];
   onMemberIdsChange: (memberIds: string[]) => void;
   readOnly?: boolean;
+  readOnlyMessage?: string;
   searchQuery: string;
   addMemberDialogOpen: boolean;
   onAddMemberDialogOpenChange: (open: boolean) => void;
@@ -968,7 +964,7 @@ function MembersTabContent({
                         </div>
                       </TooltipTrigger>
                       <TooltipContent>
-                        <p>Owner membership cannot be changed</p>
+                        <p>{readOnlyMessage}</p>
                       </TooltipContent>
                     </Tooltip>
                   </TooltipProvider>
@@ -1004,6 +1000,7 @@ function MembersTab(props: {
   memberIds: string[];
   onMemberIdsChange: (memberIds: string[]) => void;
   readOnly?: boolean;
+  readOnlyMessage?: string;
   searchQuery: string;
   addMemberDialogOpen: boolean;
   onAddMemberDialogOpenChange: (open: boolean) => void;
@@ -1132,10 +1129,10 @@ function buildPermission(
   const permission: Record<string, string[]> = {};
   if (data.allowAllStaticPermissions) {
     permission["self"] = ["*"];
-  } else {
-    const tools = new Set(data.staticPermissions);
-    for (const tool of BASIC_USAGE_TOOLS) tools.add(tool);
-    if (tools.size > 0) permission["self"] = Array.from(tools);
+  } else if (data.staticPermissions.length > 0) {
+    // Basic-usage tools are granted at runtime by AccessControl, so they are
+    // intentionally NOT persisted here — only the role's explicit grants are.
+    permission["self"] = data.staticPermissions;
   }
   for (const [connectionId, tools] of Object.entries(data.toolSet)) {
     if (tools.length > 0) {
@@ -1170,9 +1167,7 @@ function getInitialFormValues(
     return loadBuiltinRoleIntoForm(
       target.role,
       members,
-      target.storedId != null
-        ? { id: target.storedId, permission: target.storedPermission }
-        : undefined,
+      undefined,
       connections,
     );
   }
@@ -1196,9 +1191,11 @@ function getInitialFormValues(
 
 function MembersAddButton({
   readOnly,
+  readOnlyMessage = "Owner membership cannot be changed",
   onOpen,
 }: {
   readOnly: boolean;
+  readOnlyMessage?: string;
   onOpen: () => void;
 }) {
   if (readOnly) {
@@ -1214,7 +1211,7 @@ function MembersAddButton({
             </div>
           </TooltipTrigger>
           <TooltipContent>
-            <p>Owner membership cannot be changed</p>
+            <p>{readOnlyMessage}</p>
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>
@@ -1304,15 +1301,15 @@ function RoleDetailPageInner({
       const roleSlug =
         formData.role.slug ||
         formData.role.label.toLowerCase().replace(/\s+/g, "-");
-      const isOwnerBuiltinSave =
-        formData.role.slug === "owner" && !formData.role.id;
-      const isEditableBuiltinFirstSave =
-        (formData.role.slug === "admin" || formData.role.slug === "user") &&
+      const isBuiltinSave =
+        (formData.role.slug === "owner" ||
+          formData.role.slug === "admin" ||
+          formData.role.slug === "user") &&
         !formData.role.id;
 
-      const syncMembers = async (currentSlug: string) => {
+      const syncMembers = async (currentSlug: string, lookupSlug?: string) => {
         const currentIds = members
-          .filter((m) => m.role === currentSlug)
+          .filter((m) => m.role === (lookupSlug ?? currentSlug))
           .map((m) => m.id);
         const toAdd = formData.memberIds.filter(
           (id) => !currentIds.includes(id),
@@ -1338,30 +1335,29 @@ function RoleDetailPageInner({
         }
       };
 
-      if (isOwnerBuiltinSave) {
-        await syncMembers("owner");
+      if (isBuiltinSave) {
+        await syncMembers(formData.role.slug!);
         return formData;
       } else if (formData.role.id) {
+        const newSlug = formData.role.label.toLowerCase().replace(/\s+/g, "-");
+        const oldSlug = formData.role.slug!;
+        const slugChanged = newSlug !== oldSlug;
         const r = await orgAuth.organization.updateRole({
           roleId: formData.role.id,
-          data: { permission },
+          data: {
+            permission,
+            ...(slugChanged ? { roleName: newSlug } : {}),
+          },
         });
         if (r?.error)
           throw new Error(r.error.message ?? "Something went wrong");
-        await syncMembers(formData.role.slug!);
-        return formData;
-      } else if (isEditableBuiltinFirstSave) {
-        const r = await orgAuth.organization.createRole({
-          role: formData.role.slug!,
-          permission,
-        });
-        if (r?.error)
-          throw new Error(r.error.message ?? "Something went wrong");
-        await syncMembers(formData.role.slug!);
-        return {
-          ...formData,
-          role: { ...formData.role, id: r.data?.roleData?.id },
-        };
+        await syncMembers(
+          slugChanged ? newSlug : oldSlug,
+          slugChanged ? oldSlug : undefined,
+        );
+        return slugChanged
+          ? { ...formData, role: { ...formData.role, slug: newSlug } }
+          : formData;
       } else {
         const r = await orgAuth.organization.createRole({
           role: roleSlug,
@@ -1506,9 +1502,7 @@ function RoleDetailPageInner({
                     "size-2.5 rounded-full shrink-0",
                     target.kind === "builtin"
                       ? getRoleDotColor(target.role, true)
-                      : target.kind === "custom"
-                        ? getRoleDotColor(target.role.role, false)
-                        : getRoleColor(form.watch("role.label")),
+                      : getRoleColor(form.watch("role.label")),
                   )}
                 />
                 {isOwnerBuiltin && (
@@ -1517,12 +1511,12 @@ function RoleDetailPageInner({
                     className="text-muted-foreground shrink-0"
                   />
                 )}
-                {isNew ? (
+                {isNew || target.kind === "custom" ? (
                   <input
                     {...form.register("role.label")}
                     placeholder="Role name"
                     className="leading-tight text-foreground bg-transparent border-none outline-none px-1 -mx-1 rounded hover:bg-input/25 focus:bg-input/25 transition-colors w-64 placeholder:text-muted-foreground/50"
-                    autoFocus
+                    autoFocus={isNew}
                   />
                 ) : (
                   <span className="truncate">{roleName}</span>
@@ -1628,7 +1622,15 @@ function RoleDetailPageInner({
                 onMemberIdsChange={(v) =>
                   form.setValue("memberIds", v, { shouldDirty: true })
                 }
-                readOnly={target.kind === "builtin" && target.role === "owner"}
+                readOnly={
+                  target.kind === "builtin" &&
+                  (target.role === "owner" || target.role === "user")
+                }
+                readOnlyMessage={
+                  target.kind === "builtin" && target.role === "user"
+                    ? "User is the default role — members can't be removed from it; assign another role to change their access"
+                    : "Owner membership cannot be changed"
+                }
                 searchQuery={searchQuery}
                 addMemberDialogOpen={addMemberDialogOpen}
                 onAddMemberDialogOpenChange={setAddMemberDialogOpen}

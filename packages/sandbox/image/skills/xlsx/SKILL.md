@@ -1,3 +1,8 @@
+---
+name: xlsx
+description: Read and extract cell data from .xlsx Excel spreadsheets as TSV. Use when the user uploads or references an Excel file to read or summarize.
+---
+
 # xlsx — Excel spreadsheets
 
 Use this skill to read or summarize `.xlsx` files.
@@ -10,7 +15,7 @@ Print sheet contents from an `.xlsx` as TSV. Each sheet is preceded by a
 `--- sheet "<name>" ---` header.
 
 ```
-python /mnt/skills/public/xlsx/extract.py <path-to-file.xlsx>
+python org/public/core/xlsx/extract.py <path-to-file.xlsx>
 ```
 
 Empty trailing rows and columns are trimmed. Cell values are stringified;

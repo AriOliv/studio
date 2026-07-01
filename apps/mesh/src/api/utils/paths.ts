@@ -7,6 +7,10 @@
 
 /** System paths that don't require authentication or special handling */
 export const SYSTEM_PATHS = {
+  // Bare /health is the AWS NLB target-group health-check path. Kept distinct
+  // from the K8s liveness/readiness probes so the load balancer can pull a
+  // draining pod on its own during rollout.
+  HEALTH: "/health",
   HEALTH_LIVE: "/health/live",
   HEALTH_READY: "/health/ready",
   METRICS: "/metrics",
@@ -26,9 +30,18 @@ const PATH_PREFIXES = {
 const STATIC_FILE_PATTERN =
   /\.(html|css|js|ico|svg|png|jpg|jpeg|gif|webp|woff|woff2)$/;
 
+export function isHealthPath(path: string): boolean {
+  return (
+    path === SYSTEM_PATHS.HEALTH ||
+    path === SYSTEM_PATHS.HEALTH_LIVE ||
+    path === SYSTEM_PATHS.HEALTH_READY
+  );
+}
+
 /** Check if a path is a system endpoint (health, metrics, well-known) */
 function isSystemPath(path: string): boolean {
   return (
+    path === SYSTEM_PATHS.HEALTH ||
     path === SYSTEM_PATHS.HEALTH_LIVE ||
     path === SYSTEM_PATHS.HEALTH_READY ||
     path === SYSTEM_PATHS.METRICS ||
@@ -41,27 +54,6 @@ function isApiPath(path: string): boolean {
   return path.startsWith(PATH_PREFIXES.API);
 }
 
-/** Check if a path is an MCP route */
-function isMcpPath(path: string): boolean {
-  // Match both /mcp (exact) and /mcp/* (prefix)
-  return path === "/mcp" || path.startsWith(PATH_PREFIXES.MCP);
-}
-
-/** Check if a path is an OAuth proxy route */
-function isOAuthProxyPath(path: string): boolean {
-  return path.startsWith(PATH_PREFIXES.OAUTH_PROXY);
-}
-
-/** Check if a path is a static file based on extension */
-function isStaticFilePath(path: string): boolean {
-  return STATIC_FILE_PATTERN.test(path);
-}
-
-/** Check if a path is an organization route */
-function isOrgPath(path: string): boolean {
-  return path.startsWith(PATH_PREFIXES.ORG);
-}
-
 /**
  * Check if a path should be handled by the API server (Hono routes)
  * Returns true for API routes, MCP routes, OAuth proxy routes, org routes, and system endpoints
@@ -69,26 +61,27 @@ function isOrgPath(path: string): boolean {
 export function isServerPath(path: string): boolean {
   return (
     isApiPath(path) ||
-    isMcpPath(path) ||
-    isOAuthProxyPath(path) ||
-    isOrgPath(path) ||
+    path === "/mcp" ||
+    path.startsWith(PATH_PREFIXES.MCP) ||
+    path.startsWith(PATH_PREFIXES.OAUTH_PROXY) ||
+    path.startsWith(PATH_PREFIXES.ORG) ||
     isSystemPath(path)
   );
 }
 
 /**
- * Check if a path should skip MeshContext injection
+ * Check if a path should skip StudioContext injection
  * Used in the context middleware to avoid creating contexts for
  * paths that don't need database access
  */
-export function shouldSkipMeshContext(path: string): boolean {
+export function shouldSkipStudioContext(path: string): boolean {
   return (
     path === "/" ||
     path.startsWith(PATH_PREFIXES.API_AUTH) ||
     path === "/api/trigger-callback" ||
     isSystemPath(path) ||
     // Static file extension check only applies to non-API paths (e.g. Vite assets).
-    // API paths like /api/:org/files/image.jpeg still need MeshContext for auth.
-    (!isApiPath(path) && isStaticFilePath(path))
+    // API paths like /api/:org/files/image.jpeg still need StudioContext for auth.
+    (!isApiPath(path) && STATIC_FILE_PATTERN.test(path))
   );
 }

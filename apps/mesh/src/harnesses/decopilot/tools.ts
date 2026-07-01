@@ -7,8 +7,7 @@
  *  - Built-in platform tools via `getBuiltInTools` (subtask, user_ask, vm
  *    file tools, sandbox, web_search, etc.).
  *  - Single `listTools()` round-trip to derive (a) connections-block
- *    entries, (b) connection ids for `enable_tool` short-name resolution,
- *    and (c) per-tool annotations used for plan-mode gating.
+ *    entries and (b) per-tool annotations used for plan-mode gating.
  *  - VM file-tool binding context (`vmContext`) keyed on whether the
  *    agent is GitHub-linked or ephemeral.
  *
@@ -22,18 +21,24 @@
 
 import type { ToolSet, UIMessageStreamWriter } from "ai";
 import type { GithubRepo } from "@decocms/mesh-sdk";
-import type { MeshContext } from "@/core/mesh-context";
-import { createVirtualClientFrom } from "@/mcp-clients/virtual-mcp";
+import type { StudioContext } from "@/core/studio-context";
 import type { PassthroughClient } from "@/mcp-clients/virtual-mcp/passthrough-client";
 import type { MeshProvider } from "@/ai-providers/types";
+import type { BackgroundDispatcher } from "@decocms/harness/decopilot/built-in-tools/backgroundable";
 import {
   getBuiltInTools,
   type PendingImage,
   type VmContext,
 } from "./built-in-tools";
-import type { ConnectionsBlockTool } from "./connections-block";
-import { toolsFromMCP } from "../../api/routes/decopilot/helpers";
-import type { HarnessStreamInput } from "../types";
+import type { HtmlArtifactBuffer } from "@decocms/harness/decopilot/built-in-tools/vm-tools/types";
+import type { ConnectionsBlockTool } from "@decocms/harness/decopilot/connections-block";
+import {
+  toolsFromMCP,
+  type ToolCallAnalytics,
+} from "@decocms/harness/decopilot/mcp-tools";
+import { MCP_TOOL_CALL_TIMEOUT_MS } from "@decocms/harness/decopilot/harness-constants";
+import { requireDecopilotRunContext } from "@decocms/harness/decopilot/run-context";
+import type { HarnessStreamInput } from "@decocms/harness/types";
 
 /** Raw MCP tool entries returned by `passthroughClient.listTools()`. */
 export type PassthroughToolList = Awaited<
@@ -61,9 +66,6 @@ export interface AssembledTools {
   /** ConnectionsBlockTool entries derived from `listTools()` — consumed
    *  by `buildConnectionsBlock` in the prompt-assembly step. */
   connectionsBlockTools: ConnectionsBlockTool[];
-  /** Connection ids known to the agent; used by `createEnableToolTool`
-   *  to resolve short tool names against connection prefixes. */
-  connectionIds: Set<string>;
   /** Per-tool annotations (only populated in plan mode) — used to gate
    *  read-only vs write tools during enable_tool. */
   toolAnnotations: Map<string, { readOnlyHint?: boolean }>;
@@ -100,6 +102,103 @@ export interface AssembleDecopilotToolsExtras {
    *  activates this in advance — `null` is rejected by `getBuiltInTools`
    *  for tools that require it, but we forward whatever the caller has. */
   provider: MeshProvider | null;
+  /** Provider for `generate_image`. Caller passes the chat provider when
+   *  the org's `image` tier shares the chat credential. */
+  imageProvider: MeshProvider | null;
+  /** Provider for the quick `web_search` tool. Caller passes the chat
+   *  provider when the org's `web_search` tier shares the chat credential. */
+  webSearchProvider: MeshProvider | null;
+  /** Provider for the `deep_research` tool's async/deep path. Caller passes
+   *  the chat provider when the org's `deep_research` tier shares the chat
+   *  credential. */
+  deepResearchProvider: MeshProvider | null;
+  /** Per-turn HTML-artifact fast-path mirror (`org/home/{decks,pages}/
+   *  *.html`) — flushed into org-fs at step-end by the dispatch layer. */
+  htmlArtifactBuffer?: HtmlArtifactBuffer;
+  /** Usage roll-up sink (Task 17) — forwarded to the `subtask` built-in so a
+   *  delegated child run's tokens fold into the parent run's accumulator. */
+  onChildUsage?: (usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  }) => void;
+  /** Cluster-injected: makes slow built-ins (generate_image) run as durable
+   *  background jobs instead of holding the turn open. Omitted on desktop. */
+  backgroundDispatcher?: BackgroundDispatcher | null;
+  /**
+   * Portable MCP-client seam (HarnessDeps `mcpForAgent`). Generalizes the
+   * cluster's in-process `createVirtualClientFrom(virtualMcp, ctx,
+   * "passthrough", superUser, { listTimeoutMs })` so the daemon/desktop can
+   * swap in an HTTP `Client` at the agent's `mcp.url`. The cluster impl
+   * (supplied by `index.ts`) loads the Virtual MCP by id and returns a live
+   * `PassthroughClient`; the caller owns closing it via `result.close()`.
+   */
+  mcpForAgent: (
+    agentId: string,
+    opts?: { superUser?: boolean; listTimeoutMs?: number },
+  ) => Promise<PassthroughClient>;
+  /** Cluster-injected hook: resolve storage-ref args before each MCP tool
+   *  call. Omitted on desktop (no ctx) → args pass through unchanged. */
+  resolveArgs?: (
+    input: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>>;
+  /** Cluster-injected hook: emit per-tool-call analytics (posthog). Omitted
+   *  on desktop → no analytics. */
+  onToolCalled?: (event: ToolCallAnalytics) => void;
+}
+
+/**
+ * Built-in tools the agent loop depends on for mechanics (reading truncated
+ * outputs, the connections-block lazy-load via enable_tool, todo tracking).
+ * These are NEVER subject to the per-run allowlist — removing them would break
+ * the loop rather than scope it. The allowlist governs everything else: MCP
+ * tools, the user-facing capability built-ins (web_search, generate_image,
+ * subtask, …), the VM file tools, the browser tools, and read_resource /
+ * read_prompt — all selectable in the automations tool picker.
+ */
+const ALLOWLIST_EXEMPT_BUILTINS = new Set<string>([
+  "read_tool_output",
+  "enable_tool",
+  "open_in_agent",
+  "todo_write",
+  "update_interests",
+]);
+
+/**
+ * Filter the passthrough (MCP) tool set against the allowlist. The allowlist
+ * carries the RAW tool names the UI lists (from `listTools()`), so an MCP
+ * tool's model-facing (safe) key survives iff its raw name — or the safe name
+ * itself, for robustness — is allowed. A null allowlist is a no-op.
+ */
+function filterPassthroughByAllowlist(
+  set: ToolSet,
+  nameMap: Map<string, string>,
+  allow: Set<string> | null,
+): ToolSet {
+  if (!allow) return set;
+  const allowedSafe = new Set<string>();
+  for (const [raw, safe] of nameMap) {
+    if (allow.has(raw) || allow.has(safe)) allowedSafe.add(safe);
+  }
+  return Object.fromEntries(
+    Object.entries(set).filter(([name]) => allowedSafe.has(name)),
+  );
+}
+
+/**
+ * Filter built-ins against the allowlist, always keeping the loop-essential
+ * ones. A null allowlist is a no-op.
+ */
+function filterBuiltInsByAllowlist(
+  set: ToolSet,
+  allow: Set<string> | null,
+): ToolSet {
+  if (!allow) return set;
+  return Object.fromEntries(
+    Object.entries(set).filter(
+      ([name]) => ALLOWLIST_EXEMPT_BUILTINS.has(name) || allow.has(name),
+    ),
+  );
 }
 
 /**
@@ -110,29 +209,32 @@ export interface AssembleDecopilotToolsExtras {
  *     `result.close()` or `result.passthroughClient.close()`).
  *  2. Issues one `listTools()` call — its result is exposed via
  *     `passthroughToolList` so the caller doesn't need a second
- *     round-trip when building the connections block / enable_tool
- *     short-name index.
+ *     round-trip when building the connections block.
  */
 export async function assembleDecopilotTools(
   input: HarnessStreamInput,
-  ctx: MeshContext,
+  ctx: StudioContext,
   extras: AssembleDecopilotToolsExtras,
 ): Promise<AssembledTools> {
+  const runContext = requireDecopilotRunContext(input);
   const organization = ctx.organization!;
   const isPlanMode = input.mode === "plan";
+  // Per-run tool allowlist (model-facing names). Empty array is treated as
+  // "no restriction" so a misconfigured automation never ends up tool-less.
+  const allowlist =
+    input.toolAllowlist && input.toolAllowlist.length > 0
+      ? new Set(input.toolAllowlist)
+      : null;
 
   // superUser=true: the user is already authenticated as an org member,
   // the virtual MCP enforces which connections are in scope, and the
   // per-tool AuthTransport check would block every non-public connection
   // tool (GitHub, Slack, etc.) for users who don't have explicit per-tool
   // permissions configured — the wrong enforcement layer for chat.
-  const passthroughClient = await createVirtualClientFrom(
-    input.virtualMcp,
-    ctx,
-    "passthrough",
-    true,
-    { listTimeoutMs: 1_000 },
-  );
+  const passthroughClient = await extras.mcpForAgent(input.agent.id, {
+    superUser: true,
+    listTimeoutMs: 1_000,
+  });
 
   // Once the passthrough client is open, every subsequent failure in
   // tool assembly (toolsFromMCP, getBuiltInTools, listTools, …) MUST
@@ -143,14 +245,29 @@ export async function assembleDecopilotTools(
   // try/finally only covers post-construction errors, so the cleanup
   // belongs inside the helper.
   try {
-    const { tools: passthroughTools, nameMap: passthroughNameMap } =
-      await toolsFromMCP(
-        passthroughClient,
-        extras.toolOutputMap,
-        extras.writer,
-        input.toolApprovalLevel,
-        { ctx, isPlanMode },
-      );
+    const {
+      tools: rawPassthroughTools,
+      nameMap: passthroughNameMap,
+      rawTools: passthroughToolList,
+    } = await toolsFromMCP(
+      passthroughClient,
+      extras.toolOutputMap,
+      extras.writer,
+      input.toolApprovalLevel,
+      {
+        isPlanMode,
+        timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS,
+        resolveArgs: extras.resolveArgs,
+        onToolCalled: extras.onToolCalled,
+      },
+    );
+    // Restrict to the allowlist (if any) so enable_tool enumeration, the
+    // connections block, and the model-facing toolset all agree.
+    const passthroughTools = filterPassthroughByAllowlist(
+      rawPassthroughTools,
+      passthroughNameMap,
+      allowlist,
+    );
 
     // VM file tools bind to (virtualMcpId, branch, userId). The VM is
     // provisioned lazily on the first tool call inside getBuiltInTools.
@@ -166,7 +283,7 @@ export async function assembleDecopilotTools(
     //   Tradeoff: concurrent threads share /app, /home/sandbox, /tmp —
     //   parallel writes to overlapping filenames can race. Fine for
     //   reads and scoped outputs; revisit if it bites.
-    const vmMetadata = input.virtualMcp.metadata as {
+    const vmMetadata = runContext.virtualMcp.metadata as {
       githubRepo?: GithubRepo | null;
     };
     const isEphemeralAgent = !vmMetadata.githubRepo;
@@ -175,7 +292,7 @@ export async function assembleDecopilotTools(
           virtualMcpId: input.agent.id,
           branch: isEphemeralAgent
             ? "ephemeral"
-            : (input.branch ?? `thread:${extras.threadId}`),
+            : (runContext.branch ?? `thread:${extras.threadId}`),
           userId: input.user.id,
           // Used by share_with_user to scope artifacts under
           // model-outputs/<threadId>/. Cannot be derived from the
@@ -184,10 +301,13 @@ export async function assembleDecopilotTools(
         }
       : null;
 
-    const builtInTools = await getBuiltInTools(
+    const allBuiltInTools = await getBuiltInTools(
       extras.writer,
       {
         provider: extras.provider,
+        imageProvider: extras.imageProvider,
+        webSearchProvider: extras.webSearchProvider,
+        deepResearchProvider: extras.deepResearchProvider,
         organization,
         models: input.models,
         toolApprovalLevel: input.toolApprovalLevel,
@@ -196,22 +316,34 @@ export async function assembleDecopilotTools(
         pendingImages: extras.pendingImages,
         passthroughClient,
         vmContext,
+        htmlArtifactBuffer: extras.htmlArtifactBuffer,
         taskId: extras.threadId,
+        agentId: input.agent.id,
+        onChildUsage: extras.onChildUsage,
+        backgroundDispatcher: extras.backgroundDispatcher,
       },
       ctx,
     );
+    const builtInTools = filterBuiltInsByAllowlist(
+      allBuiltInTools,
+      allowlist,
+    ) as typeof allBuiltInTools;
 
     // Collect (rawName, safeName, connectionId) triples for the
-    // connections block, the set of connection ids for enable_tool
-    // short-name resolution, and the per-tool annotations used for
-    // plan-mode gating — all from a single listTools() round-trip.
-    const passthroughToolList = (await passthroughClient.listTools()).tools;
+    // connections block and the per-tool annotations used for plan-mode
+    // gating — both from the single listTools() round-trip toolsFromMCP
+    // already issued (reused via its `rawTools`), as the docstring intends.
     const connectionsBlockTools: ConnectionsBlockTool[] = [];
-    const connectionIds = new Set<string>();
     const toolAnnotations = new Map<string, { readOnlyHint?: boolean }>();
     for (const t of passthroughToolList) {
       const safeName = passthroughNameMap.get(t.name);
       if (!safeName) continue;
+      // Honor the allowlist so the connections block never advertises a tool
+      // the model can't actually call. The allowlist holds raw names; accept
+      // the safe name too for robustness.
+      if (allowlist && !allowlist.has(t.name) && !allowlist.has(safeName)) {
+        continue;
+      }
       // _meta.gatewayClientId is set by the gateway when the tool is
       // proxied from a non-virtual connection; the "unknown" fallback
       // only fires for tools that didn't traverse the gateway, which
@@ -226,7 +358,6 @@ export async function assembleDecopilotTools(
         safeName,
         connectionId,
       });
-      connectionIds.add(connectionId);
       if (isPlanMode) {
         toolAnnotations.set(safeName, {
           readOnlyHint: t.annotations?.readOnlyHint,
@@ -260,7 +391,6 @@ export async function assembleDecopilotTools(
       builtInTools,
       passthroughToolList,
       connectionsBlockTools,
-      connectionIds,
       toolAnnotations,
       vmContext,
       connectionTitleMap,

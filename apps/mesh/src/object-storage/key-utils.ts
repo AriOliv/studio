@@ -61,6 +61,21 @@ export function buildS3Prefix(orgId: string, prefix?: string): string {
 }
 
 /**
+ * Build the stable, non-expiring URL the UI / tools use to read an object by
+ * key. Backed by `GET /api/:org/files/*`, which proxies the object bytes
+ * through mesh (presigning internally). Single source of truth for this
+ * route shape.
+ */
+export function toFilesUrl(
+  baseUrl: string,
+  orgSlug: string,
+  key: string,
+): string {
+  const encodedKey = key.split("/").map(encodeURIComponent).join("/");
+  return `${baseUrl}/api/${encodeURIComponent(orgSlug)}/files/${encodedKey}`;
+}
+
+/**
  * Strip the org ID prefix from an S3 key, returning the relative key.
  */
 export function stripOrgPrefix(orgId: string, s3Key: string): string {

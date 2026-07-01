@@ -1,24 +1,40 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  existsSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   makeReadHandler,
   makeWriteHandler,
+  makeUnlinkHandler,
+  makeMkdirHandler,
+  makeRenameHandler,
   makeEditHandler,
   makeGrepHandler,
   makeGlobHandler,
+  collectEmptyDirectories,
+  pathSegmentDepth,
+  registerGlobAncestorDirectories,
+  GLOB_RESULT_LIMIT,
+  GLOB_MAX_RESULT_LIMIT,
+  resolveGlobResultLimit,
 } from "./fs";
 
 const hasRg = spawnSync("which", ["rg"]).status === 0;
 
-function b64(obj: unknown): string {
-  return Buffer.from(JSON.stringify(obj), "utf-8").toString("base64");
-}
-
 function post(path: string, obj: unknown): Request {
-  return new Request(`http://x${path}`, { method: "POST", body: b64(obj) });
+  return new Request(`http://x${path}`, {
+    method: "POST",
+    body: JSON.stringify(obj),
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 describe("fs handlers", () => {
@@ -33,7 +49,7 @@ describe("fs handlers", () => {
   it("read: returns numbered content for text", async () => {
     writeFileSync(join(appRoot, "a.txt"), "one\ntwo\nthree\n");
     const h = makeReadHandler({ appRoot, repoDir: appRoot });
-    const res = await h(post("/_decopilot_vm/read", { path: "a.txt" }));
+    const res = await h(post("/_sandbox/read", { path: "a.txt" }));
     const body = (await res.json()) as {
       kind: string;
       content: string;
@@ -45,12 +61,39 @@ describe("fs handlers", () => {
     expect(body.lineCount).toBeGreaterThanOrEqual(3);
   });
 
+  it("read: defaults to 2000 lines but full returns the entire file", async () => {
+    const lines = Array.from({ length: 2500 }, (_, i) => `line-${i + 1}`);
+    writeFileSync(join(appRoot, "big.txt"), lines.join("\n"));
+    const h = makeReadHandler({ appRoot, repoDir: appRoot });
+
+    const truncated = await h(post("/_sandbox/read", { path: "big.txt" }));
+    const truncatedBody = (await truncated.json()) as {
+      content: string;
+      lineCount: number;
+    };
+    expect(truncatedBody.lineCount).toBe(2500);
+    expect(truncatedBody.content).toContain("1\tline-1");
+    expect(truncatedBody.content).toContain("2000\tline-2000");
+    expect(truncatedBody.content).not.toContain("2500\tline-2500");
+
+    const full = await h(
+      post("/_sandbox/read", { path: "big.txt", full: true }),
+    );
+    const fullBody = (await full.json()) as {
+      content: string;
+      lineCount: number;
+    };
+    expect(fullBody.lineCount).toBe(2500);
+    expect(fullBody.content).toContain("1\tline-1");
+    expect(fullBody.content).toContain("2500\tline-2500");
+  });
+
   it("read: returns base64 + mediaType for jpeg", async () => {
     // Minimal JPEG: SOI + EOI markers, enough to pass the magic-byte sniff.
     const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9]);
     writeFileSync(join(appRoot, "img.jpg"), jpeg);
     const h = makeReadHandler({ appRoot, repoDir: appRoot });
-    const res = await h(post("/_decopilot_vm/read", { path: "img.jpg" }));
+    const res = await h(post("/_sandbox/read", { path: "img.jpg" }));
     const body = (await res.json()) as {
       kind: string;
       mediaType: string;
@@ -69,7 +112,7 @@ describe("fs handlers", () => {
     ]);
     writeFileSync(join(appRoot, "img.png"), png);
     const h = makeReadHandler({ appRoot, repoDir: appRoot });
-    const res = await h(post("/_decopilot_vm/read", { path: "img.png" }));
+    const res = await h(post("/_sandbox/read", { path: "img.png" }));
     const body = (await res.json()) as { kind: string; mediaType: string };
     expect(body.kind).toBe("image");
     expect(body.mediaType).toBe("image/png");
@@ -78,13 +121,13 @@ describe("fs handlers", () => {
   it("read: rejects non-image binary files", async () => {
     writeFileSync(join(appRoot, "bin"), Buffer.from([0, 1, 2, 3]));
     const h = makeReadHandler({ appRoot, repoDir: appRoot });
-    const res = await h(post("/_decopilot_vm/read", { path: "bin" }));
+    const res = await h(post("/_sandbox/read", { path: "bin" }));
     expect(res.status).toBe(400);
   });
 
   it("read: rejects relative path escape", async () => {
     const h = makeReadHandler({ appRoot, repoDir: appRoot });
-    const res = await h(post("/_decopilot_vm/read", { path: "../etc/passwd" }));
+    const res = await h(post("/_sandbox/read", { path: "../etc/passwd" }));
     expect(res.status).toBe(400);
   });
 
@@ -92,7 +135,7 @@ describe("fs handlers", () => {
     writeFileSync(join(appRoot, "abs.txt"), "hello");
     const h = makeReadHandler({ appRoot, repoDir: appRoot });
     const res = await h(
-      post("/_decopilot_vm/read", { path: join(appRoot, "abs.txt") }),
+      post("/_sandbox/read", { path: join(appRoot, "abs.txt") }),
     );
     const body = (await res.json()) as { kind: string; content: string };
     expect(body.kind).toBe("text");
@@ -102,17 +145,89 @@ describe("fs handlers", () => {
   it("write: creates file and returns byte count", async () => {
     const h = makeWriteHandler({ appRoot, repoDir: appRoot });
     const res = await h(
-      post("/_decopilot_vm/write", { path: "new.txt", content: "hello" }),
+      post("/_sandbox/write", { path: "new.txt", content: "hello" }),
     );
     expect(res.status).toBe(200);
     expect(readFileSync(join(appRoot, "new.txt"), "utf-8")).toBe("hello");
+  });
+
+  it("unlink: deletes a .deco/blocks json file", async () => {
+    const blockDir = join(appRoot, ".deco", "blocks");
+    mkdirSync(blockDir, { recursive: true });
+    const blockPath = join(blockDir, "Header.json");
+    writeFileSync(blockPath, "{}");
+    const h = makeUnlinkHandler({ appRoot, repoDir: appRoot });
+    const res = await h(
+      post("/_sandbox/unlink", { path: ".deco/blocks/Header.json" }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; existed: boolean };
+    expect(body.ok).toBe(true);
+    expect(body.existed).toBe(true);
+    expect(() => readFileSync(blockPath)).toThrow();
+  });
+
+  it("unlink: is idempotent when the file is missing", async () => {
+    const h = makeUnlinkHandler({ appRoot, repoDir: appRoot });
+    const res = await h(
+      post("/_sandbox/unlink", { path: ".deco/blocks/missing.json" }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; existed: boolean };
+    expect(body.existed).toBe(false);
+  });
+
+  it("unlink: deletes any file under the workspace root", async () => {
+    writeFileSync(join(appRoot, "secret.txt"), "x");
+    const h = makeUnlinkHandler({ appRoot, repoDir: appRoot });
+    const res = await h(post("/_sandbox/unlink", { path: "secret.txt" }));
+    expect(res.status).toBe(200);
+    expect(() => readFileSync(join(appRoot, "secret.txt"))).toThrow();
+  });
+
+  it("unlink: refuses directories without recursive", async () => {
+    const blockDir = join(appRoot, ".deco", "blocks");
+    mkdirSync(blockDir, { recursive: true });
+    const h = makeUnlinkHandler({ appRoot, repoDir: appRoot });
+    const res = await h(post("/_sandbox/unlink", { path: ".deco/blocks" }));
+    expect(res.status).toBe(400);
+  });
+
+  it("unlink: deletes directories when recursive is true", async () => {
+    const dir = join(appRoot, "nested", "dir");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "a.txt"), "x");
+    const h = makeUnlinkHandler({ appRoot, repoDir: appRoot });
+    const res = await h(
+      post("/_sandbox/unlink", { path: "nested", recursive: true }),
+    );
+    expect(res.status).toBe(200);
+    expect(() => readFileSync(join(dir, "a.txt"))).toThrow();
+  });
+
+  it("mkdir: creates a directory", async () => {
+    const h = makeMkdirHandler({ appRoot, repoDir: appRoot });
+    const res = await h(post("/_sandbox/mkdir", { path: "new-dir/nested" }));
+    expect(res.status).toBe(200);
+    expect(existsSync(join(appRoot, "new-dir", "nested"))).toBe(true);
+  });
+
+  it("rename: moves a file", async () => {
+    writeFileSync(join(appRoot, "old.txt"), "hello");
+    const h = makeRenameHandler({ appRoot, repoDir: appRoot });
+    const res = await h(
+      post("/_sandbox/rename", { from: "old.txt", to: "new.txt" }),
+    );
+    expect(res.status).toBe(200);
+    expect(readFileSync(join(appRoot, "new.txt"), "utf-8")).toBe("hello");
+    expect(() => readFileSync(join(appRoot, "old.txt"))).toThrow();
   });
 
   it("edit: rejects when old_string doesn't match", async () => {
     writeFileSync(join(appRoot, "e.txt"), "abc");
     const h = makeEditHandler({ appRoot, repoDir: appRoot });
     const res = await h(
-      post("/_decopilot_vm/edit", {
+      post("/_sandbox/edit", {
         path: "e.txt",
         old_string: "xyz",
         new_string: "q",
@@ -125,7 +240,7 @@ describe("fs handlers", () => {
     writeFileSync(join(appRoot, "e.txt"), "a a a");
     const h = makeEditHandler({ appRoot, repoDir: appRoot });
     const res = await h(
-      post("/_decopilot_vm/edit", {
+      post("/_sandbox/edit", {
         path: "e.txt",
         old_string: "a",
         new_string: "b",
@@ -138,7 +253,7 @@ describe("fs handlers", () => {
     writeFileSync(join(appRoot, "e.txt"), "a a a");
     const h = makeEditHandler({ appRoot, repoDir: appRoot });
     const res = await h(
-      post("/_decopilot_vm/edit", {
+      post("/_sandbox/edit", {
         path: "e.txt",
         old_string: "a",
         new_string: "b",
@@ -153,7 +268,7 @@ describe("fs handlers", () => {
     writeFileSync(join(appRoot, "needle.txt"), "hello world\n");
     const h = makeGrepHandler({ appRoot, repoDir: appRoot });
     const res = await h(
-      post("/_decopilot_vm/grep", {
+      post("/_sandbox/grep", {
         pattern: "hello",
         output_mode: "content",
       }),
@@ -165,8 +280,166 @@ describe("fs handlers", () => {
   (hasRg ? it : it.skip)("glob: returns matching file names", async () => {
     writeFileSync(join(appRoot, "x.txt"), "");
     const h = makeGlobHandler({ appRoot, repoDir: appRoot });
-    const res = await h(post("/_decopilot_vm/glob", { pattern: "*.txt" }));
-    const body = (await res.json()) as { files: string[] };
+    const res = await h(post("/_sandbox/glob", { pattern: "*.txt" }));
+    const body = (await res.json()) as {
+      files: string[];
+      directories?: string[];
+    };
     expect(body.files).toContain("x.txt");
+    expect(body.directories ?? []).toEqual([]);
+  });
+
+  it("glob: includes dot-directories such as .deco", async () => {
+    mkdirSync(join(appRoot, ".deco/blocks"), { recursive: true });
+    writeFileSync(join(appRoot, ".deco/blocks/foo.json"), "{}");
+    const h = makeGlobHandler({ appRoot, repoDir: appRoot });
+    const res = await h(post("/_sandbox/glob", { pattern: "**/*" }));
+    const body = (await res.json()) as {
+      files: string[];
+      directories?: string[];
+    };
+    expect(body.files).toContain(".deco/blocks/foo.json");
+  });
+
+  it("glob: shows dotfiles but excludes GLOB_EXCLUDE_DIRS", async () => {
+    writeFileSync(join(appRoot, ".env"), "SECRET=1");
+    mkdirSync(join(appRoot, ".deco/blocks"), { recursive: true });
+    writeFileSync(join(appRoot, ".deco/blocks/foo.json"), "{}");
+    mkdirSync(join(appRoot, ".git"), { recursive: true });
+    writeFileSync(join(appRoot, ".git/config"), "");
+    const h = makeGlobHandler({ appRoot, repoDir: appRoot });
+    const res = await h(post("/_sandbox/glob", { pattern: "**/*" }));
+    const body = (await res.json()) as { files: string[] };
+    expect(body.files).toContain(".env");
+    expect(body.files).toContain(".deco/blocks/foo.json");
+    expect(body.files).not.toContain(".git/config");
+  });
+
+  it("glob: includes empty directories without placeholder files", async () => {
+    mkdirSync(join(appRoot, "tavano-folder"), { recursive: true });
+    const h = makeGlobHandler({ appRoot, repoDir: appRoot });
+    const res = await h(post("/_sandbox/glob", { pattern: "**/*" }));
+    const body = (await res.json()) as {
+      files: string[];
+      directories: string[];
+    };
+    expect(body.directories).toContain("tavano-folder");
+  });
+
+  it("glob: includes .gitkeep folder markers in files", async () => {
+    mkdirSync(join(appRoot, "empty-dir"), { recursive: true });
+    writeFileSync(join(appRoot, "empty-dir", ".gitkeep"), "");
+    const h = makeGlobHandler({ appRoot, repoDir: appRoot });
+    const res = await h(post("/_sandbox/glob", { pattern: "**/*" }));
+    const body = (await res.json()) as { files: string[] };
+    expect(body.files).toContain("empty-dir/.gitkeep");
+  });
+
+  it("glob: maxDepth skips deeper files but registers ancestor directories", async () => {
+    mkdirSync(join(appRoot, "a/b/c/d"), { recursive: true });
+    writeFileSync(join(appRoot, "a/b/c/d/deep.txt"), "x");
+    writeFileSync(join(appRoot, "a/b/shallow.txt"), "y");
+    const h = makeGlobHandler({ appRoot, repoDir: appRoot });
+    const res = await h(
+      post("/_sandbox/glob", { pattern: "**/*", maxDepth: 3 }),
+    );
+    const body = (await res.json()) as {
+      files: string[];
+      directories: string[];
+    };
+    expect(body.files).toContain("a/b/shallow.txt");
+    expect(body.files).not.toContain("a/b/c/d/deep.txt");
+    expect(body.directories).toContain("a/b/c");
+  });
+
+  it("glob: explicit limit truncates results", async () => {
+    for (let i = 0; i < 7; i++) {
+      writeFileSync(join(appRoot, `file-${i}.txt`), "");
+    }
+    const h = makeGlobHandler({ appRoot, repoDir: appRoot });
+    const res = await h(
+      post("/_sandbox/glob", {
+        pattern: "*.txt",
+        limit: 5,
+      }),
+    );
+    const body = (await res.json()) as {
+      files: string[];
+      truncated?: boolean;
+    };
+    expect(body.files.length).toBe(5);
+    expect(body.truncated).toBe(true);
+  });
+
+  it("resolveGlobResultLimit caps at GLOB_MAX_RESULT_LIMIT", () => {
+    expect(resolveGlobResultLimit(undefined)).toBe(GLOB_RESULT_LIMIT);
+    expect(resolveGlobResultLimit(GLOB_MAX_RESULT_LIMIT + 999)).toBe(
+      GLOB_MAX_RESULT_LIMIT,
+    );
+  });
+
+  it("glob: default limit remains GLOB_RESULT_LIMIT for agents", async () => {
+    for (let i = 0; i < GLOB_RESULT_LIMIT + 5; i++) {
+      writeFileSync(join(appRoot, `agent-${i}.txt`), "");
+    }
+    const h = makeGlobHandler({ appRoot, repoDir: appRoot });
+    const res = await h(post("/_sandbox/glob", { pattern: "agent-*.txt" }));
+    const body = (await res.json()) as {
+      files: string[];
+      truncated?: boolean;
+    };
+    expect(body.files.length).toBe(GLOB_RESULT_LIMIT);
+    expect(body.truncated).toBe(true);
+  });
+
+  it("pathSegmentDepth counts path segments", () => {
+    expect(pathSegmentDepth("a/b/c.ts")).toBe(3);
+    expect(pathSegmentDepth("README.md")).toBe(1);
+  });
+
+  it("registerGlobAncestorDirectories adds ancestors up to maxDepth", () => {
+    const dirs = new Set<string>();
+    registerGlobAncestorDirectories("a/b/c/d.ts", 3, dirs, true);
+    expect([...dirs].sort()).toEqual(["a", "a/b", "a/b/c"]);
+  });
+
+  it("registerGlobAncestorDirectories handles directory paths", () => {
+    const dirs = new Set<string>();
+    registerGlobAncestorDirectories("a/b/c/d", 3, dirs, false);
+    expect([...dirs].sort()).toEqual(["a", "a/b", "a/b/c"]);
+  });
+
+  it("collectEmptyDirectories ignores parents of nested directories", () => {
+    expect(collectEmptyDirectories([], ["src", "src/components"])).toEqual([
+      "src/components",
+    ]);
+  });
+
+  it("unlink: refuses recursive delete of repository root", async () => {
+    const h = makeUnlinkHandler({ appRoot, repoDir: appRoot });
+    const res = await h(
+      post("/_sandbox/unlink", { path: ".", recursive: true }),
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("unlink: refuses deleting .git", async () => {
+    mkdirSync(join(appRoot, ".git"), { recursive: true });
+    writeFileSync(join(appRoot, ".git", "HEAD"), "ref: refs/heads/main\n");
+    const h = makeUnlinkHandler({ appRoot, repoDir: appRoot });
+    const res = await h(
+      post("/_sandbox/unlink", { path: ".git/HEAD", recursive: false }),
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("rename: rejects destination that already exists", async () => {
+    writeFileSync(join(appRoot, "old.txt"), "hello");
+    writeFileSync(join(appRoot, "new.txt"), "taken");
+    const h = makeRenameHandler({ appRoot, repoDir: appRoot });
+    const res = await h(
+      post("/_sandbox/rename", { from: "old.txt", to: "new.txt" }),
+    );
+    expect(res.status).toBe(400);
   });
 });

@@ -12,7 +12,16 @@ import type {
  * Bakes in the org ID so callers don't need to pass it on every call.
  */
 export interface BoundObjectStorage {
-  get(key: string): Promise<GetObjectResult | GetObjectTooLargeResult>;
+  /**
+   * Read an object, or return a `FILE_TOO_LARGE` marker with a presigned URL
+   * when it exceeds `presignWhenLargerThan` (the caller's inline budget).
+   */
+  getBytesOrPresign(
+    key: string,
+    opts: { presignWhenLargerThan: number; presignExpiresIn?: number },
+  ): Promise<GetObjectResult | GetObjectTooLargeResult>;
+  /** Read an object's raw bytes, uncapped. */
+  getBytes(key: string): Promise<Uint8Array>;
   put(
     key: string,
     body: string | Uint8Array,
@@ -27,7 +36,11 @@ export interface BoundObjectStorage {
   delete(key: string): Promise<void>;
   head(key: string): Promise<HeadObjectResult>;
   /** Generate a presigned GET URL for the given key. */
-  presignedGetUrl(key: string, expiresIn?: number): Promise<string>;
+  presignedGetUrl(
+    key: string,
+    expiresIn?: number,
+    opts?: { requireFetchable?: boolean },
+  ): Promise<string>;
   /** Generate a presigned PUT URL for the given key. */
   presignedPutUrl(
     key: string,
@@ -44,13 +57,14 @@ export function createBoundObjectStorage(
   orgId: string,
 ): BoundObjectStorage {
   return {
-    get: (key) => s3.get(orgId, key),
+    getBytesOrPresign: (key, opts) => s3.getBytesOrPresign(orgId, key, opts),
+    getBytes: (key) => s3.getBytes(orgId, key),
     put: (key, body, options) => s3.put(orgId, key, body, options),
     list: (options) => s3.list(orgId, options),
     delete: (key) => s3.delete(orgId, key),
     head: (key) => s3.head(orgId, key),
-    presignedGetUrl: (key, expiresIn) =>
-      s3.presignedGetUrl(orgId, key, expiresIn),
+    presignedGetUrl: (key, expiresIn, opts) =>
+      s3.presignedGetUrl(orgId, key, expiresIn, opts),
     presignedPutUrl: (key, expiresIn, contentType) =>
       s3.presignedPutUrl(orgId, key, expiresIn, contentType),
   };

@@ -8,7 +8,9 @@ import {
   useMCPClient,
   useMCPToolsList,
   useMCPToolCall,
+  parseDevConnectionId,
 } from "@decocms/mesh-sdk";
+import { useSandboxLifecycle } from "@/web/components/sandbox/hooks/sandbox-lifecycle-context";
 import type {
   McpUiDisplayMode,
   McpUiMessageRequest,
@@ -111,16 +113,46 @@ export function AppViewContent({
   args?: Record<string, unknown>;
 }) {
   const { org } = useProjectContext();
+  const lifecycle = useSandboxLifecycle();
+  // A dev view (`dev_<id>`) against a user-desktop sandbox renders against the
+  // loopback dev server, which the cloud proxy can't reach. The browser is
+  // co-located with the daemon, so connect directly to the previewUrl (deco dev
+  // server CORS is `*`). Gated on a dev connection id, so regular connection UIs
+  // and agent-sandbox dev views (public previewUrl) keep the cloud route.
+  const devMcpUrl =
+    parseDevConnectionId(connectionId) &&
+    lifecycle.vmEntry?.sandboxProviderKind === "user-desktop" &&
+    lifecycle.previewUrl
+      ? `${lifecycle.previewUrl.replace(/\/+$/, "")}/api/mcp`
+      : undefined;
   const client = useMCPClient({
     connectionId,
     orgId: org.id,
     orgSlug: org.slug,
+    mcpUrl: devMcpUrl,
   });
   const { data: toolsResult } = useMCPToolsList({ client });
 
   const decodedToolName = stripMcpServerPrefix(decodeURIComponent(toolName));
 
-  const tool = toolsResult.tools.find((t) => t.name === decodedToolName);
+  // Try exact match first. If that fails, the decoded name may be the original
+  // (un-namespaced) tool name while the tools list has gateway-namespaced names
+  // (e.g. "render_html" vs "conn-abc_render_html"), or vice versa. Fall back to
+  // matching by the base name with the gateway namespace stripped from both sides.
+  const tool =
+    toolsResult.tools.find((t) => t.name === decodedToolName) ??
+    toolsResult.tools.find((t) => {
+      const clientId = getGatewayClientId(t._meta);
+      if (!clientId) return false;
+      // Case 1: decoded name is the base name, tool list has namespaced names
+      const baseName = stripToolNamespace(t.name, clientId);
+      if (baseName === decodedToolName) return true;
+      // Case 2: decoded name has namespace prefix, tool list has base names
+      const decodedBase = stripToolNamespace(decodedToolName, clientId);
+      if (decodedBase !== decodedToolName && t.name === decodedBase)
+        return true;
+      return false;
+    });
 
   const resourceURI = tool?._meta ? getUIResourceUri(tool._meta) : undefined;
 

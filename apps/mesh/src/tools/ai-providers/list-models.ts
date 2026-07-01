@@ -1,6 +1,6 @@
 import z from "zod";
 import { defineTool } from "../../core/define-tool";
-import { requireAuth, requireOrganization } from "../../core/mesh-context";
+import { requireAuth, requireOrganization } from "../../core/studio-context";
 import {
   checkModelPermission,
   fetchModelPermissions,
@@ -62,13 +62,10 @@ export const AI_PROVIDERS_LIST_MODELS = defineTool({
       return { models: CODEX_MODELS };
     }
 
-    const allowedModels = await fetchModelPermissions(
-      ctx.db,
-      org.id,
-      ctx.auth.user?.role,
-    );
-
-    const models = await ctx.aiProviders.listModels(input.keyId, org.id);
+    const [models, allowedModels] = await Promise.all([
+      ctx.aiProviders.listModels(input.keyId, org.id),
+      fetchModelPermissions(ctx.db, org.id, ctx.auth.user?.role),
+    ]);
 
     const filtered = models.filter((m) =>
       checkModelPermission(allowedModels, input.keyId, m.modelId),

@@ -6,9 +6,10 @@
  * Branch resolution (only meaningful when the vMCP has a githubRepo):
  *   1. Honor `data.branch` when provided.
  *   2. Otherwise pick the most-recently-touched branch from the user's
- *      `vmMap[userId]` so a new task lands on a warm sandbox.
- *   3. Fall back to a freshly generated `deco/<adj>-<noun>` name when the
- *      user has no vmMap entries for this vMCP.
+ *      `sandboxMap[userId]` so a new task lands on a warm sandbox.
+ *   3. Fall back to a freshly generated Bayer-style `<greek>-<constellation>`
+ *      name (e.g. `alpha-centauri`) when the user has no sandboxMap entries
+ *      for this vMCP.
  *
  * Threads created on a vMCP without a githubRepo always get `branch = null`.
  *
@@ -22,7 +23,8 @@ import {
   getUserId,
   requireAuth,
   requireOrganization,
-} from "../../core/mesh-context";
+} from "../../core/studio-context";
+import { normalizeThreadForResponse } from "./helpers";
 import { ThreadCreateDataSchema, ThreadEntitySchema } from "./schema";
 import { generatePrefixedId } from "@/shared/utils/generate-id";
 import { generateBranchName } from "@/shared/branch-name";
@@ -47,23 +49,37 @@ type GithubRepoMeta = {
   } | null;
 };
 
-type VmMapMeta = {
-  vmMap?: Record<string, Record<string, { createdAt?: number }>>;
+type SandboxMapMeta = {
+  sandboxMap?: Record<
+    string,
+    Record<string, Record<string, { createdAt?: number }>>
+  >;
 };
 
 /**
- * Pick the user's most-recently-touched branch from vmMap. Returns undefined
- * when the user has no entries (caller falls back to generateBranchName).
+ * Pick the user's most-recently-touched branch from sandboxMap (3-level shape:
+ * sandboxMap[userId][branch][sandboxProviderKind] → SandboxRecord). Returns
+ * undefined when the user has no entries (caller falls back to
+ * generateBranchName).
  */
-function pickWarmBranchFromVmMap(
-  vmMap: VmMapMeta["vmMap"],
+function pickWarmBranchFromSandboxMap(
+  sandboxMap: SandboxMapMeta["sandboxMap"],
   userId: string,
 ): string | undefined {
-  const entries = vmMap?.[userId];
-  if (!entries) return undefined;
-  const sorted = Object.entries(entries).sort(
-    ([, a], [, b]) => (b.createdAt ?? 0) - (a.createdAt ?? 0),
-  );
+  const branchMap = sandboxMap?.[userId];
+  if (!branchMap) return undefined;
+  // For each branch, take the max createdAt across all sandboxProviderKind entries.
+  const sorted = Object.entries(branchMap).sort(([, aKinds], [, bKinds]) => {
+    const aMax = Math.max(
+      0,
+      ...Object.values(aKinds).map((e) => e.createdAt ?? 0),
+    );
+    const bMax = Math.max(
+      0,
+      ...Object.values(bKinds).map((e) => e.createdAt ?? 0),
+    );
+    return bMax - aMax;
+  });
   return sorted[0]?.[0];
 }
 
@@ -102,7 +118,7 @@ export const COLLECTION_THREADS_CREATE = defineTool({
     }
 
     const metadata = vmcp.metadata as
-      | (GithubRepoMeta & VmMapMeta)
+      | (GithubRepoMeta & SandboxMapMeta)
       | null
       | undefined;
     const githubRepo = metadata?.githubRepo;
@@ -110,7 +126,7 @@ export const COLLECTION_THREADS_CREATE = defineTool({
     if (githubRepo) {
       branch =
         data.branch ??
-        pickWarmBranchFromVmMap(metadata?.vmMap, userId) ??
+        pickWarmBranchFromSandboxMap(metadata?.sandboxMap, userId) ??
         generateBranchName();
     }
 
@@ -137,10 +153,7 @@ export const COLLECTION_THREADS_CREATE = defineTool({
     });
 
     return {
-      item: {
-        ...result,
-        hidden: result.hidden ?? false,
-      },
+      item: normalizeThreadForResponse(result),
     };
   },
 });

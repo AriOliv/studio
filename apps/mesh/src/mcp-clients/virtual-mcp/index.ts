@@ -9,10 +9,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { isDecopilot } from "@decocms/mesh-sdk";
 import { SpanStatusCode } from "@opentelemetry/api";
 import { getMcpListCache } from "../mcp-list-cache";
-import type { MeshContext } from "../../core/mesh-context";
+import type { StudioContext } from "../../core/studio-context";
 import type { ConnectionEntity } from "../../tools/connection/schema";
 import type { VirtualMCPEntity } from "../../tools/virtual/schema";
 import { PassthroughClient } from "./passthrough-client";
+import { renderSkillsCatalogBlock } from "./skills-instructions";
 import type { VirtualClientOptions } from "./types";
 
 /**
@@ -38,7 +39,7 @@ function isSelfReferencingVirtual(
  */
 export async function createVirtualClient(
   connection: ConnectionEntity,
-  ctx: MeshContext,
+  ctx: StudioContext,
   superUser = false,
 ): Promise<Client> {
   // Virtual MCP ID is the connection ID
@@ -66,17 +67,26 @@ export async function createVirtualClient(
  */
 export async function createVirtualClientFrom(
   virtualMcp: VirtualMCPEntity,
-  ctx: MeshContext,
+  ctx: StudioContext,
   _strategy: "passthrough",
   superUser = false,
-  options?: { listTimeoutMs?: number },
+  options?: {
+    listTimeoutMs?: number;
+    includeSkillsCatalog?: boolean;
+    /**
+     * Pre-resolved connections to prepend to the aggregated set — e.g. the
+     * ephemeral per-user dev-server connection (`dev_<id>`). Prepended so they
+     * shadow same-named virtual-mcp tools (the aggregator dedups first-wins).
+     */
+    additionalConnections?: ConnectionEntity[];
+  },
 ): Promise<PassthroughClient> {
   // Inclusion mode: use only the connections specified in virtual MCP
   const connectionIds = virtualMcp.connections.map((c) => c.connection_id);
 
   // Load all connections in parallel
   const allConnections = await ctx.tracer.startActiveSpan(
-    "mesh.virtual_mcp.load_connections",
+    "studio.virtual_mcp.load_connections",
     {
       attributes: {
         "virtual_mcp.id": virtualMcp.id ?? "decopilot",
@@ -113,6 +123,22 @@ export async function createVirtualClientFrom(
       !isSelfReferencingVirtual(conn, virtualMcp.id),
   );
 
+  // Prepend caller-provided connections (e.g. the ephemeral dev-server
+  // connection for a dev-capable agent). Prepended so their tools win the
+  // aggregator's first-occurrence-wins dedup over any same-named tool.
+  if (options?.additionalConnections?.length) {
+    loadedConnections.unshift(...options.additionalConnections);
+  }
+
+  // Agent runtimes opt into the skill catalog: enumerate the org's skills now
+  // (async — the sync getInstructions() can't) and stash the rendered block so
+  // it reaches both the cluster engine and the desktop daemon. Cheap: the
+  // public portion is cached process-wide. Skipped for non-agent consumers
+  // (e.g. the home-next-actions prompt poll).
+  const skillsBlock = options?.includeSkillsCatalog
+    ? ((await renderSkillsCatalogBlock(ctx, virtualMcp)) ?? undefined)
+    : undefined;
+
   // Build aggregator options
   const clientOptions: VirtualClientOptions = {
     connections: loadedConnections,
@@ -120,6 +146,7 @@ export async function createVirtualClientFrom(
     superUser,
     mcpListCache: getMcpListCache() ?? undefined,
     listTimeoutMs: options?.listTimeoutMs,
+    skillsBlock,
   };
 
   return new PassthroughClient(clientOptions, ctx);

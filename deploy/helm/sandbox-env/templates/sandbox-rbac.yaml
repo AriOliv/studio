@@ -1,5 +1,5 @@
 # RBAC for the mesh ServiceAccount to drive the agent-sandbox operator from
-# inside the cluster. The runner (packages/sandbox/server/runner/agent-sandbox/) needs:
+# inside the cluster. The runner (packages/sandbox/server/provider/agent-sandbox/) needs:
 #   - sandboxclaims CRUD/patch (per-tenant claim lifecycle, idle TTL refresh)
 #   - sandboxes get/list/watch (waitForSandboxReady streams `?watch=true`)
 #   - pods/portforward create (kubectl-style tunnel to the daemon container)
@@ -17,7 +17,7 @@
 #        waitForDaemonReady) on every code-execution. This path uses
 #        portforward unconditionally — see runner.ts:openForwarder. It
 #        works the same whether mesh runs in-cluster or on a developer's
-#        laptop, and routes through the apiserver so we don't have to
+#        desktop, and routes through the apiserver so we don't have to
 #        open daemon ingress on 9000 to mesh's pod selector.
 #   In production we *could* switch path 2 to in-cluster Service DNS and
 #   drop portforward from this Role; the daemon already enforces its own
@@ -69,12 +69,15 @@ rules:
   # `istio-system` (or wherever `previewGateway.namespace` points) can
   # route `<handle>.<domain>` traffic directly to the operator-created
   # headless Service — bypassing mesh as a proxy. `delete` mirrors the
-  # claim teardown path. `get` is used for the create-if-missing branch
-  # in `adopt()` so legacy claims (provisioned before this rolled out)
-  # get their HTTPRoute backfilled.
+  # claim teardown path. `patch` is required because the runner upserts
+  # the route via Server-Side Apply (`applyHttpRoute`) — apply-patch is a
+  # content type, but the verb on the resource is still PATCH. Without it
+  # every route write 403s, so re-adoption can't re-point the backendRef
+  # and the preview hostname serves an empty 500. `get`/`create` remain
+  # for the legacy-claim backfill path in `adopt()`.
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes"]
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "create", "delete", "patch"]
   # Per-claim Service port ownership. agent-sandbox v0.4.x creates the
   # Service for each Sandbox with `spec.ports: []` (the operator's
   # contract is that callers reach pods via direct pod-IP DNS). Istio's

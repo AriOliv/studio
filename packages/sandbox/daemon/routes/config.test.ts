@@ -6,8 +6,11 @@ import type { TenantConfig } from "../types";
 const BOOT_ID = "boot-cfg-test";
 
 function buildReq(method: "PUT" | "POST", body: object): Request {
-  const b64 = Buffer.from(JSON.stringify(body), "utf-8").toString("base64");
-  return new Request("http://x/_decopilot_vm/config", { method, body: b64 });
+  return new Request("http://x/_sandbox/config", {
+    method,
+    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 const SEED: TenantConfig = {
@@ -174,5 +177,25 @@ describe("makeConfigReadHandler", () => {
     expect(body.config.git?.repository?.cloneUrl).toBe(
       SEED.git?.repository?.cloneUrl,
     );
+  });
+
+  it("returns repoDir when provided", async () => {
+    const h = makeConfigReadHandler({
+      daemonBootId: BOOT_ID,
+      store,
+      repoDir: "/home/user/project",
+    });
+    const res = await h();
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { repoDir: string | null };
+    expect(body.repoDir).toBe("/home/user/project");
+  });
+
+  it("returns null repoDir when not provided", async () => {
+    const h = makeConfigReadHandler({ daemonBootId: BOOT_ID, store });
+    const res = await h();
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { repoDir: string | null };
+    expect(body.repoDir).toBeNull();
   });
 });

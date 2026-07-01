@@ -1,7 +1,7 @@
 /**
  * Context Factory
  *
- * Creates MeshContext instances from HTTP requests (via Hono Context).
+ * Creates StudioContext instances from HTTP requests (via Hono Context).
  * Handles:
  * - API key verification
  * - Organization scope extraction (from Better Auth)
@@ -16,7 +16,11 @@ import { CredentialVault } from "../encryption/credential-vault";
 import { getSettings } from "../settings";
 import { getBaseUrl } from "./server-constants";
 import { ConnectionStorage } from "../storage/connection";
-import { VirtualMCPStorage } from "../storage/virtual";
+import { ConnectionCredentialVaultStorage } from "../storage/connection-credential-vault";
+import {
+  createRequestCachedVirtualMcps,
+  VirtualMCPStorage,
+} from "../storage/virtual";
 import {
   SqlMonitoringStorage,
   type SqlDialect,
@@ -24,8 +28,14 @@ import {
 import {
   createMonitoringEngine,
   ClickHouseClientEngine,
+  DuckDBEngine,
+  buildOtlpFlatSource,
 } from "../monitoring/query-engine";
-import type { QueryEngine } from "../monitoring/query-engine";
+import type {
+  QueryEngine,
+  DuckDBGcsConfig,
+  MonitoringDateRange,
+} from "../monitoring/query-engine";
 import { getLogsDir, getMetricsDir } from "../monitoring/schema";
 import { OrganizationSettingsStorage } from "../storage/organization-settings";
 import { VirtualMcpPluginConfigsStorage } from "../storage/virtual-mcp-plugin-configs";
@@ -33,6 +43,9 @@ import { createAutomationsStorage } from "../storage/automations";
 import { KyselyTriggerCallbackTokenStorage } from "../storage/trigger-callback-tokens";
 import { BrandContextStorage } from "../storage/brand-context";
 import { OrganizationDomainStorage } from "../storage/organization-domains";
+import { OrganizationJoinRequestStorage } from "../storage/organization-join-requests";
+import { KyselyKVStorage } from "../storage/kv";
+import { KyselyInterestsStorage } from "../storage/interests";
 import { OrgSsoConfigStorage } from "../storage/org-sso-config";
 import { OrgSsoSessionStorage } from "../storage/org-sso-sessions";
 import {
@@ -47,18 +60,19 @@ import { TagStorage } from "../storage/tags";
 import type { Database, Permission } from "../storage/types";
 import { UserStorage } from "../storage/user";
 import { AccessControl } from "./access-control";
+import { buildWildcardPermission } from "./permission-wildcard";
+import { isOrgArchived } from "./org-archived";
 import type {
   BetterAuthInstance,
   BoundAuthClient,
-  MeshContext,
+  StudioContext,
   Timings,
-} from "./mesh-context";
+} from "./studio-context";
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-import type { EventBus } from "../event-bus/interface";
 import type { MemberRoleCache } from "../auth/member-role-cache";
 
 // ============================================================================
@@ -99,7 +113,7 @@ function parsePropertiesHeader(
   }
 }
 
-export interface MeshContextConfig {
+export interface StudioContextConfig {
   db: Kysely<Database>;
   auth: BetterAuthInstance;
   encryption: {
@@ -109,9 +123,28 @@ export interface MeshContextConfig {
     tracer: Tracer;
     meter: Meter;
   };
-  eventBus: EventBus;
   modelListCache?: ModelListCache;
+  providerKeyCache?: ProviderKeyCache;
   memberRoleCache?: MemberRoleCache;
+  linkStatusProbe?: import("@/links/tunnel-status-probe").LinkStatusProbe;
+  /**
+   * Publishes a control frame to a user's link control channel (delegates to
+   * the app's CancelBroadcast). Required for LINK_DISCONNECT; tests may omit.
+   */
+  publishLinkControlFrame?: StudioContext["publishLinkControlFrame"];
+  /**
+   * Test-only escape hatch: pre-built monitoring + metric engines. When
+   * provided, skips the `@duckdb/node-api` import path that otherwise
+   * runs in dev/test (when no `clickhouseUrl` is set). DuckDB's native
+   * binding triggers a Bun teardown crash (SIGSEGV/SIGILL/SIGABRT) on
+   * process exit, even on 1.3.14 / 1.4-canary. Production never sets
+   * this — it either has a real `clickhouseUrl` or wants the real
+   * DuckDB engine.
+   */
+  monitoringEngines?: {
+    monitoringEngine: QueryEngine;
+    metricEngine: QueryEngine;
+  };
 }
 
 // ============================================================================
@@ -121,23 +154,6 @@ export interface MeshContextConfig {
 // ============================================================================
 // Types
 // ============================================================================
-
-/**
- * OAuth Session from Better Auth MCP plugin
- * Returned by auth.api.getMcpSession()
- */
-interface OAuthSession {
-  id: string;
-  accessToken: string;
-  refreshToken: string;
-  accessTokenExpiresAt: Date;
-  refreshTokenExpiresAt: Date;
-  clientId: string;
-  userId: string;
-  scopes: string;
-  createdAt: Date;
-  updatedAt: Date;
-}
 
 // ============================================================================
 // Authentication Helpers
@@ -166,53 +182,6 @@ type HasPermissionAPI = (params: {
 }) => Promise<{ success?: boolean; error?: unknown } | null>;
 
 /**
- * Check if API key permissions grant access to the requested permission
- * API key permissions are a simple { resource: [tools] } map
- */
-function checkApiKeyPermission(
-  apiKeyPermissions: Permission,
-  requestedPermission: Permission,
-): boolean {
-  for (const [resource, tools] of Object.entries(requestedPermission)) {
-    // Check if the API key has permission for this resource
-    const grantedTools = apiKeyPermissions[resource];
-
-    // No permission for this resource at all
-    if (!grantedTools || grantedTools.length === 0) {
-      // Also check wildcard resource "*"
-      const wildcardTools = apiKeyPermissions["*"];
-      if (!wildcardTools || wildcardTools.length === 0) {
-        return false;
-      }
-      // Check if wildcard grants the tools
-      if (wildcardTools.includes("*")) {
-        continue; // Wildcard grants all tools
-      }
-      for (const tool of tools) {
-        if (!wildcardTools.includes(tool)) {
-          return false;
-        }
-      }
-      continue;
-    }
-
-    // Wildcard grants all tools for this resource
-    if (grantedTools.includes("*")) {
-      continue;
-    }
-
-    // Check each requested tool
-    for (const tool of tools) {
-      if (!grantedTools.includes(tool)) {
-        return false;
-      }
-    }
-  }
-
-  return true;
-}
-
-/**
  * Auth context needed to create a bound auth client
  *
  * Two permission flows:
@@ -225,33 +194,49 @@ export interface AuthContext {
   role?: string; // User's role (for built-in role bypass)
   permissions?: Permission; // Permissions from API key or custom role (MCP OAuth)
   userId?: string; // User ID for server-side API key operations
+  apiKeyId?: string; // Set when the principal authenticated with an API key
 }
 
 /**
  * Create a bound auth client that encapsulates HTTP headers and auth context
- * MeshContext stays HTTP-agnostic while delegating all Better Auth calls
+ * StudioContext stays HTTP-agnostic while delegating all Better Auth calls
  *
  * Two permission flows:
  * 1. API Key / MCP OAuth → check directly against stored `permissions`
  * 2. Browser sessions → delegate to Better Auth's hasPermission API
  */
 export function createBoundAuthClient(ctx: AuthContext): BoundAuthClient {
-  const { auth, headers, role, permissions, userId } = ctx;
+  const { auth, headers, role, permissions, userId, apiKeyId } = ctx;
+
+  // An API key is authorized SOLELY by its own stored allowlist — the owner's
+  // admin/owner role never widens it, or a "read-only" key minted by an admin
+  // would silently act with full org power. A full-access key carries an
+  // explicit wildcard. Only genuine API keys (apiKeyId present) are gated this
+  // way; browser sessions, MCP OAuth, and mesh JWTs keep the role-based path.
+  const isApiKeyPrincipal = !!apiKeyId;
 
   // Get hasPermission from Better Auth's organization plugin (for browser sessions)
   const hasPermissionApi = (auth.api as { hasPermission?: HasPermissionAPI })
     .hasPermission;
 
   return {
+    isApiKeyPrincipal,
     hasPermission: async (
       requestedPermission: Permission,
-      options?: { organizationId?: string },
+      options?: { organizationId?: string; role?: string },
     ): Promise<boolean> => {
-      // Built-in roles bypass all permission checks
-      if (
-        role &&
-        BUILTIN_ROLES.includes(role as (typeof BUILTIN_ROLES)[number])
-      ) {
+      // API key → its allowlist IS the authorization. Checked before the role
+      // bypass so the owner's role can never widen it. No allowlist → grants
+      // nothing (fail-closed).
+      if (isApiKeyPrincipal) {
+        return checkApiKeyPermission(permissions ?? {}, requestedPermission);
+      }
+
+      // Only owner/admin bypass all permission checks (full org access). The
+      // built-in `user` role is enforced like any member: it gets basic-usage
+      // (granted out-of-band in AccessControl) plus its explicit Better Auth /
+      // connection grants, and nothing else. See ADMIN_ROLES in auth/roles.ts.
+      if (role && ADMIN_ROLES.includes(role as (typeof ADMIN_ROLES)[number])) {
         return true;
       }
 
@@ -260,7 +245,26 @@ export function createBoundAuthClient(ctx: AuthContext): BoundAuthClient {
         return checkApiKeyPermission(permissions, requestedPermission);
       }
 
-      // Flow 2: Browser sessions - delegate to Better Auth's hasPermission API
+      // Flow 2: Browser sessions.
+      //
+      // Fast path: resolve BUILT-IN roles in-memory. The caller
+      // (AccessControl.checkResource) passes the member's role for the SAME
+      // effective org as `organizationId`, so this matches what Better Auth
+      // would resolve server-side — without two DB-backed calls. For custom /
+      // multi-role / unknown roles this returns "fallback" and we drop to the
+      // unchanged Better Auth path below. Admin/owner already bypassed above and
+      // in AccessControl, so in practice only `user` is resolved here.
+      // See auth/builtin-role-permission.ts for the full parity argument.
+      const builtinDecision = resolveBuiltinRolePermission(
+        options?.role,
+        requestedPermission,
+        getCachedBuiltinRoleStatements(),
+      );
+      if (builtinDecision !== "fallback") {
+        return builtinDecision === "grant";
+      }
+
+      // Slow path: delegate to Better Auth's hasPermission API.
       if (!hasPermissionApi) {
         console.error("[Auth] hasPermission API not available");
         return false;
@@ -286,11 +290,12 @@ export function createBoundAuthClient(ctx: AuthContext): BoundAuthClient {
         }
 
         // Check wildcard permission: { resource: ["*"] }
-        // Better Auth may not handle wildcards, so we check explicitly
-        const wildcardPermission: Permission = {};
-        for (const resource of Object.keys(requestedPermission)) {
-          wildcardPermission[resource] = ["*"];
-        }
+        // Better Auth's authorize() matches actions literally with no wildcard
+        // expansion, so the `*` grant on a (custom) role is only reachable by
+        // probing for the literal `"*"` action — a SEPARATE call from the exact
+        // probe above (a merged array would be AND-matched and fail both). See
+        // permission-wildcard.ts.
+        const wildcardPermission = buildWildcardPermission(requestedPermission);
 
         const wildcardResult = await hasPermissionApi({
           headers,
@@ -299,7 +304,18 @@ export function createBoundAuthClient(ctx: AuthContext): BoundAuthClient {
 
         return wildcardResult?.success === true;
       } catch (err) {
-        console.error("[Auth] Permission check failed:", err);
+        // A 401/403 from the permission API is an expected denial (no session
+        // or insufficient scope) — we already deny by returning `false`, so
+        // don't log it as an error. Only surface genuinely unexpected failures
+        // (5xx, network), and log the message rather than dumping the whole
+        // APIError object.
+        const statusCode = (err as { statusCode?: number } | null)?.statusCode;
+        if (statusCode !== 401 && statusCode !== 403) {
+          console.error(
+            "[Auth] Permission check failed:",
+            err instanceof Error ? err.message : String(err),
+          );
+        }
         return false;
       }
     },
@@ -334,10 +350,15 @@ export function createBoundAuthClient(ctx: AuthContext): BoundAuthClient {
       },
 
       list: async (userId?: string) => {
-        return auth.api.listOrganizations({
+        // Choke point: archived (soft-deleted) orgs are invisible to every
+        // API/UI surface, so filter them here — no caller of this method ever
+        // sees them. A future restore flow would read archived orgs from
+        // storage directly, not via this method.
+        const orgs = await auth.api.listOrganizations({
           headers,
           query: userId ? { userId } : undefined,
         });
+        return orgs.filter((org: (typeof orgs)[number]) => !isOrgArchived(org));
       },
 
       addMember: async (data) => {
@@ -422,27 +443,45 @@ export function createBoundAuthClient(ctx: AuthContext): BoundAuthClient {
 
 import { createMCPProxy } from "@/api/routes/mcp-proxy-factory";
 import { ConnectionEntity } from "@/tools/connection/schema";
-import { BUILTIN_ROLES } from "../auth/roles";
+import { ADMIN_ROLES, BUILTIN_ROLES } from "../auth/roles";
+import { checkApiKeyPermission } from "../auth/api-key-permissions";
+import {
+  getCachedBuiltinRoleStatements,
+  resolveBuiltinRolePermission,
+} from "../auth/builtin-role-permission";
 import { OrgScopedThreadStorage, SqlThreadStorage } from "@/storage/threads";
+import {
+  OrgScopedAsyncResearchJobStorage,
+  SqlAsyncResearchJobStorage,
+} from "@/storage/async-research-jobs";
 import { createClientPool } from "@/mcp-clients/outbound/client-pool";
 import { AIProviderKeyStorage } from "@/storage/ai-provider-keys";
+import { SecretStorage } from "@/storage/secrets";
+import { OrgFileConfigStorage } from "@/storage/org-file-configs";
+import { OrgSiteStorage } from "@/storage/org-sites";
+import { OrgFsEntryStorage } from "@/storage/org-fs";
+import { OrgFs } from "@/file-storage/org-fs";
 import { OAuthPkceStateStorage } from "@/storage/oauth-pkce-states";
 import { AIProviderFactory } from "@/ai-providers/factory";
 import type { ModelListCache } from "@/ai-providers/model-list-cache";
+import type { ProviderKeyCache } from "@/storage/provider-key-cache";
 import { getObjectStorageS3Service } from "../object-storage/factory";
 import { createBoundObjectStorage } from "../object-storage/bound-object-storage";
 import { DevObjectStorage } from "../object-storage/dev-object-storage";
+import { decorateStorageWithAssetHoisting } from "../object-storage/asset-hoister";
 
 /**
- * Fetch role permissions from the database
- * Returns undefined for built-in roles (they bypass permission checks)
+ * Fetch role permissions from the database.
+ * Built-in roles have no row in the organizationRole table, so this returns
+ * undefined for them. owner/admin additionally bypass all checks at runtime;
+ * `user` falls through to its (intentionally empty) Better Auth role grant.
  */
 export async function fetchRolePermissions(
   db: Kysely<Database>,
   organizationId: string,
   role: string,
 ): Promise<Permission | undefined> {
-  // Built-in roles bypass permission checks
+  // Built-in roles have no custom-role permission row to fetch.
   if (BUILTIN_ROLES.includes(role as (typeof BUILTIN_ROLES)[number])) {
     return undefined;
   }
@@ -476,6 +515,119 @@ export async function fetchRolePermissions(
  * 1. API Key / MCP OAuth → permissions are queried and returned
  * 2. Browser sessions → no permissions stored (use Better Auth's hasPermission API)
  */
+// Tiny TTL cache for org archived-status, keyed by org id. The mesh-JWT
+// (embedded name/slug) and API-key auth paths check this on every proxied
+// request, so caching keeps the lookup off the hot path. Archiving is a
+// one-way soft-delete, so a short TTL is plenty.
+const ARCHIVED_CACHE_TTL_MS = 60_000;
+const orgArchivedCache = new Map<string, { archived: boolean; at: number }>();
+
+async function isOrgArchivedCached(
+  db: Kysely<Database>,
+  timings: NonNullable<FactoryOptions["timings"]>,
+  organizationId: string,
+  spanName: string,
+): Promise<boolean> {
+  const hit = orgArchivedCache.get(organizationId);
+  if (hit && Date.now() - hit.at < ARCHIVED_CACHE_TTL_MS) return hit.archived;
+  const orgRow = await timings.measure(spanName, () =>
+    db
+      .selectFrom("organization")
+      .select(["metadata"])
+      .where("id", "=", organizationId)
+      .executeTakeFirst(),
+  );
+  const archived = isOrgArchived(orgRow);
+  orgArchivedCache.set(organizationId, { archived, at: Date.now() });
+  return archived;
+}
+
+// Read-through member-role cache; shared by the mesh-JWT and API-key auth paths.
+async function resolveAndCacheRole(
+  db: Kysely<Database>,
+  timings: NonNullable<FactoryOptions["timings"]>,
+  userId: string,
+  organizationId: string,
+  memberRoleCache?: MemberRoleCache,
+): Promise<string | undefined> {
+  const cachedRole = memberRoleCache?.get(userId, organizationId);
+  if (cachedRole) return cachedRole;
+
+  const membership = await timings.measure("auth_query_membership", () =>
+    db
+      .selectFrom("member")
+      .select(["member.role"])
+      .where("member.userId", "=", userId)
+      .where("member.organizationId", "=", organizationId)
+      .executeTakeFirst(),
+  );
+  const role = membership?.role;
+  if (role) {
+    memberRoleCache?.set(userId, organizationId, role);
+  }
+  return role;
+}
+
+/**
+ * Resolve the on-behalf-of user for a self/loopback call.
+ *
+ * When mesh calls its own management server (the `<org>_self` connection — e.g.
+ * a Studio Pack agent invoking COLLECTION_VIRTUAL_MCP_CREATE), the outbound
+ * request authenticates with that connection's API key (owned by the org
+ * creator) but ALSO forwards the REAL acting user in an `x-mesh-token` JWT (see
+ * `buildRequestHeaders`). Without honoring it, every write routed through a
+ * Studio Pack agent is attributed to the org creator instead of the user who
+ * actually acted (wrong `created_by`/`updated_by`).
+ *
+ * `x-mesh-token` is only ever set by mesh's own outbound header builder, so an
+ * inbound API-key request carrying one is always a self/loopback call. We use
+ * the forwarded user for IDENTITY/attribution; the API key's permissions remain
+ * the authorizing capability (the caller keeps `permissions`/`apiKeyId`).
+ */
+async function resolveOnBehalfOfUser(
+  req: Request,
+  db: Kysely<Database>,
+  timings: NonNullable<FactoryOptions["timings"]>,
+  apiKeyOrgId: string | undefined,
+  memberRoleCache?: MemberRoleCache,
+): Promise<AuthenticatedUser | undefined> {
+  const meshToken = req.headers.get("x-mesh-token");
+  if (!meshToken) return undefined;
+
+  const payload = await timings.measure("auth_verify_onbehalf_mesh_jwt", () =>
+    verifyMeshToken(meshToken),
+  );
+  if (!payload?.sub) return undefined;
+
+  // Defensive: only honor a forwarded user scoped to the SAME org the API key
+  // authorizes. A cross-org token (never expected for self calls) is ignored.
+  const tokenOrgId = payload.metadata?.organizationId;
+  if (apiKeyOrgId && tokenOrgId && tokenOrgId !== apiKeyOrgId) {
+    return undefined;
+  }
+
+  // Re-resolve the actor's role for the org (authoritative + cached) rather
+  // than trusting the JWT's snapshot. Authorization is unaffected either way —
+  // it's decided by the API key's stored permissions, not this role — so an
+  // undefined role (e.g. non-member) is harmless.
+  const role = apiKeyOrgId
+    ? await resolveAndCacheRole(
+        db,
+        timings,
+        payload.sub,
+        apiKeyOrgId,
+        memberRoleCache,
+      )
+    : (payload.user?.role ?? undefined);
+
+  return {
+    id: payload.sub,
+    email: payload.user?.email,
+    name: payload.user?.name,
+    role,
+  };
+}
+
 async function authenticateRequest(
   req: Request,
   auth: BetterAuthInstance,
@@ -503,7 +655,7 @@ async function authenticateRequest(
       () =>
         auth.api.getMcpSession({
           headers: mcpHeaders,
-        }) as Promise<OAuthSession | null>,
+        }) as Promise<{ userId: string } | null>,
     );
 
     if (session) {
@@ -543,21 +695,20 @@ async function authenticateRequest(
             .where("organization.slug", "=", orgSlugHint)
             .executeTakeFirst();
         }
-        return base.executeTakeFirst();
+        // No org hint — only resolve when the user has exactly one membership.
+        // For multi-org users without a hint, return undefined so callers get
+        // no org context instead of a non-deterministic pick (the previous
+        // .executeTakeFirst() without ORDER BY could return any membership row
+        // depending on PostgreSQL's physical row ordering).
+        return base
+          .orderBy("member.createdAt", "asc")
+          .limit(2)
+          .execute()
+          .then((rows) => (rows.length === 1 ? rows[0] : undefined));
       });
 
-      if (membership?.orgMetadata) {
-        try {
-          const meta = JSON.parse(membership.orgMetadata) as Record<
-            string,
-            unknown
-          >;
-          if (meta.archived === true) {
-            throw new Error("Organization is archived");
-          }
-        } catch (e) {
-          if ((e as Error).message === "Organization is archived") throw e;
-        }
+      if (isOrgArchived({ metadata: membership?.orgMetadata })) {
+        throw new Error("Organization is archived");
       }
 
       const role = membership?.role;
@@ -611,28 +762,13 @@ async function authenticateRequest(
         let role: string | undefined;
         const organizationId = meshJwtPayload.metadata?.organizationId;
         if (meshJwtPayload.sub && organizationId) {
-          const cachedRole = memberRoleCache?.get(
+          role = await resolveAndCacheRole(
+            db,
+            timings,
             meshJwtPayload.sub,
             organizationId,
+            memberRoleCache,
           );
-          if (cachedRole) {
-            role = cachedRole;
-          } else {
-            const membership = await timings.measure(
-              "auth_query_membership",
-              () =>
-                db
-                  .selectFrom("member")
-                  .select(["member.role"])
-                  .where("member.userId", "=", meshJwtPayload.sub)
-                  .where("member.organizationId", "=", organizationId)
-                  .executeTakeFirst(),
-            );
-            role = membership?.role;
-            if (role) {
-              memberRoleCache?.set(meshJwtPayload.sub, organizationId, role);
-            }
-          }
         }
 
         let organization: OrganizationContext | undefined;
@@ -641,6 +777,19 @@ async function authenticateRequest(
           const metaName = meshJwtPayload.metadata?.organizationName;
           const metaSlug = meshJwtPayload.metadata?.organizationSlug;
           if (metaName || metaSlug) {
+            // Name/slug are embedded in the JWT, but we still need to verify the
+            // org isn't archived — the token may have been issued before
+            // deletion. Cached to keep this off the hot path.
+            if (
+              await isOrgArchivedCached(
+                db,
+                timings,
+                metaOrgId,
+                "auth_query_org_archived_for_mesh_jwt",
+              )
+            ) {
+              return { user: undefined };
+            }
             organization = { id: metaOrgId, name: metaName, slug: metaSlug };
           } else {
             const orgRow = await timings.measure(
@@ -648,10 +797,13 @@ async function authenticateRequest(
               () =>
                 db
                   .selectFrom("organization")
-                  .select(["id", "slug", "name"])
+                  .select(["id", "slug", "name", "metadata"])
                   .where("id", "=", metaOrgId)
                   .executeTakeFirst(),
             );
+            if (isOrgArchived(orgRow)) {
+              return { user: undefined };
+            }
             organization = orgRow
               ? { id: orgRow.id, slug: orgRow.slug, name: orgRow.name }
               : { id: metaOrgId };
@@ -693,6 +845,19 @@ async function authenticateRequest(
           | OrganizationContext
           | undefined;
 
+        // Block access if the org has been soft-deleted since the key was issued
+        if (
+          orgMetadata?.id &&
+          (await isOrgArchivedCached(
+            db,
+            timings,
+            orgMetadata.id,
+            "auth_query_org_for_api_key",
+          ))
+        ) {
+          return { user: undefined };
+        }
+
         // API keys have permissions stored directly on them
         const permissions = result.key.permissions as Permission | undefined;
 
@@ -700,31 +865,33 @@ async function authenticateRequest(
         let role: string | undefined;
         const userId = result.key.userId;
         if (userId && orgMetadata?.id) {
-          const cachedRole = memberRoleCache?.get(userId, orgMetadata.id);
-          if (cachedRole) {
-            role = cachedRole;
-          } else {
-            const membership = await timings.measure(
-              "auth_query_membership",
-              () =>
-                db
-                  .selectFrom("member")
-                  .select(["member.role"])
-                  .where("member.userId", "=", userId)
-                  .where("member.organizationId", "=", orgMetadata.id)
-                  .executeTakeFirst(),
-            );
-            role = membership?.role;
-            if (userId && role) {
-              memberRoleCache?.set(userId, orgMetadata.id, role);
-            }
-          }
+          role = await resolveAndCacheRole(
+            db,
+            timings,
+            userId,
+            orgMetadata.id,
+            memberRoleCache,
+          );
         }
+
+        // On-behalf-of: a self/loopback call authenticates with the
+        // connection's API key but forwards the real acting user in
+        // `x-mesh-token`. Credit that user (attribution) while keeping the API
+        // key's permissions as the authorizing capability.
+        const onBehalfOf = await resolveOnBehalfOfUser(
+          req,
+          db,
+          timings,
+          orgMetadata?.id,
+          memberRoleCache,
+        );
 
         return {
           apiKeyId: result.key.id,
-          user: { id: result.key.userId, role }, // Include userId and role from membership
-          role,
+          // On-behalf-of fully replaces the principal (id + role) so user/role
+          // stay consistent; the actor never inherits the key owner's role.
+          user: onBehalfOf ?? { id: result.key.userId, role },
+          role: onBehalfOf ? onBehalfOf.role : role,
           permissions, // Store the API key's permissions
           organization: orgMetadata
             ? {
@@ -736,8 +903,28 @@ async function authenticateRequest(
         };
       }
     } catch (error) {
-      const err = error as Error;
-      console.error("[Auth] API key check failed:", err);
+      const err = error as Error & { body?: { code?: string } };
+      // INVALID_API_KEY is expected here (any Bearer token is probed as an API
+      // key). Better Auth's noisy ERROR+stack is suppressed in its logger; emit
+      // one concise line with caller context so a flood can be traced to its
+      // source. Token prefix only — never the full secret.
+      const isInvalidKey =
+        err.body?.code === "INVALID_API_KEY" ||
+        err.message?.includes("Invalid API key");
+      if (isInvalidKey) {
+        console.warn("[Auth] invalid API key (Bearer)", {
+          path: new URL(req.url).pathname,
+          method: req.method,
+          ua: req.headers.get("user-agent") ?? undefined,
+          ip:
+            req.headers.get("x-forwarded-for") ??
+            req.headers.get("x-real-ip") ??
+            undefined,
+          tokenPrefix: token.slice(0, 8),
+        });
+      } else {
+        console.error("[Auth] API key check failed:", err);
+      }
     }
   }
 
@@ -810,6 +997,7 @@ async function authenticateRequest(
                 "organization.id as orgId",
                 "organization.slug as orgSlug",
                 "organization.name as orgName",
+                "organization.metadata as orgMetadata",
               ])
               .where("member.userId", "=", session.user.id);
             if (requestedOrgId) {
@@ -820,6 +1008,10 @@ async function authenticateRequest(
             return q.executeTakeFirst();
           },
         );
+
+        if (isOrgArchived({ metadata: membership?.orgMetadata })) {
+          throw new Error("Organization is archived");
+        }
 
         if (membership) {
           organization = {
@@ -855,7 +1047,7 @@ async function authenticateRequest(
         } | null;
 
         if (orgData) {
-          if (orgData.metadata?.archived === true) {
+          if (isOrgArchived(orgData)) {
             throw new Error("Organization is archived");
           }
 
@@ -925,7 +1117,7 @@ interface FactoryOptions {
 type FactoryFunction = (
   req?: Request,
   options?: FactoryOptions,
-) => Promise<MeshContext>;
+) => Promise<StudioContext>;
 
 let createContextFn: FactoryFunction;
 
@@ -949,25 +1141,119 @@ const wellKnownForwardableHeaders = ["x-hub-signature-256"];
  * Create a context factory function
  *
  * The factory creates storage adapters once (singleton pattern) and
- * returns a function that creates MeshContext from Hono Context
+ * returns a function that creates StudioContext from Hono Context
  */
-export async function createMeshContextFactory(
-  config: MeshContextConfig,
+export async function createStudioContextFactory(
+  config: StudioContextConfig,
 ): Promise<FactoryFunction> {
   // Create vault instance for credential encryption
   const vault = new CredentialVault(config.encryption.key);
 
-  // Create monitoring engines (shared across requests)
-  const clickhouseUrl = getSettings().clickhouseUrl;
+  // Create monitoring engines (shared across requests).
+  // Precedence: ClickHouse (otel_logs view) > GCS OTLP-JSON (embedded DuckDB +
+  // httpfs) > local NDJSON (embedded DuckDB). The test-stub path overrides all.
+  const settings = getSettings();
+  const clickhouseUrl = settings.clickhouseUrl;
   const isClickHouse = !!clickhouseUrl;
+  const isGcsOtlp = !isClickHouse && !!settings.monitoringS3Bucket;
   const dialect: SqlDialect = isClickHouse ? "clickhouse" : "duckdb";
+
+  const { resolve } = await import("node:path");
+  const logsBasePath = resolve(getLogsDir());
+  const metricsBasePath = resolve(getMetricsDir());
+
+  // DuckDB reads local NDJSON files; org-sharded directory layout.
+  const localLogSourceFactory = (orgId: string) =>
+    `read_ndjson('${logsBasePath}/${orgId}/**/*.ndjson', auto_detect=true)`;
+  const localMetricSourceFactory = (orgId: string) =>
+    `read_ndjson('${metricsBasePath}/${orgId}/**/*.ndjson', auto_detect=true)`;
 
   let monitoringEngine: QueryEngine;
   let metricEngine: QueryEngine;
+  let logSourceFactory: (orgId: string, range?: MonitoringDateRange) => string;
+  let metricSourceFactory: (
+    orgId: string,
+    range?: MonitoringDateRange,
+  ) => string;
+  // When true, metrics are derived from flat log rows instead of histogram
+  // MetricRow files (the GCS OTLP path; see SqlMonitoringStorage).
+  let metricsFromLogs = false;
 
-  if (isClickHouse) {
-    monitoringEngine = new ClickHouseClientEngine(clickhouseUrl!);
-    metricEngine = new ClickHouseClientEngine(clickhouseUrl!);
+  if (config.monitoringEngines) {
+    // Test-only path: caller supplied stubs to avoid loading
+    // `@duckdb/node-api` (whose native finalizer trips a Bun teardown
+    // crash). See StudioContextConfig.monitoringEngines for the why.
+    monitoringEngine = config.monitoringEngines.monitoringEngine;
+    metricEngine = config.monitoringEngines.metricEngine;
+    logSourceFactory = localLogSourceFactory;
+    metricSourceFactory = localMetricSourceFactory;
+  } else if (isClickHouse) {
+    // ClickHouse reads the studio_monitoring_logs VIEW (a flat projection of the
+    // OTel-native otel_logs table — provisioned manually, see
+    // monitoring/clickhouse-setup.md). Metrics are derived from those same log
+    // rows, so both factories point at the view.
+    const clickhouseEngineOptions = settings.clickhouseMaxMemoryUsage
+      ? { maxMemoryUsage: String(settings.clickhouseMaxMemoryUsage) }
+      : undefined;
+    monitoringEngine = new ClickHouseClientEngine(
+      clickhouseUrl!,
+      clickhouseEngineOptions,
+    );
+    metricEngine = new ClickHouseClientEngine(
+      clickhouseUrl!,
+      clickhouseEngineOptions,
+    );
+    logSourceFactory = (_orgId: string) => "studio_monitoring_logs";
+    metricSourceFactory = (_orgId: string) => "studio_monitoring_logs";
+  } else if (isGcsOtlp) {
+    // GCS OTLP-JSON path: embedded DuckDB reads OTLP-JSON log files from the
+    // bucket over the S3-compatible endpoint, flattens them to the dashboard's
+    // flat columns, and derives metrics from those log rows. The flat source is
+    // the same for logs and metrics; org scoping is the outer WHERE.
+    const accessKeyId =
+      settings.monitoringS3AccessKeyId ?? settings.s3AccessKeyId;
+    const secretAccessKey =
+      settings.monitoringS3SecretAccessKey ?? settings.s3SecretAccessKey;
+    const extensionDirectory = settings.duckdbExtensionDirectory;
+    if (!accessKeyId || !secretAccessKey || !extensionDirectory) {
+      throw new Error(
+        "MONITORING_S3_BUCKET is set but the GCS monitoring path is misconfigured: " +
+          "MONITORING_S3_ACCESS_KEY_ID/S3_ACCESS_KEY_ID, " +
+          "MONITORING_S3_SECRET_ACCESS_KEY/S3_SECRET_ACCESS_KEY, and " +
+          "DUCKDB_EXTENSION_DIRECTORY are all required.",
+      );
+    }
+    const gcs: DuckDBGcsConfig = {
+      endpoint:
+        settings.monitoringS3Endpoint ??
+        settings.s3Endpoint ??
+        "storage.googleapis.com",
+      region: settings.monitoringS3Region ?? settings.s3Region,
+      accessKeyId,
+      secretAccessKey,
+      extensionDirectory,
+    };
+    // One shared engine: same files for logs and log-derived metrics, so the
+    // httpfs + SECRET setup runs once. Memory tuning lets constrained
+    // containers cap DuckDB so the OTLP-flatten query spills instead of OOMing.
+    const gcsEngine = new DuckDBEngine(gcs, {
+      memoryLimit: settings.duckdbMemoryLimit,
+      threads: settings.duckdbThreads,
+    });
+    monitoringEngine = gcsEngine;
+    metricEngine = gcsEngine;
+
+    const gcsBucket = settings.monitoringS3Bucket!;
+    const gcsPrefix = settings.monitoringS3Prefix ?? "";
+    // Source is rebuilt per query so the dashboard date range scopes the read to
+    // the relevant year=/month=/day= partitions (the documented collector layout
+    // is assumed) instead of flattening the whole prefix — the embedded-DuckDB
+    // OOM cause. A range-less query still reads everything.
+    const gcsSourceFactory = (_orgId: string, range?: MonitoringDateRange) =>
+      buildOtlpFlatSource({ bucket: gcsBucket, prefix: gcsPrefix, range });
+    logSourceFactory = gcsSourceFactory;
+    metricSourceFactory = gcsSourceFactory;
+    metricsFromLogs = true;
   } else {
     const { engine: me } = await createMonitoringEngine({
       basePath: getLogsDir(),
@@ -977,28 +1263,17 @@ export async function createMeshContextFactory(
     });
     monitoringEngine = me;
     metricEngine = metricE;
+    logSourceFactory = localLogSourceFactory;
+    metricSourceFactory = localMetricSourceFactory;
   }
-
-  const { resolve } = await import("node:path");
-  const logsBasePath = resolve(getLogsDir());
-  const metricsBasePath = resolve(getMetricsDir());
-
-  const logSourceFactory = isClickHouse
-    ? (_orgId: string) => "monitoring_logs"
-    : (orgId: string) =>
-        `read_ndjson('${logsBasePath}/${orgId}/**/*.ndjson', auto_detect=true)`;
-
-  const useMetricsRollup = process.env.USE_METRICS_ROLLUP !== "false";
-  const metricSourceFactory = isClickHouse
-    ? (_orgId: string) =>
-        useMetricsRollup ? "monitoring_metrics_rollup_1m" : "monitoring_metrics"
-    : (orgId: string) =>
-        `read_ndjson('${metricsBasePath}/${orgId}/**/*.ndjson', auto_detect=true)`;
 
   // Create storage adapters once (singleton pattern)
   const threadDb = new SqlThreadStorage(config.db);
+  const asyncResearchJobDb = new SqlAsyncResearchJobStorage(config.db);
+  const kvStorage = new KyselyKVStorage(config.db);
   const baseStorage = {
     connections: new ConnectionStorage(config.db, vault),
+    connectionCredentialVault: new ConnectionCredentialVaultStorage(config.db),
     organizationSettings: new OrganizationSettingsStorage(config.db),
     monitoring: new SqlMonitoringStorage(
       monitoringEngine,
@@ -1006,12 +1281,21 @@ export async function createMeshContextFactory(
       metricEngine,
       metricSourceFactory,
       dialect,
+      metricsFromLogs,
     ),
     virtualMcps: new VirtualMCPStorage(config.db),
     users: new UserStorage(config.db),
     tags: new TagStorage(config.db),
     virtualMcpPluginConfigs: new VirtualMcpPluginConfigsStorage(config.db),
-    aiProviderKeys: new AIProviderKeyStorage(config.db, vault),
+    aiProviderKeys: new AIProviderKeyStorage(
+      config.db,
+      vault,
+      config.providerKeyCache,
+    ),
+    secrets: new SecretStorage(config.db, vault),
+    orgFileConfigs: new OrgFileConfigStorage(config.db, vault),
+    orgSites: new OrgSiteStorage(config.db),
+    orgFsEntries: new OrgFsEntryStorage(config.db),
     oauthPkceStates: new OAuthPkceStateStorage(config.db),
     automations: createAutomationsStorage(config.db),
     triggerCallbackTokens: new KyselyTriggerCallbackTokenStorage(config.db),
@@ -1027,6 +1311,9 @@ export async function createMeshContextFactory(
     },
     brandContext: new BrandContextStorage(config.db),
     organizationDomains: new OrganizationDomainStorage(config.db),
+    organizationJoinRequests: new OrganizationJoinRequestStorage(config.db),
+    kv: kvStorage,
+    interests: new KyselyInterestsStorage(kvStorage),
     // Note: Organizations, teams, members, roles managed by Better Auth organization plugin
     // Note: Policies handled by Better Auth permissions directly
     // Note: API keys (tokens) managed by Better Auth API Key plugin
@@ -1037,7 +1324,7 @@ export async function createMeshContextFactory(
   return async (
     req?: Request,
     options?: FactoryOptions,
-  ): Promise<MeshContext> => {
+  ): Promise<StudioContext> => {
     const timings = options?.timings ?? DEFAULT_TIMINGS;
 
     // Client pool scoped to this request — reuses connections within the same
@@ -1048,7 +1335,7 @@ export async function createMeshContextFactory(
     // Authenticate request (OAuth session or API key)
     const authResult = req
       ? await config.observability.tracer.startActiveSpan(
-          "mesh.auth",
+          "studio.auth",
           async (span) => {
             try {
               const result = await authenticateRequest(
@@ -1076,8 +1363,8 @@ export async function createMeshContextFactory(
 
     // Resolve caller connection ID: explicit header takes priority, then fall
     // back to the connectionId embedded in the mesh JWT. This ensures that
-    // management tools (e.g. EVENT_PUBLISH on _self) see the caller's
-    // connection ID even when the runtime doesn't set x-caller-id.
+    // management tools on _self see the caller's connection ID even when the
+    // runtime doesn't set x-caller-id.
     const connectionId =
       req?.headers.get("x-caller-id") ??
       authResult.user?.connectionId ??
@@ -1090,10 +1377,11 @@ export async function createMeshContextFactory(
       role: authResult.role,
       permissions: authResult.permissions,
       userId: authResult.user?.id, // For server-side API key operations
+      apiKeyId: authResult.apiKeyId, // Enables scoped-key enforcement
     });
 
-    // Build auth object for MeshContext
-    const meshAuth: MeshContext["auth"] = {
+    // Build auth object for StudioContext
+    const meshAuth: StudioContext["auth"] = {
       user: authResult.user,
     };
 
@@ -1115,7 +1403,6 @@ export async function createMeshContextFactory(
 
     // Create AccessControl instance with bound auth client
     const access = new AccessControl(
-      config.auth,
       meshAuth.user?.id,
       undefined, // toolName set later by defineTool
       boundAuth, // Bound auth client for permission checks
@@ -1127,7 +1414,12 @@ export async function createMeshContextFactory(
 
     const storage = {
       ...baseStorage,
+      virtualMcps: createRequestCachedVirtualMcps(baseStorage.virtualMcps),
       threads: new OrgScopedThreadStorage(threadDb, organization?.id),
+      asyncResearchJobs: new OrgScopedAsyncResearchJobStorage(
+        asyncResearchJobDb,
+        organization?.id,
+      ),
     };
 
     const aiProviderFactory = new AIProviderFactory(
@@ -1145,7 +1437,24 @@ export async function createMeshContextFactory(
         ? createBoundObjectStorage(s3Service, organization.id)
         : new DevObjectStorage(organization.id, baseUrl);
 
-    const ctx: MeshContext = {
+    // Org filesystem: path/tree view over the org-prefixed keyspace. Needs both
+    // object storage and an org scope.
+    const orgFs =
+      organization && objectStorage
+        ? new OrgFs(objectStorage, storage.orgFsEntries, organization.id)
+        : null;
+
+    // Hoist inline data: media to object storage on connection/virtual-MCP
+    // writes so base64 blobs never land on a row or get re-inlined into
+    // COLLECTION_*_LIST results. Decorate here — not in the storage classes —
+    // because those are singletons without objectStorage/org slug.
+    decorateStorageWithAssetHoisting(storage, {
+      objectStorage,
+      baseUrl,
+      orgSlug: organization?.slug,
+    });
+
+    const ctx: StudioContext = {
       timings,
       auth: meshAuth,
       connectionId,
@@ -1160,6 +1469,7 @@ export async function createMeshContextFactory(
       meter: config.observability.meter,
       baseUrl,
       objectStorage,
+      orgFs,
       metadata: {
         requestId: crypto.randomUUID(),
         timestamp: new Date(),
@@ -1180,7 +1490,8 @@ export async function createMeshContextFactory(
           req?.headers.get("x-mesh-properties"),
         ),
       },
-      eventBus: config.eventBus,
+      linkStatusProbe: config.linkStatusProbe,
+      publishLinkControlFrame: config.publishLinkControlFrame,
       aiProviders: aiProviderFactory,
       createMCPProxy: async (conn: string | ConnectionEntity) => {
         return await createMCPProxy(conn, ctx);
@@ -1196,4 +1507,43 @@ export async function createMeshContextFactory(
 
     return ctx;
   };
+}
+
+/**
+ * Rebind every org-scoped facet of an existing StudioContext to `org`.
+ *
+ * A StudioContext is born from the session's active org — or from no org at
+ * all (background contexts, unauthenticated requests). Any code path that
+ * resolves the org AFTER creation (path-scoped routes via
+ * resolve-org-from-path, durable-run rebuilds via automation-context) must
+ * rebind ALL org-scoped state through this one helper. A hand-rolled subset
+ * is how `ctx.orgFs` stayed null in background runs while `ctx.objectStorage`
+ * worked (#3826) — add new org-scoped fields HERE, not at the call sites.
+ *
+ * Auth state (ctx.organization, ctx.access, ctx.boundAuth) is intentionally
+ * not handled: the callers derive role/permissions differently (path
+ * membership vs background membership) and set those themselves.
+ */
+export function rebindOrgScope(
+  ctx: StudioContext,
+  org: { id: string; slug: string | null },
+): void {
+  // Storage wrappers were constructed eagerly with the creation-time org (or
+  // undefined); point them at the resolved org. Per-context instances — never
+  // shared across requests — so the mutation is race-free.
+  ctx.storage.threads.setOrganizationId(org.id);
+  ctx.storage.asyncResearchJobs.setOrganizationId(org.id);
+  // Object storage, and the org filesystem view over its keyspace.
+  const s3Service = getObjectStorageS3Service();
+  ctx.objectStorage = s3Service
+    ? createBoundObjectStorage(s3Service, org.id)
+    : new DevObjectStorage(org.id, ctx.baseUrl);
+  ctx.orgFs = new OrgFs(ctx.objectStorage, ctx.storage.orgFsEntries, org.id);
+  // Asset hoisters close over object storage and org slug; refresh the
+  // wrappers so writes land in the resolved org's tenant scope.
+  decorateStorageWithAssetHoisting(ctx.storage, {
+    objectStorage: ctx.objectStorage,
+    baseUrl: ctx.baseUrl,
+    orgSlug: org.slug ?? undefined,
+  });
 }

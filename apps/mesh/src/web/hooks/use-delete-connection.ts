@@ -1,12 +1,13 @@
 import {
-  SELF_MCP_ALIAS_ID,
-  useMCPClient,
+  UI_RESOURCE_HTML_KEY,
   useProjectContext,
   type ConnectionEntity,
 } from "@decocms/mesh-sdk";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { toast } from "sonner";
+import { clearHtmlResourceCacheForConnection } from "@/web/lib/html-resource-persist";
+import { useStudioTools } from "@/web/lib/studio-tools";
 
 export type DeleteConnectionState =
   | { mode: "idle" }
@@ -17,18 +18,6 @@ export type DeleteConnectionState =
       agentNames: string;
     };
 
-function getMcpErrorText(result: Record<string, unknown>): string {
-  const content = result.content;
-  if (
-    Array.isArray(content) &&
-    content[0]?.type === "text" &&
-    typeof content[0].text === "string"
-  ) {
-    return content[0].text;
-  }
-  return "Unknown error";
-}
-
 export function useDeleteConnection({
   onSuccess,
 }: {
@@ -36,11 +25,7 @@ export function useDeleteConnection({
 } = {}) {
   const { org } = useProjectContext();
   const queryClient = useQueryClient();
-  const selfClient = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
+  const studio = useStudioTools();
 
   const [deleteState, setDeleteState] = useState<DeleteConnectionState>({
     mode: "idle",
@@ -59,8 +44,18 @@ export function useDeleteConnection({
     });
   };
 
-  const handleSuccess = () => {
+  const evictUiResourceCache = (connectionId: string) => {
+    void clearHtmlResourceCacheForConnection(connectionId);
+    queryClient.invalidateQueries({
+      predicate: (query) =>
+        query.queryKey[1] === UI_RESOURCE_HTML_KEY &&
+        query.queryKey[3] === connectionId,
+    });
+  };
+
+  const handleSuccess = (connectionId: string) => {
     invalidateConnections();
+    evictUiResourceCache(connectionId);
     toast.success("Connection deleted successfully");
     setDeleteState({ mode: "idle" });
     onSuccess?.();
@@ -81,39 +76,32 @@ export function useDeleteConnection({
     setDeleteState({ mode: "idle" });
 
     try {
-      const result = await selfClient.callTool({
-        name: "COLLECTION_CONNECTIONS_DELETE",
-        arguments: { id: connection.id },
+      await studio.call("COLLECTION_CONNECTIONS_DELETE", {
+        id: connection.id,
       });
 
-      if (result.isError) {
-        const errorText = getMcpErrorText(result);
-
-        const jsonText = errorText.replace(/^Error:\s*/, "");
-        try {
-          const parsed = JSON.parse(jsonText) as {
-            code?: string;
-            agentNames?: string[];
-          };
-          if (parsed.code === "CONNECTION_IN_USE" && parsed.agentNames) {
-            setDeleteState({
-              mode: "force-deleting",
-              connection,
-              agentNames: parsed.agentNames.map((n) => `"${n}"`).join(", "),
-            });
-            return;
-          }
-        } catch {
-          // Not JSON — fall through to generic error toast
-        }
-
-        toast.error(`Failed to delete connection: ${errorText}`);
-        return;
-      }
-
-      handleSuccess();
+      handleSuccess(connection.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+
+      const jsonText = message.replace(/^Error:\s*/, "");
+      try {
+        const parsed = JSON.parse(jsonText) as {
+          code?: string;
+          agentNames?: string[];
+        };
+        if (parsed.code === "CONNECTION_IN_USE" && parsed.agentNames) {
+          setDeleteState({
+            mode: "force-deleting",
+            connection,
+            agentNames: parsed.agentNames.map((n) => `"${n}"`).join(", "),
+          });
+          return;
+        }
+      } catch {
+        // Not JSON — fall through to generic error toast
+      }
+
       toast.error(`Failed to delete connection: ${message}`);
     }
   };
@@ -125,17 +113,9 @@ export function useDeleteConnection({
     setDeleteState({ mode: "idle" });
 
     try {
-      const result = await selfClient.callTool({
-        name: "COLLECTION_CONNECTIONS_DELETE",
-        arguments: { id, force: true },
-      });
+      await studio.call("COLLECTION_CONNECTIONS_DELETE", { id, force: true });
 
-      if (result.isError) {
-        toast.error(`Failed to delete connection: ${getMcpErrorText(result)}`);
-        return;
-      }
-
-      handleSuccess();
+      handleSuccess(id);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       toast.error(`Failed to delete connection: ${message}`);

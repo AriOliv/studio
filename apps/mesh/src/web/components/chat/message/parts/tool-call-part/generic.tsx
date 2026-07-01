@@ -6,9 +6,10 @@ import { getUIResourceUri } from "@/mcp-apps/types.ts";
 import {
   useOptionalChatStream,
   useOptionalChatPrefs,
-  useChatTask,
+  useOptionalChatTask,
 } from "@/web/components/chat/context.tsx";
 import { useTaskExpandedTools } from "@/web/hooks/use-task-expanded-tools";
+import { formatBytes } from "@/web/lib/format-bytes";
 import { formatPinnedViewTabId } from "@/web/layouts/main-panel-tabs/tab-id";
 import { useNavigate } from "@tanstack/react-router";
 import { Button } from "@deco/ui/components/button.tsx";
@@ -44,13 +45,16 @@ import {
   XClose,
 } from "@untitledui/icons";
 import { TOOL_DISPLAY_MAP } from "./tool-display-map.ts";
+import { BashWaitSummary } from "./bash-wait.tsx";
+import { parseSleepMs } from "./bash-sleep.ts";
+import { toEpochMs } from "@/web/lib/format-time.ts";
 import type { DynamicToolUIPart, ToolUIPart } from "ai";
 import type React from "react";
 import { Suspense } from "react";
 import { ErrorBoundary } from "@/web/components/error-boundary.tsx";
 import { usePanelActions } from "@/web/layouts/shell-layout";
 
-import { getToolPartErrorText, safeStringify } from "../utils.ts";
+import { getToolPartErrorText, safeStringifyFormatted } from "../utils.ts";
 import { ToolCallShell } from "./common.tsx";
 import { getEffectiveState } from "./utils.tsx";
 
@@ -62,20 +66,36 @@ interface GenericToolCallPartProps {
   annotations?: ToolDefinition["annotations"];
   /** Latency in seconds from data-tool-metadata part */
   latency?: number;
+  /** UTF-8 byte length of the JSON-serialized tool result. */
+  outputBytes?: number;
   /** Whether this part belongs to the last (most recent) assistant message */
   isLastMessage?: boolean;
   /** Tool _meta from data-tool-metadata part */
   toolMeta?: ToolDefinition["_meta"];
 }
 
-function safeStringifyFormatted(value: unknown): string {
-  const str = safeStringify(value);
-  if (str === "" || str === "[Non-serializable value]") return str;
-  try {
-    return JSON.stringify(JSON.parse(str), null, 2);
-  } catch {
-    return str;
-  }
+/**
+ * Read the part's own persisted `created_at` (epoch ms). `foldParts` stamps it
+ * onto each part on the v2 read path — it's the only per-part timestamp the
+ * client gets, and it anchors the `bash` `sleep` countdown to when that
+ * specific call fired (correct across reload / late attach). Null while the
+ * turn is still in-flight (parts not yet folded from storage).
+ */
+function partCreatedAtMs(part: unknown): number | null {
+  const raw =
+    part && typeof part === "object" && "created_at" in part
+      ? (part as { created_at?: unknown }).created_at
+      : undefined;
+  return typeof raw === "string" || raw instanceof Date ? toEpochMs(raw) : null;
+}
+
+/** Effective bash timeout (ms) the daemon enforces — mirrors BashInputSchema. */
+function bashTimeoutMs(input: unknown): number {
+  const t =
+    input && typeof input === "object" && "timeout" in input
+      ? (input as { timeout?: unknown }).timeout
+      : undefined;
+  return Math.min(typeof t === "number" ? t : 30_000, 120_000);
 }
 
 function AnnotationBadge({
@@ -126,6 +146,33 @@ function AnnotationBadges({
   );
 }
 
+function formatLatency(seconds: number): string {
+  if (seconds < 1) return `${Math.round(seconds * 1000)}ms`;
+  if (seconds < 10) return `${seconds.toFixed(1)}s`;
+  return `${Math.round(seconds)}s`;
+}
+
+function LatencyBytesBadge({
+  latency,
+  outputBytes,
+}: {
+  latency?: number;
+  outputBytes?: number;
+}) {
+  const hasLatency = typeof latency === "number" && latency > 0;
+  const hasBytes = typeof outputBytes === "number" && outputBytes >= 0;
+  if (!hasLatency && !hasBytes) return null;
+  return (
+    <span className="inline-flex items-center gap-1.5 text-[11px] font-mono tabular-nums text-muted-foreground/60 px-1 leading-none">
+      {hasLatency && <span>{formatLatency(latency!)}</span>}
+      {hasLatency && hasBytes && (
+        <span className="text-muted-foreground/30">·</span>
+      )}
+      {hasBytes && <span>{formatBytes(outputBytes!)}</span>}
+    </span>
+  );
+}
+
 /** Returns a short status hint shown on the summary line */
 function getSummary(
   state: string,
@@ -172,6 +219,7 @@ export function GenericToolCallPart({
   part,
   annotations,
   latency,
+  outputBytes,
   isLastMessage,
   toolMeta,
 }: GenericToolCallPartProps) {
@@ -190,8 +238,10 @@ export function GenericToolCallPart({
   const { org } = useProjectContext();
 
   const { setChatOpen } = usePanelActions();
-  const { taskId } = useChatTask();
-  const { addOrReplace } = useTaskExpandedTools(taskId);
+  // Optional: the tool-call part is also rendered read-only in the Monitor
+  // threads view, which has no ChatContextProvider / ThreadManagerProvider.
+  const taskId = useOptionalChatTask()?.taskId ?? null;
+  const { addOrReplaceEager } = useTaskExpandedTools(taskId);
   const navigate = useNavigate();
 
   const connectionId =
@@ -223,7 +273,8 @@ export function GenericToolCallPart({
   const hasMCPApp = !!uiResourceUri && part.state === "output-available";
   const sourceId = connectionId ? `${connectionId}:${rawToolName}` : null;
   const isDestructive = !!annotations?.destructiveHint;
-  const canOpenInPanel = hasMCPApp && !!connectionId && !isDestructive;
+  const canOpenInPanel =
+    hasMCPApp && !!connectionId && !isDestructive && !!taskId;
 
   const handleOpenInPanel = () => {
     if (!connectionId) return;
@@ -231,7 +282,7 @@ export function GenericToolCallPart({
       "input" in part && part.input && typeof part.input === "object"
         ? (part.input as Record<string, unknown>)
         : {};
-    addOrReplace({
+    addOrReplaceEager({
       toolName: rawToolName,
       appId: connectionId,
       args,
@@ -294,11 +345,38 @@ export function GenericToolCallPart({
   const errorText =
     part.state === "output-error" ? getToolPartErrorText(part) : undefined;
 
-  const summary = isStaleApproval
-    ? "Cancelled"
-    : isOutputError
-      ? "Failed"
-      : getSummary(part.state, part.output, errorText);
+  // While a `bash` `sleep` is still running, replace the generic "Preparing…"
+  // with a live countdown. Duration is parsed from the command (capped at the
+  // daemon timeout, since a longer sleep is killed there); the countdown anchors
+  // on this part's own persisted `created_at` (when the call fired) so the
+  // remaining time stays correct across reload / late attach.
+  const sleepCommand =
+    toolName === "bash" &&
+    effectiveState === "loading" &&
+    part.input &&
+    typeof part.input === "object" &&
+    typeof (part.input as { command?: unknown }).command === "string"
+      ? (part.input as { command: string }).command
+      : null;
+  const sleepMs = sleepCommand !== null ? parseSleepMs(sleepCommand) : null;
+  const sleepDurationMs =
+    sleepMs !== null ? Math.min(sleepMs, bashTimeoutMs(part.input)) : null;
+  const toolCallId = "toolCallId" in part ? part.toolCallId : "";
+
+  const summary =
+    sleepDurationMs !== null ? (
+      <BashWaitSummary
+        toolCallId={toolCallId}
+        durationMs={sleepDurationMs}
+        anchorMs={partCreatedAtMs(part)}
+      />
+    ) : isStaleApproval ? (
+      "Cancelled"
+    ) : isOutputError ? (
+      "Failed"
+    ) : (
+      getSummary(part.state, part.output, errorText)
+    );
 
   // Build expanded content
   let detail = "";
@@ -328,7 +406,10 @@ export function GenericToolCallPart({
         })()}
         iconDestructive={isCancelled}
         trailing={
-          <AnnotationBadges annotations={annotations} toolMeta={toolMeta} />
+          <>
+            <AnnotationBadges annotations={annotations} toolMeta={toolMeta} />
+            <LatencyBytesBadge latency={latency} outputBytes={outputBytes} />
+          </>
         }
         title={friendlyName}
         latency={latency}

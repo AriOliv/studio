@@ -5,9 +5,24 @@
  * enrichment on tools and VirtualMCP instructions.
  */
 
-import { GatewayClient, type ClientEntry } from "@decocms/mcp-utils/aggregate";
-import type { MeshContext } from "../../core/mesh-context";
+import {
+  GatewayClient,
+  type ClientEntry,
+  getGatewayClientId,
+  stripToolNamespace,
+} from "@decocms/mcp-utils/aggregate";
+import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type {
+  ListPromptsRequest,
+  ListPromptsResult,
+} from "@modelcontextprotocol/sdk/types.js";
+import type { StudioContext } from "../../core/studio-context";
+import {
+  findStudioPackAgentByMcpId,
+  resolveStudioPackChecklist,
+} from "../../tools/virtual/studio-pack";
 import { createLazyClient } from "../lazy-client";
+import { withKnowledge } from "./knowledge";
 import type { VirtualClientOptions } from "./types";
 
 /**
@@ -17,7 +32,7 @@ import type { VirtualClientOptions } from "./types";
 export class PassthroughClient extends GatewayClient {
   constructor(
     protected options: VirtualClientOptions,
-    protected ctx: MeshContext,
+    protected ctx: StudioContext,
   ) {
     // Build VirtualMCP connection lookup for per-client selection
     const vmcpConnMap = new Map(
@@ -70,8 +85,66 @@ export class PassthroughClient extends GatewayClient {
     await this.close();
   }
 
+  /**
+   * Studio Pack agents back their welcome-screen icebreakers with onboarding
+   * prompts (e.g. Brand Manager's "Set up your brand"). Each prompt mirrors a
+   * checklist item whose `isCompleted` reflects org state. Once an item is
+   * done, its prompt should stop being suggested — same logic the home
+   * next-actions route already applies. Filter completed items out here so the
+   * icebreakers, tools popover, and harness prompt block all stay in sync.
+   * Non-studio-pack agents are untouched.
+   */
+  override async listPrompts(
+    params?: ListPromptsRequest["params"],
+    options?: RequestOptions,
+  ): Promise<ListPromptsResult> {
+    const result = await super.listPrompts(params, options);
+
+    const agent = findStudioPackAgentByMcpId(this.options.virtualMcp.id ?? "");
+    const orgId = this.ctx.organization?.id;
+    if (!agent || !orgId) return result;
+
+    const items = await resolveStudioPackChecklist(agent, {
+      orgId,
+      ctx: this.ctx,
+    });
+    const completed = new Set(
+      items
+        .filter(
+          (item) =>
+            item.completed &&
+            !item.alwaysSuggest &&
+            item.action.kind === "open-agent-thread",
+        )
+        .map((item) => (item.action as { promptName: string }).promptName),
+    );
+    if (completed.size === 0) return result;
+
+    return {
+      ...result,
+      prompts: result.prompts.filter(
+        (prompt) =>
+          !completed.has(
+            stripToolNamespace(prompt.name, getGatewayClientId(prompt._meta)),
+          ),
+      ),
+    };
+  }
+
   override getInstructions(): string | undefined {
-    return this.options.virtualMcp.metadata?.instructions ?? undefined;
+    // Fold the agent's attached files/skills into its served instructions so
+    // they reach the model on every run path (cluster engine AND sandbox
+    // daemon both read instructions; only the cluster runs the richer
+    // buildAgentSystemPrompt).
+    const base = withKnowledge(
+      this.options.virtualMcp.metadata?.instructions ?? undefined,
+      this.options.virtualMcp.metadata?.knowledge,
+    );
+    // Append the pre-rendered <available-skills> catalog (built async in the
+    // factory). Same seam, same both-paths guarantee as the knowledge block.
+    const skills = this.options.skillsBlock;
+    if (!skills) return base;
+    return base ? `${base}${skills}` : skills.replace(/^\n+/, "");
   }
 
   getConnectionTitleMap(): Map<string, string> {

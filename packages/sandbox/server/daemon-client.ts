@@ -1,16 +1,33 @@
 /**
  * Pure helpers for the unified daemon's HTTP API. Daemon endpoints live
- * under `/_decopilot_vm/*` (except `/health` at root, which is unauth).
- * POST/PUT bodies are base64-encoded JSON — the daemon decodes on its side.
+ * under `/_sandbox/*` (except `/health` at root, which is unauth).
  */
 
+import type { ConfigPatch } from "../daemon/config-store/types";
 import type { TenantConfig } from "../daemon/types";
 import { sleep } from "../shared";
-import type { ExecInput, ExecOutput } from "./runner/types";
 
-const DEFAULT_EXEC_TIMEOUT_MS = 60_000;
+export type { ConfigPatch };
+
+/** Error thrown by config requests when the daemon responds non-2xx; carries
+ *  the HTTP status so callers can branch (e.g. 401 → re-auth with another
+ *  token rather than tear the sandbox down). */
+export class ConfigRequestError extends Error {
+  constructor(
+    readonly status: number,
+    body: string,
+  ) {
+    super(`sandbox daemon /_sandbox/config returned ${status}: ${body}`);
+    this.name = "ConfigRequestError";
+  }
+}
+
 const HEALTH_PROBE_TIMEOUT_MS = 500;
-const CONFIG_TIMEOUT_MS = 10_000;
+// Config application can run a cold clone + install on a heavy sandbox; 10s was
+// too tight and routinely tripped `AbortSignal.timeout()`, surfacing benign
+// "operation timed out" aborts as a chronic error spike. 30s gives cold starts
+// headroom. Callers may override per-call via `postConfig`'s `timeoutMs`.
+const CONFIG_TIMEOUT_MS = 30_000;
 const READY_ATTEMPTS = 25;
 const READY_INTERVAL_MS = 200;
 const READY_JITTER_MS = 50;
@@ -85,13 +102,17 @@ export interface ConfigAuthPatch {
   rotateToken?: string;
 }
 
+export interface ConfigRequestOptions {
+  /** Override the abort timeout (ms). Defaults to `CONFIG_TIMEOUT_MS`. */
+  timeoutMs?: number;
+}
+
 /**
- * POST /_decopilot_vm/config — set initial tenant config (or patch via
+ * POST /_sandbox/config — set initial tenant config (or patch via
  * the same payload semantics; deep-merge happens daemon-side).
  *
  * `/config` is the trust boundary endpoint; the daemon's NetworkPolicy is
- * the auth on its port. Body is base64-encoded JSON like every other
- * `/_decopilot_vm/*` route. 200 = applied (or no-op); 400 = invalid;
+ * the auth on its port. 200 = applied (or no-op); 400 = invalid;
  * 409 = identity conflict (e.g., cloneUrl mismatch).
  *
  * `auth.rotateToken` is applied *before* the tenant patch — see
@@ -100,81 +121,67 @@ export interface ConfigAuthPatch {
 export async function postConfig(
   daemonUrl: string,
   token: string,
-  payload: Partial<TenantConfig>,
+  payload: ConfigPatch,
   auth?: ConfigAuthPatch,
+  opts?: ConfigRequestOptions,
 ): Promise<ConfigResponse> {
-  return configRequest(daemonUrl, token, "POST", payload, auth);
+  return configRequest(daemonUrl, token, "POST", payload, auth, opts);
 }
 
 async function configRequest(
   daemonUrl: string,
   token: string,
   method: "POST" | "PUT",
-  payload: Partial<TenantConfig>,
+  payload: ConfigPatch,
   auth?: ConfigAuthPatch,
+  opts?: ConfigRequestOptions,
 ): Promise<ConfigResponse> {
   const wire: Record<string, unknown> = { ...payload };
   if (auth && auth.rotateToken !== undefined) wire.auth = auth;
-  const rawBody = JSON.stringify(wire);
-  const b64Body = Buffer.from(rawBody, "utf-8").toString("base64");
-  const res = await fetch(`${daemonUrl}/_decopilot_vm/config`, {
+  const res = await fetch(`${daemonUrl}/_sandbox/config`, {
     method,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
-    body: b64Body,
-    signal: AbortSignal.timeout(CONFIG_TIMEOUT_MS),
+    body: JSON.stringify(wire),
+    signal: AbortSignal.timeout(opts?.timeoutMs ?? CONFIG_TIMEOUT_MS),
   });
   const body = await res.text();
   if (!res.ok) {
-    throw new Error(
-      `sandbox daemon /_decopilot_vm/config returned ${res.status}: ${body}`,
-    );
+    throw new ConfigRequestError(res.status, body);
   }
   return JSON.parse(body) as ConfigResponse;
 }
 
-export async function daemonBash(
+/**
+ * POST /_sandbox/orgfs-config — relay the org-fs mount config (a JSON
+ * `OrgFsMountConfig`) for the pod's privileged sidecar. Separate from
+ * `/config` on purpose: an orgFs-only TenantConfig patch classifies as no-op
+ * and would be dropped by the daemon's config store. Returns whether the
+ * daemon actually relayed it (false = no sidecar configured; desktop pods).
+ */
+export async function postOrgFsConfig(
   daemonUrl: string,
   token: string,
-  input: ExecInput,
-): Promise<ExecOutput> {
-  const timeoutMs = input.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
-  const rawBody = JSON.stringify({
-    command: input.command,
-    timeout: timeoutMs,
-    cwd: input.cwd,
-    env: input.env,
-  });
-  const b64Body = Buffer.from(rawBody, "utf-8").toString("base64");
-  const response = await fetch(`${daemonUrl}/_decopilot_vm/bash`, {
+  configJson: string,
+): Promise<{ written: boolean }> {
+  const res = await fetch(`${daemonUrl}/_sandbox/orgfs-config`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
-    body: b64Body,
-    signal: AbortSignal.timeout(timeoutMs + 5_000),
+    body: configJson,
+    signal: AbortSignal.timeout(CONFIG_TIMEOUT_MS),
   });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
+  const body = await res.text();
+  if (!res.ok) {
     throw new Error(
-      `sandbox daemon /_decopilot_vm/bash returned ${response.status}${body ? `: ${body}` : ""}`,
+      `sandbox daemon /_sandbox/orgfs-config returned ${res.status}: ${body}`,
     );
   }
-  const json = (await response.json()) as {
-    stdout?: string;
-    stderr?: string;
-    exitCode?: number;
-    timedOut?: boolean;
-  };
-  return {
-    stdout: json.stdout ?? "",
-    stderr: json.stderr ?? "",
-    exitCode: json.exitCode ?? -1,
-    timedOut: Boolean(json.timedOut),
-  };
+  return JSON.parse(body) as { written: boolean };
 }
 
 const STRIP_REQUEST_HEADERS = [

@@ -1,27 +1,21 @@
 /**
  * Tool Registry
  *
- * Central export for all MCP Mesh management tools
- * Types are inferred from ALL_TOOLS - this is the source of truth.
- *
- * Plugin tools are collected at startup and combined with core tools.
+ * Central export for all MCP Mesh management tools.
+ * Types are inferred from CORE_TOOLS — this is the source of truth.
  */
 
-import type { ToolAnnotations } from "@/core/define-tool";
-import { MeshContext } from "@/core/mesh-context";
-import {
-  collectPluginTools,
-  filterToolsByEnabledPlugins,
-} from "@/core/plugin-loader";
+import { StudioContext } from "@/core/studio-context";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { sharedJsonSchemaValidator } from "@decocms/mcp-utils";
 import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as ApiKeyTools from "./apiKeys";
+import * as CommerceDiscoveryTools from "./commerce-discovery";
 import * as ConnectionTools from "./connection";
 import * as DatabaseTools from "./database";
-import * as EventBusTools from "./eventbus";
 import * as VirtualMCPTools from "./virtual";
 import * as MonitoringTools from "./monitoring";
 import * as OrganizationTools from "./organization";
@@ -30,14 +24,24 @@ import * as ThreadTools from "./thread";
 import * as AutomationTools from "./automations";
 import * as UserTools from "./user";
 import * as AiProvidersTools from "./ai-providers";
+import * as SecretsTools from "./secrets";
+import * as FileConfigTools from "./file-configs";
+import { ORG_FS_PUBLIC_SETS_SYNC } from "./org-fs/sync-public-sets";
 import { getPrompts, getResources } from "./guides";
+import {
+  getToolRegistration,
+  type RegistrableTool,
+} from "./management-registration";
+export { managementContextStore } from "./management-registration";
 import * as ObjectStorageTools from "./object-storage";
 import * as RegistryTools from "./registry/index";
-import * as VmTools from "./vm";
+import * as SandboxTools from "./sandbox";
 import * as GitHubTools from "./github";
+import * as LinkTools from "./links";
+import * as SearchTools from "./search";
 import { ToolName } from "./registry-metadata";
 // Core tools - always available
-const CORE_TOOLS = [
+export const CORE_TOOLS = [
   OrganizationTools.ORGANIZATION_CREATE,
   OrganizationTools.ORGANIZATION_LIST,
   OrganizationTools.ORGANIZATION_GET,
@@ -53,10 +57,14 @@ const CORE_TOOLS = [
   OrganizationTools.BRAND_CONTEXT_EXTRACT,
   OrganizationTools.BRAND_GET,
   OrganizationTools.BRAND_LIST,
-  OrganizationTools.ORGANIZATION_DOMAIN_GET,
-  OrganizationTools.ORGANIZATION_DOMAIN_SET,
+  OrganizationTools.ORGANIZATION_DOMAIN_LIST,
+  OrganizationTools.ORGANIZATION_DOMAIN_ADD,
   OrganizationTools.ORGANIZATION_DOMAIN_UPDATE,
-  OrganizationTools.ORGANIZATION_DOMAIN_CLEAR,
+  OrganizationTools.ORGANIZATION_DOMAIN_VERIFY,
+  OrganizationTools.ORGANIZATION_DOMAIN_REMOVE,
+  OrganizationTools.ORGANIZATION_JOIN_REQUEST_LIST,
+  OrganizationTools.ORGANIZATION_JOIN_REQUEST_APPROVE,
+  OrganizationTools.ORGANIZATION_JOIN_REQUEST_DENY,
   OrganizationTools.ORGANIZATION_MEMBER_ADD,
   OrganizationTools.ORGANIZATION_MEMBER_REMOVE,
   OrganizationTools.ORGANIZATION_MEMBER_LIST,
@@ -69,6 +77,7 @@ const CORE_TOOLS = [
   ConnectionTools.COLLECTION_CONNECTIONS_UPDATE,
   ConnectionTools.COLLECTION_CONNECTIONS_DELETE,
   ConnectionTools.CONNECTION_TEST,
+  CommerceDiscoveryTools.COMMERCE_DISCOVERY_SETUP,
 
   // Virtual MCP collection tools
   VirtualMCPTools.COLLECTION_VIRTUAL_MCP_CREATE,
@@ -84,21 +93,13 @@ const CORE_TOOLS = [
   MonitoringTools.MONITORING_LOG_GET,
   MonitoringTools.MONITORING_LOGS_LIST,
   MonitoringTools.MONITORING_STATS,
+  MonitoringTools.MONITORING_THREAD_USAGE,
 
   // API Key tools
   ApiKeyTools.API_KEY_CREATE,
   ApiKeyTools.API_KEY_LIST,
   ApiKeyTools.API_KEY_UPDATE,
   ApiKeyTools.API_KEY_DELETE,
-
-  // Event Bus tools
-  EventBusTools.EVENT_PUBLISH,
-  EventBusTools.EVENT_SUBSCRIBE,
-  EventBusTools.EVENT_UNSUBSCRIBE,
-  EventBusTools.EVENT_CANCEL,
-  EventBusTools.EVENT_ACK,
-  EventBusTools.EVENT_SUBSCRIPTION_LIST,
-  EventBusTools.EVENT_SYNC_SUBSCRIPTIONS,
 
   // User tools
   UserTools.USER_GET,
@@ -110,6 +111,8 @@ const CORE_TOOLS = [
   ThreadTools.COLLECTION_THREADS_UPDATE,
   ThreadTools.COLLECTION_THREADS_DELETE,
   ThreadTools.COLLECTION_THREAD_MESSAGES_LIST,
+  ThreadTools.THREAD_BACKGROUND_TOOL_START,
+  ThreadTools.THREAD_SUBTASK_DELIVER,
 
   // Tag tools
   TagTools.TAGS_LIST,
@@ -126,12 +129,15 @@ const CORE_TOOLS = [
   AutomationTools.AUTOMATION_DELETE,
   AutomationTools.AUTOMATION_TRIGGER_ADD,
   AutomationTools.AUTOMATION_TRIGGER_REMOVE,
+  AutomationTools.AUTOMATION_TRIGGER_ROTATE_TOKEN,
   AutomationTools.AUTOMATION_RUN,
+  AutomationTools.AUTOMATION_RUN_STATS,
 
   // Virtual MCP plugin config tools
   VirtualMCPTools.VIRTUAL_MCP_PLUGIN_CONFIG_GET,
   VirtualMCPTools.VIRTUAL_MCP_PLUGIN_CONFIG_UPDATE,
   VirtualMCPTools.VIRTUAL_MCP_PINNED_VIEWS_UPDATE,
+  VirtualMCPTools.VIRTUAL_MCP_LAST_USED_LIST,
 
   // Ai providers tools
   AiProvidersTools.AI_PROVIDERS_LIST,
@@ -140,13 +146,26 @@ const CORE_TOOLS = [
   AiProvidersTools.AI_PROVIDER_KEY_CREATE,
   AiProvidersTools.AI_PROVIDER_KEY_DELETE,
   AiProvidersTools.AI_PROVIDER_KEY_UPDATE,
+  AiProvidersTools.AI_PROVIDER_KEY_PREVIEW,
   AiProvidersTools.AI_PROVIDER_KEY_LIST,
   AiProvidersTools.AI_PROVIDER_OAUTH_URL,
   AiProvidersTools.AI_PROVIDER_OAUTH_EXCHANGE,
   AiProvidersTools.AI_PROVIDER_PROVISION_KEY,
   AiProvidersTools.AI_PROVIDER_TOPUP_URL,
   AiProvidersTools.AI_PROVIDER_CREDITS,
-  AiProvidersTools.AI_PROVIDER_CLI_ACTIVATE,
+  // Secrets tools
+  SecretsTools.SECRET_CREATE,
+  SecretsTools.SECRET_LIST,
+
+  // File config tools (org-scoped S3 bucket configurations)
+  FileConfigTools.FILE_CONFIG_CREATE,
+  FileConfigTools.FILE_CONFIG_LIST,
+  FileConfigTools.FILE_CONFIG_UPDATE,
+  FileConfigTools.FILE_CONFIG_DELETE,
+  FileConfigTools.FILE_OBJECTS_LIST,
+
+  // Org filesystem (shared public skill sets)
+  ORG_FS_PUBLIC_SETS_SYNC,
 
   // Object Storage tools
   ObjectStorageTools.LIST_OBJECTS,
@@ -160,138 +179,102 @@ const CORE_TOOLS = [
   ...RegistryTools.tools,
 
   // VM tools (app-only)
-  VmTools.VM_START,
-  VmTools.VM_DELETE,
+  SandboxTools.SANDBOX_START,
+  SandboxTools.SANDBOX_DELETE,
 
   // GitHub tools (app-only)
   GitHubTools.GITHUB_LIST_USER_ORGS,
+
+  // Link tools
+  LinkTools.LINK_CURRENT_GET,
+  LinkTools.LINK_DISCONNECT,
+
+  // Search tools
+  SearchTools.GLOBAL_SEARCH,
 ] as const satisfies { name: ToolName }[];
 
-// Plugin tools - collected at startup, gated by org settings at runtime
-const PLUGIN_TOOLS = collectPluginTools();
+/**
+ * Tuple type of the core tools, preserving each tool's concrete Zod
+ * input/output schema types (unlike the widened `RegistrableTool`). Type-only
+ * consumers derive per-tool input/output types from this — see `./io-types`.
+ * Import as `import type` only; importing as a value would pull the entire
+ * server tool graph into a bundle.
+ */
+export type CoreTools = typeof CORE_TOOLS;
 
-// Tool type for combined core + plugin tools
-interface CombinedTool {
-  name: string;
-  description: string;
-  inputSchema: unknown;
-  outputSchema: unknown;
-  annotations?: ToolAnnotations;
-  _meta?: Record<string, unknown>;
-  handler: (input: unknown, ctx: MeshContext) => Promise<unknown>;
-  execute: (input: unknown, ctx: MeshContext) => Promise<unknown>;
-}
-
-// All available tools — core + plugin tools
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const ALL_TOOLS: CombinedTool[] = [
-  ...(CORE_TOOLS as unknown as CombinedTool[]),
-  ...(PLUGIN_TOOLS as unknown as CombinedTool[]),
-];
-
-export type MCPMeshTools = typeof ALL_TOOLS;
-
-// Derive tool name type from ALL_TOOLS
-export type ToolNameFromTools = (typeof ALL_TOOLS)[number]["name"];
+/**
+ * Static name→tool map over the (static) tool set, built once at module load.
+ * Shared by the REST dispatch/list endpoints and the MCP server.
+ *
+ * Values are widened to `RegistrableTool` (a uniform shape with
+ * `execute(unknown, ctx)`) — the concrete per-tool tuple types form a union of
+ * functions with incompatible parameters that can't be called generically. This
+ * map is the single boundary where that widening happens.
+ */
+export const TOOL_BY_NAME: Map<string, RegistrableTool> = new Map(
+  (CORE_TOOLS as unknown as RegistrableTool[]).map((tool) => [tool.name, tool]),
+);
 
 export const managementMCP = async (
-  ctx: MeshContext,
+  ctx: StudioContext,
   toolFilter?: (name: string) => boolean,
 ) => {
-  // Get enabled plugins for this organization to filter plugin tools
-  // Check both org settings (legacy) and all virtual MCPs
-  let enabledPlugins: string[] | null = null;
-  if (ctx.organization) {
-    const settings = await ctx.storage.organizationSettings.get(
-      ctx.organization.id,
-    );
-    const virtualMcps = await ctx.storage.virtualMcps.list(ctx.organization.id);
-    // Merge enabled plugins from org settings + all virtual MCPs
-    const merged = new Set<string>(settings?.enabled_plugins ?? []);
-    for (const virtualMcp of virtualMcps) {
-      const enabledPlugins = virtualMcp.metadata?.enabled_plugins;
-      if (enabledPlugins && Array.isArray(enabledPlugins)) {
-        for (const pluginId of enabledPlugins) {
-          merged.add(pluginId);
-        }
-      }
-    }
-    enabledPlugins = merged.size > 0 ? [...merged] : null;
-  }
-
-  // Filter tools based on enabled plugins
-  // Core tools are always included, plugin tools only if their plugin is enabled
-  const filteredTools = filterToolsByEnabledPlugins(
-    ALL_TOOLS,
-    enabledPlugins,
-  ).filter((tool) => toolFilter?.(tool.name) ?? true);
-
   // Create MCP server directly
   const server = new McpServer(
     { name: "mcp-cms-management", version: "1.0.0" },
-    { capabilities: { tools: {}, prompts: {}, resources: {} } },
+    {
+      capabilities: { tools: {}, prompts: {}, resources: {} },
+      jsonSchemaValidator: sharedJsonSchemaValidator,
+    },
   );
 
-  // Register each tool with the server
-  for (const tool of filteredTools) {
-    const inputSchema =
-      tool.inputSchema &&
-      typeof tool.inputSchema === "object" &&
-      "shape" in tool.inputSchema
-        ? (tool.inputSchema as z.ZodObject<z.ZodRawShape>)
-        : z.object({});
-    const outputSchema =
-      tool.outputSchema &&
-      typeof tool.outputSchema === "object" &&
-      "shape" in tool.outputSchema
-        ? (tool.outputSchema as z.ZodObject<z.ZodRawShape>)
-        : undefined;
-
-    const inputShape = inputSchema.shape;
-    const outputShape = outputSchema?.shape;
-
-    server.registerTool(
-      tool.name,
-      {
-        description: tool.description ?? "",
-        inputSchema: inputShape,
-        outputSchema: outputShape,
-        annotations: tool.annotations,
-        _meta: tool._meta,
-      },
-      async (args) => {
-        ctx.access.setToolName(tool.name);
-        try {
-          const result = await tool.execute(args, ctx);
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify(result) }],
-            structuredContent: result as { [x: string]: unknown },
-          };
-        } catch (error) {
-          const err = error as Error;
-          return {
-            content: [{ type: "text" as const, text: `Error: ${err.message}` }],
-            isError: true,
-          };
-        }
-      },
-    );
+  // Register each tool from its shared, prebuilt registration (config carries
+  // the prebuilt Zod schemas; the handler reads ctx from the ALS store at call
+  // time rather than capturing it). Only the map insertion is per-request.
+  for (const tool of TOOL_BY_NAME.values()) {
+    // Role-scoped access: skip tools the caller's role may not use so they
+    // don't appear in tools/list and can't be invoked.
+    if (toolFilter && !toolFilter(tool.name)) continue;
+    const { config, handler } = getToolRegistration(tool);
+    server.registerTool(tool.name, config, handler);
   }
 
   // Register action prompts
   const prompts = getPrompts();
   for (const prompt of prompts) {
+    const argsSchema = prompt.arguments?.length
+      ? Object.fromEntries(
+          prompt.arguments.map((a) => {
+            const base = a.required ? z.string() : z.string().optional();
+            return [
+              a.name,
+              a.description ? base.describe(a.description) : base,
+            ];
+          }),
+        )
+      : undefined;
+
     server.registerPrompt(
       prompt.name,
-      { title: prompt.title, description: prompt.description },
-      () => ({
-        messages: [
-          {
-            role: "user" as const,
-            content: { type: "text" as const, text: prompt.text },
-          },
-        ],
-      }),
+      {
+        title: prompt.title,
+        description: prompt.description,
+        ...(argsSchema ? { argsSchema } : {}),
+      },
+      (args) => {
+        const text =
+          typeof prompt.text === "function"
+            ? prompt.text((args ?? {}) as Record<string, string | undefined>)
+            : prompt.text;
+        return {
+          messages: [
+            {
+              role: "user" as const,
+              content: { type: "text" as const, text },
+            },
+          ],
+        };
+      },
     );
   }
 
@@ -409,18 +392,22 @@ export const managementMCP = async (
  * connecting a client to the management server over InMemoryTransport.
  */
 export async function listManagementTools(
-  ctx: MeshContext,
+  ctx: StudioContext,
 ): Promise<McpTool[]> {
   const server = await managementMCP(ctx);
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
-  const client = new Client({ name: "tools-hydration", version: "1.0.0" });
+  const client = new Client(
+    { name: "tools-hydration", version: "1.0.0" },
+    { jsonSchemaValidator: sharedJsonSchemaValidator },
+  );
   try {
     await client.connect(clientTransport);
     const result = await client.listTools();
     return result.tools;
   } finally {
     await client.close().catch(() => {});
+    await server.close().catch(() => {});
   }
 }

@@ -11,11 +11,9 @@ import {
 } from "@deco/ui/components/dialog.tsx";
 import { Button } from "@deco/ui/components/button.tsx";
 import { Spinner } from "@deco/ui/components/spinner.tsx";
-import {
-  SELF_MCP_ALIAS_ID,
-  useMCPClient,
-  useProjectContext,
-} from "@decocms/mesh-sdk";
+import { useProjectContext } from "@decocms/mesh-sdk";
+import { useStudioTools } from "@/web/lib/studio-tools";
+import type { ToolInput } from "@/tools/io-types";
 import { useAiProviders } from "@/web/hooks/collections/use-ai-providers";
 import { KEYS } from "@/web/lib/query-keys";
 import { track } from "@/web/lib/posthog-client";
@@ -42,8 +40,6 @@ function activeProviderId(state: DialogState): string | null {
   switch (state.kind) {
     case "form":
     case "oauth-pending":
-    case "cli-pending":
-    case "cli-error":
     case "provision-pending":
     case "provision-error":
       return state.providerId;
@@ -60,11 +56,7 @@ export function ConnectProviderDialog({
   const aiProviders = useAiProviders();
   const providers = aiProviders?.providers ?? [];
   const { org } = useProjectContext();
-  const client = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
+  const studio = useStudioTools();
   const queryClient = useQueryClient();
   const [state, dispatch] = useReducer(reducer, initialState);
   const triggeredRef = useRef(false);
@@ -102,13 +94,13 @@ export function ConnectProviderDialog({
       stateToken: string;
       label: string;
     }) => {
-      const result = (await client.callTool({
-        name: "AI_PROVIDER_OAUTH_EXCHANGE",
-        arguments: { providerId, code, stateToken, label },
-      })) as { isError?: boolean; content?: { text?: string }[] };
-      if (result?.isError) {
-        throw new Error(result.content?.[0]?.text ?? "OAuth exchange failed");
-      }
+      await studio.call("AI_PROVIDER_OAUTH_EXCHANGE", {
+        providerId:
+          providerId as ToolInput<"AI_PROVIDER_OAUTH_EXCHANGE">["providerId"],
+        code,
+        stateToken,
+        label,
+      });
       return providerId;
     },
     onSuccess: (providerId) => {
@@ -128,57 +120,12 @@ export function ConnectProviderDialog({
     },
   });
 
-  const { mutate: activateCli } = useMutation({
-    mutationFn: async (providerId: string) => {
-      const result = (await client.callTool({
-        name: "AI_PROVIDER_CLI_ACTIVATE",
-        arguments: { providerId },
-      })) as {
-        structuredContent?: { activated: boolean; error?: string };
-        isError?: boolean;
-        content?: { text?: string }[];
-      };
-      if (result?.isError) {
-        throw new Error(result.content?.[0]?.text ?? "CLI activation failed");
-      }
-      return { providerId, ...result.structuredContent };
-    },
-    onSuccess: (data) => {
-      if (!data?.activated) {
-        track("ai_provider_cli_activate_failed", {
-          provider_id: data.providerId,
-          error: data?.error ?? "unknown",
-        });
-        dispatch({
-          type: "cli-error",
-          error: data?.error ?? "CLI activation failed",
-        });
-        return;
-      }
-      track("ai_provider_cli_activated", { provider_id: data.providerId });
-      invalidateKeys();
-      const provider = providers.find((p) => p.id === data.providerId);
-      toast.success(`${provider?.name ?? "Provider"} activated`);
-      close();
-    },
-    onError: (err, providerId) => {
-      track("ai_provider_cli_activate_failed", {
-        provider_id: providerId,
-        error: err.message,
-      });
-      dispatch({ type: "cli-error", error: err.message });
-    },
-  });
-
   const { mutate: provisionKey } = useMutation({
     mutationFn: async (providerId: string) => {
-      const result = (await client.callTool({
-        name: "AI_PROVIDER_PROVISION_KEY",
-        arguments: { providerId },
-      })) as { isError?: boolean; content?: { text?: string }[] };
-      if (result?.isError) {
-        throw new Error(result.content?.[0]?.text ?? "Key provisioning failed");
-      }
+      await studio.call("AI_PROVIDER_PROVISION_KEY", {
+        providerId:
+          providerId as ToolInput<"AI_PROVIDER_PROVISION_KEY">["providerId"],
+      });
       return providerId;
     },
     onSuccess: (providerId) => {
@@ -204,7 +151,6 @@ export function ConnectProviderDialog({
         ? (selection.preset?.id ?? null)
         : null;
     const supportsOAuth = provider.supportedMethods.includes("oauth-pkce");
-    const supportsCli = provider.supportedMethods.includes("cli-activate");
     const supportsApiKey = provider.supportedMethods.includes("api-key");
     const supportsProvision = provider.supportsProvision === true;
 
@@ -218,42 +164,25 @@ export function ConnectProviderDialog({
       return;
     }
 
-    if (supportsCli) {
-      track("ai_provider_connect_clicked", {
-        provider_id: provider.id,
-        method: "cli-activate",
-      });
-      dispatch({ type: "select-cli", providerId: provider.id });
-      activateCli(provider.id);
-      return;
-    }
-
     if (supportsOAuth) {
       track("ai_provider_connect_clicked", {
         provider_id: provider.id,
         method: "oauth-pkce",
       });
       try {
-        const result = (await client.callTool({
-          name: "AI_PROVIDER_OAUTH_URL",
-          arguments: {
-            providerId: provider.id,
-            callbackUrl: `${window.location.origin}/oauth/callback/ai-provider`,
-          },
-        })) as { structuredContent?: { url: string; stateToken: string } };
-        if (!result.structuredContent) {
+        const result = await studio.call("AI_PROVIDER_OAUTH_URL", {
+          providerId: provider.id,
+          callbackUrl: `${window.location.origin}/oauth/callback/ai-provider`,
+        });
+        if (!result?.url) {
           throw new Error("Invalid response from AI_PROVIDER_OAUTH_URL");
         }
         dispatch({
           type: "select-oauth",
           providerId: provider.id,
-          stateToken: result.structuredContent.stateToken,
+          stateToken: result.stateToken,
         });
-        window.open(
-          result.structuredContent.url,
-          "AiProviderOAuth",
-          "width=600,height=700",
-        );
+        window.open(result.url, "AiProviderOAuth", "width=600,height=700");
       } catch (err) {
         toast.error(
           `Failed to start OAuth: ${err instanceof Error ? err.message : String(err)}`,
@@ -366,7 +295,7 @@ export function ConnectProviderDialog({
 
   return (
     <Dialog open={state.kind !== "closed"} onOpenChange={(o) => !o && close()}>
-      <DialogContent className="sm:max-w-3xl max-h-[90vh] overflow-y-auto">
+      <DialogContent className="sm:max-w-md max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <div className="flex items-center gap-2">
             {showBack && (
@@ -429,17 +358,14 @@ export function ConnectProviderDialog({
           </div>
         )}
 
-        {(state.kind === "cli-pending" ||
-          state.kind === "provision-pending") && (
+        {state.kind === "provision-pending" && (
           <div className="flex flex-col items-center gap-4 py-8">
             <Spinner size="lg" />
-            <p className="text-sm text-muted-foreground">
-              {state.kind === "cli-pending" ? "Checking CLI…" : "Connecting…"}
-            </p>
+            <p className="text-sm text-muted-foreground">Connecting…</p>
           </div>
         )}
 
-        {(state.kind === "cli-error" || state.kind === "provision-error") && (
+        {state.kind === "provision-error" && (
           <div className="flex flex-col items-center gap-4 py-6">
             <AlertCircle size={28} className="text-destructive" />
             <p className="text-sm text-foreground text-center">{state.error}</p>
@@ -454,13 +380,8 @@ export function ConnectProviderDialog({
               <Button
                 size="sm"
                 onClick={() => {
-                  if (state.kind === "cli-error") {
-                    dispatch({ type: "retry-cli" });
-                    activateCli(state.providerId);
-                  } else {
-                    dispatch({ type: "retry-provision" });
-                    provisionKey(state.providerId);
-                  }
+                  dispatch({ type: "retry-provision" });
+                  provisionKey(state.providerId);
                 }}
               >
                 Retry

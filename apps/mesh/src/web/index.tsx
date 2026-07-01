@@ -9,24 +9,18 @@ import {
   Outlet,
   RouterProvider,
   redirect,
-  type AnyRoute,
 } from "@tanstack/react-router";
 import { SplashScreen } from "@/web/components/splash-screen";
 import { ChunkErrorBoundary } from "@/web/components/error-boundary";
 import * as z from "zod";
-import type { ReactNode } from "react";
 
 import "../../index.css";
 
-import { authClient } from "@/web/lib/auth-client";
+import { listOrganizationsCached } from "@/web/lib/auth-client";
 import { LOCALSTORAGE_KEYS } from "@/web/lib/localstorage-keys";
 import { requireAdminRole } from "@/web/lib/require-admin-role";
-
-import { sourcePlugins } from "./plugins.ts";
-import type {
-  AnyClientPlugin,
-  PluginSetupContext,
-} from "@decocms/bindings/plugins";
+import { readLastLocation, saveLastLocation } from "@/web/lib/last-location";
+import { initPwaInstallCapture } from "@/web/lib/pwa-install";
 
 const rootRoute = createRootRoute({
   component: () => (
@@ -62,6 +56,12 @@ const loginRoute = createRoute({
       code_challenge_method: z.string().optional(),
     }),
   ),
+});
+
+const cliAuthSuccessRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/cli/auth-success",
+  component: lazyRouteComponent(() => import("./routes/cli-auth-success.tsx")),
 });
 
 const resetPasswordRoute = createRoute({
@@ -114,38 +114,49 @@ const homeRoute = createRoute({
   getParentRoute: () => shellLayout,
   path: "/",
   beforeLoad: async () => {
-    // Fetch org list once — used for both slug validation and redirect
-    const { data: orgs } = await authClient.organization.list();
-
-    // If the list call failed, skip redirect logic to avoid clearing a
-    // valid cached slug due to a transient API failure.
-    if (!orgs) return;
-
-    // Filter out archived organizations — they are soft-deleted and invisible to the UI
-    type OrgWithMeta = (typeof orgs)[number] & {
-      metadata?: { archived?: boolean } | null;
-    };
-    const activeOrgs = (orgs as OrgWithMeta[]).filter(
-      (o) => !o.metadata?.archived,
-    );
-
-    // Fast path: validate cached slug against current membership before redirecting.
-    // If stale (org deleted/archived or user removed), clear it to prevent a redirect loop.
-    const lastOrgSlug = localStorage.getItem(LOCALSTORAGE_KEYS.lastOrgSlug());
-    if (lastOrgSlug) {
-      const slugIsValid = activeOrgs.some((o) => o.slug === lastOrgSlug);
-      if (slugIsValid) {
-        throw redirect({
-          to: "/$org",
-          params: { org: lastOrgSlug },
-        });
-      }
-      // Stale — remove so future visits don't loop
-      localStorage.removeItem(LOCALSTORAGE_KEYS.lastOrgSlug());
+    // Restore where the user last was. lastLocation is recorded on every
+    // org-scoped navigation (orgLayout writes the org; the thread route adds
+    // the taskId), so it's always current — including after an in-app org
+    // switch, which the queryFn-driven lastOrgSlug can miss when the new org
+    // is already cached. Reads are synchronous so cold entry stays instant. A
+    // stale org/thread self-heals: OrgAccessGate clears it and bounces back to
+    // "/", and an unknown taskId is re-fetched/created by useEnsureTask.
+    const lastLocation = readLastLocation();
+    if (lastLocation?.taskId) {
+      throw redirect({
+        to: "/$org/$taskId",
+        params: { org: lastLocation.org, taskId: lastLocation.taskId },
+        search: lastLocation.virtualmcpid
+          ? { virtualmcpid: lastLocation.virtualmcpid }
+          : {},
+      });
+    }
+    if (lastLocation) {
+      throw redirect({ to: "/$org", params: { org: lastLocation.org } });
     }
 
+    // Fast path: redirect returning users immediately from the cached slug,
+    // WITHOUT awaiting the org-list network call. This is what keeps a cold
+    // load from blocking on a round-trip (the previous blank/white screen).
+    // The org layout validates membership via getFullOrganization, and a stale
+    // slug self-heals in OrgAccessGate (clears the slug + bounces back to "/").
+    const lastOrgSlug = localStorage.getItem(LOCALSTORAGE_KEYS.lastOrgSlug());
+    if (lastOrgSlug) {
+      throw redirect({
+        to: "/$org",
+        params: { org: lastOrgSlug },
+      });
+    }
+
+    // No cached slug — fetch the list (cached) to pick a destination.
+    const { data: orgs } = await listOrganizationsCached();
+
+    // If the list call failed, skip redirect logic to avoid a misfire on a
+    // transient API failure. Archived orgs are already filtered by the helper.
+    if (!orgs) return;
+
     // Redirect to first available org (every user gets a default org on signup)
-    const firstOrg = activeOrgs[0];
+    const firstOrg = orgs[0];
     if (firstOrg) {
       throw redirect({
         to: "/$org",
@@ -163,18 +174,27 @@ const onboardingRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/onboarding",
   beforeLoad: async () => {
-    const { data: orgs } = await authClient.organization.list();
-    type OrgWithMeta = NonNullable<typeof orgs>[number] & {
-      metadata?: { archived?: boolean } | null;
-    };
-    const activeOrgs = (orgs as OrgWithMeta[] | undefined)?.filter(
-      (o) => !o.metadata?.archived,
-    );
-    if (activeOrgs && activeOrgs.length > 0) {
+    // Archived orgs are already filtered by the helper.
+    const { data: orgs } = await listOrganizationsCached();
+    if (orgs && orgs.length > 0) {
       throw redirect({ to: "/" });
     }
   },
   component: lazyRouteComponent(() => import("./routes/onboarding.tsx")),
+});
+
+const commerceOnboardingRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/commerce-onboarding",
+  component: lazyRouteComponent(
+    () => import("./routes/commerce-onboarding.tsx"),
+  ),
+  validateSearch: z.lazy(() =>
+    z.object({
+      org: z.string().optional(),
+      siteUrl: z.string().optional(),
+    }),
+  ),
 });
 
 // ============================================
@@ -184,6 +204,12 @@ const onboardingRoute = createRoute({
 const orgLayout = createRoute({
   getParentRoute: () => shellLayout,
   path: "/$org",
+  // Record the org on every entry/switch (this re-runs whenever the $org param
+  // changes). Clears any prior taskId; the thread route re-adds it right after
+  // for /$org/$taskId, since this parent beforeLoad runs before the child's.
+  beforeLoad: ({ params }) => {
+    saveLastLocation({ org: params.org });
+  },
   component: lazyRouteComponent(() => import("./layouts/org-layout.tsx")),
 });
 
@@ -219,18 +245,34 @@ const unifiedChatSearchSchema = z.object({
   virtualmcpid: z.string().optional(),
   tab: z.string().optional(),
   main: z.string().optional(),
+  /** Open the Library file-preview overlay over the chat (browse-grammar path
+   *  "<volume>/<path…>"). Set by clickable org-file refs in agent messages. */
+  preview: z.string().optional(),
   id: z.string().optional(),
   toolName: z.string().optional(),
   tasks: z.number().optional(),
   mainOpen: z.number().optional(),
   chat: z.number().optional(),
   autosend: z.string().optional(),
+  /** Carried from the homepage composer so the new thread's first send
+   *  inherits the "Run locally" toggle state. ChatPrefsProvider seeds
+   *  runLocally from this on mount. */
+  runLocally: z.string().optional(),
 });
 
 const unifiedChatRoute = createRoute({
   getParentRoute: () => agentShellLayout,
   path: "/$taskId",
   validateSearch: unifiedChatSearchSchema,
+  // Remember the open thread so cold entry ("/") can restore it. Preloading is
+  // off (defaultPreload unset), so this only fires on real navigation.
+  beforeLoad: ({ params, search }) => {
+    saveLastLocation({
+      org: params.org,
+      taskId: params.taskId,
+      virtualmcpid: search.virtualmcpid,
+    });
+  },
   component: () => null,
 });
 
@@ -240,6 +282,23 @@ const orgIndexRoute = createRoute({
   getParentRoute: () => orgShellLayout,
   path: "/",
   component: lazyRouteComponent(() => import("./layouts/org-home/index.tsx")),
+});
+
+// Library (/$org/files) — the org filesystem browser. Static segment, so it
+// outranks the /$taskId param route. `path` is the browse location
+// ("<volume>/<dir...>", "" = root); `preview` is an open file's path;
+// `skill` is an open skill dir's path (Claude Code skill preview).
+const librarySearchSchema = z.object({
+  path: z.string().optional(),
+  preview: z.string().optional(),
+  skill: z.string().optional(),
+});
+
+const libraryRoute = createRoute({
+  getParentRoute: () => orgShellLayout,
+  path: "/files",
+  validateSearch: librarySearchSchema,
+  component: lazyRouteComponent(() => import("./layouts/library/index.tsx")),
 });
 
 // ============================================
@@ -252,17 +311,24 @@ const settingsLayout = createRoute({
   component: lazyRouteComponent(() => import("./layouts/settings-layout.tsx")),
 });
 
+// Per-org install page (/$org/install) — swaps the document manifest to an
+// org-branded one so installing here produces a distinct home-screen app for
+// the org. Studio itself is installed via the browser's native "Add to Home
+// Screen" (the default manifest stays active everywhere else). See
+// routes/org-install.tsx and lib/pwa-install.ts.
+const orgInstallRoute = createRoute({
+  getParentRoute: () => orgLayout,
+  path: "/install",
+  component: lazyRouteComponent(() => import("./routes/org-install.tsx")),
+});
+
 // Settings index → redirect to /general
 const settingsIndexRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/",
-  beforeLoad: ({ params }) => {
-    throw redirect({
-      to: "/$org/settings/general",
-      params: { org: params.org },
-    });
-  },
-  component: () => null,
+  component: lazyRouteComponent(
+    () => import("./routes/orgs/settings/index-redirect.tsx"),
+  ),
 });
 
 // Operations: Connections
@@ -313,7 +379,9 @@ const monitoringRoute = createRoute({
   ),
   validateSearch: z.lazy(() =>
     z.object({
-      tab: z.enum(["overview", "audit", "threads"]).default("overview"),
+      tab: z
+        .enum(["overview", "audit", "dashboards", "threads", "automations"])
+        .default("overview"),
       from: z.string().default("now-30m"),
       to: z.string().default("now"),
       connectionId: z.array(z.string()).optional().default([]),
@@ -341,17 +409,6 @@ const settingsGeneralRoute = createRoute({
   ),
 });
 
-const settingsFeaturesRoute = createRoute({
-  getParentRoute: () => settingsLayout,
-  path: "/features",
-  beforeLoad: async ({ params }) => {
-    await requireAdminRole({ org: params.org });
-  },
-  component: lazyRouteComponent(
-    () => import("./routes/orgs/settings/features.tsx"),
-  ),
-});
-
 const settingsBrandContextRoute = createRoute({
   getParentRoute: () => settingsLayout,
   path: "/brand-context",
@@ -371,6 +428,30 @@ const settingsAiProvidersRoute = createRoute({
   },
   component: lazyRouteComponent(
     () => import("./routes/orgs/settings/ai-providers.tsx"),
+  ),
+});
+
+const settingsSecretsRoute = createRoute({
+  getParentRoute: () => settingsLayout,
+  path: "/secrets",
+  component: lazyRouteComponent(
+    () => import("./routes/orgs/settings/secrets.tsx"),
+  ),
+});
+
+const settingsFilesRoute = createRoute({
+  getParentRoute: () => settingsLayout,
+  path: "/files",
+  component: lazyRouteComponent(
+    () => import("./routes/orgs/settings/files.tsx"),
+  ),
+});
+
+const settingsBucketsRoute = createRoute({
+  getParentRoute: () => settingsLayout,
+  path: "/buckets",
+  component: lazyRouteComponent(
+    () => import("./routes/orgs/settings/buckets.tsx"),
   ),
 });
 
@@ -451,29 +532,6 @@ const settingsStoreRegistryRoute = createRoute({
   ),
 });
 
-const settingsWorkflowsRoute = createRoute({
-  getParentRoute: () => settingsLayout,
-  path: "/workflows",
-  component: lazyRouteComponent(() => import("./routes/orgs/workflow.tsx")),
-});
-
-const settingsWorkflowDetailRoute = createRoute({
-  getParentRoute: () => settingsLayout,
-  path: "/workflows/$itemId",
-  component: lazyRouteComponent(
-    () => import("./routes/orgs/settings/workflow-detail.tsx"),
-  ),
-});
-
-// Org-level plugin route (for org-admin)
-const orgPluginRoute = createRoute({
-  getParentRoute: () => agentShellLayout,
-  path: "/plugins/$pluginId",
-  component: lazyRouteComponent(
-    () => import("./layouts/org-plugin-layout.tsx"),
-  ),
-});
-
 // ============================================
 // UNIFIED CHAT SUB-ROUTES
 // ============================================
@@ -493,71 +551,6 @@ const settingsAutomationsRoute = createRoute({
   ),
 });
 
-// Plugin sub-route under unified chat
-const unifiedPluginRoute = createRoute({
-  getParentRoute: () => unifiedChatRoute,
-  path: "/$pluginId",
-  component: lazyRouteComponent(
-    () => import("./layouts/dynamic-plugin-layout.tsx"),
-  ),
-});
-
-// ============================================
-// PLUGIN ROUTES
-// ============================================
-
-// Plugin setup (same as before)
-export const pluginRootSidebarItems: {
-  pluginId: string;
-  icon: ReactNode;
-  label: string;
-}[] = [];
-
-export const pluginSidebarGroups: {
-  pluginId: string;
-  id: string;
-  label: string;
-  items: { icon: ReactNode; label: string }[];
-  defaultExpanded?: boolean;
-}[] = [];
-
-export const pluginSettingsSidebarItems: {
-  pluginId: string;
-  key: string;
-  icon: ReactNode;
-  label: string;
-  to: string;
-}[] = [];
-
-const pluginRoutes: AnyRoute[] = [];
-
-sourcePlugins.forEach((plugin: AnyClientPlugin) => {
-  // Only invoke setup if the plugin provides it
-  if (!plugin.setup) return;
-
-  const context: PluginSetupContext = {
-    parentRoute: unifiedPluginRoute as AnyRoute,
-    routing: {
-      createRoute: createRoute,
-      lazyRouteComponent: lazyRouteComponent,
-    },
-    registerRootSidebarItem: (item) =>
-      pluginRootSidebarItems.push({ pluginId: plugin.id, ...item }),
-    registerSidebarGroup: (group) =>
-      pluginSidebarGroups.push({ pluginId: plugin.id, ...group }),
-    registerSettingsSidebarItem: (item) =>
-      pluginSettingsSidebarItems.push({ pluginId: plugin.id, ...item }),
-    registerPluginRoutes: (routes) => {
-      pluginRoutes.push(...routes);
-    },
-  };
-
-  plugin.setup(context);
-});
-
-// Add all plugin routes as children of the unified plugin route
-const unifiedPluginWithChildren = unifiedPluginRoute.addChildren(pluginRoutes);
-
 // ============================================
 // ROUTE TREE
 // ============================================
@@ -571,9 +564,11 @@ const settingsWithChildren = settingsLayout.addChildren([
   settingsAutomationsRoute,
   monitoringRoute,
   settingsGeneralRoute,
-  settingsFeaturesRoute,
   settingsBrandContextRoute,
   settingsAiProvidersRoute,
+  settingsSecretsRoute,
+  settingsFilesRoute,
+  settingsBucketsRoute,
   settingsMembersRoute,
   settingsRolesRoute,
   settingsSsoRoute,
@@ -581,27 +576,20 @@ const settingsWithChildren = settingsLayout.addChildren([
   settingsStoreRoute,
   settingsStoreRegistryRoute,
   settingsRegistryRoute,
-  settingsWorkflowsRoute,
-  settingsWorkflowDetailRoute,
 ]);
 
-const unifiedChatWithChildren = unifiedChatRoute.addChildren([
-  unifiedPluginWithChildren,
-]);
-
-const agentShellWithChildren = agentShellLayout.addChildren([
-  unifiedChatWithChildren,
-  orgPluginRoute,
-]);
+const agentShellWithChildren = agentShellLayout.addChildren([unifiedChatRoute]);
 
 const orgShellWithChildren = orgShellLayout.addChildren([
   orgIndexRoute,
+  libraryRoute,
   agentShellWithChildren,
 ]);
 
 const orgLayoutWithChildren = orgLayout.addChildren([
   orgShellWithChildren,
   settingsWithChildren,
+  orgInstallRoute,
 ]);
 
 const shellRouteTree = shellLayout.addChildren([
@@ -612,7 +600,9 @@ const shellRouteTree = shellLayout.addChildren([
 const routeTree = rootRoute.addChildren([
   shellRouteTree,
   onboardingRoute,
+  commerceOnboardingRoute,
   loginRoute,
+  cliAuthSuccessRoute,
   resetPasswordRoute,
   betterAuthRoutes,
   oauthCallbackRoute,
@@ -621,6 +611,11 @@ const routeTree = rootRoute.addChildren([
 
 const router = createRouter({
   routeTree,
+  // Show the splash (not a blank screen) while a route loader/beforeLoad is
+  // awaiting — e.g. the new-user org-list fetch. 200ms delay avoids a flash on
+  // instant (synchronous) redirects like the returning-user fast path.
+  defaultPendingComponent: SplashScreen,
+  defaultPendingMs: 200,
   defaultNotFoundComponent: () => (
     <div className="flex h-full items-center justify-center">
       <div className="flex flex-col items-center gap-4 p-8">
@@ -645,6 +640,10 @@ declare module "@tanstack/react-router" {
     router: typeof router;
   }
 }
+
+// Capture the Chromium install prompt as early as possible so the /install
+// page can offer a one-click install. Fires once shortly after load.
+initPwaInstallCapture();
 
 const rootElement = document.getElementById("root")!;
 

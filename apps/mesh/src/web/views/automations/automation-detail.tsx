@@ -4,10 +4,12 @@
  * Settings and run history for a single automation on one page.
  */
 
+import { type SimpleModeTier } from "@/web/components/chat/simple-mode-tier-dropdown";
 import {
-  SimpleModeTierDropdown,
-  type SimpleModeTier,
-} from "@/web/components/chat/simple-mode-tier-dropdown";
+  AutomationModelControl,
+  AutomationToolsControl,
+  type AutomationModelOverride,
+} from "@/web/components/automations/automation-config";
 import { User } from "@/web/components/user/user.tsx";
 import {
   useAutomation,
@@ -15,13 +17,13 @@ import {
   useTriggerList,
   type TriggerDefinition,
 } from "@/web/hooks/use-automations";
-import {
-  useChatTask,
-  useChatPrefs,
-  useChatStream,
-} from "@/web/components/chat/context";
-import { usePreferences } from "@/web/hooks/use-preferences";
+import { useChatTask, useChatStream } from "@/web/components/chat/context";
 import { Button } from "@deco/ui/components/button.tsx";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@deco/ui/components/collapsible.tsx";
 import { Input } from "@deco/ui/components/input.tsx";
 import { Switch } from "@deco/ui/components/switch.tsx";
 import {
@@ -35,11 +37,11 @@ import {
   useProjectContext,
 } from "@decocms/mesh-sdk";
 import { usePanelActions } from "@/web/layouts/shell-layout";
-import { useEnsureStudioPack } from "@/web/components/home/use-ensure-studio-pack";
 import { buildImprovePromptDoc } from "@/web/components/chat/tiptap/build-improve-prompt-doc";
 import {
   ArrowLeft,
   ArrowUp,
+  ChevronDown,
   Clock,
   Loading01,
   Stars01,
@@ -69,7 +71,17 @@ interface SettingsFormData {
   name: string;
   active: boolean;
   tier: SimpleModeTier;
+  // Specific-model override (null when using the tier preset).
+  modelOverride: AutomationModelOverride | null;
+  // Tool allowlist (null = all of the agent's tools).
+  tools: string[] | null;
+  // Parent agent-loop step cap (null = platform default).
+  maxAgentSteps: number | null;
 }
+
+// Platform default for the parent agent loop (PARENT_STEP_LIMIT) — shown as
+// the placeholder when no per-automation override is set.
+const DEFAULT_MAX_AGENT_STEPS = 30;
 
 type EditSession = {
   start: number;
@@ -108,6 +120,7 @@ function editSessionReducer(
 import { isValidCron } from "@/web/lib/cron-utils.ts";
 import { AddStarterPopover } from "@/web/components/automations/add-starter-popover.tsx";
 import { TriggerCard } from "@/web/components/automations/trigger-card.tsx";
+import { WebhookSecretDialog } from "@/web/components/automations/webhook-secret-dialog.tsx";
 import {
   Select,
   SelectContent,
@@ -326,27 +339,32 @@ export function SettingsTab({
 }) {
   const agentId = automation.virtual_mcp_id;
   const { org } = useProjectContext();
-  const { update: updateMutation, triggerAdd: addTrigger } =
-    useAutomationActions();
+  const {
+    update: updateMutation,
+    triggerAdd: addTrigger,
+    run: runMutation,
+  } = useAutomationActions();
   const allConnections = useConnections();
   const connectionNameMap = new Map(allConnections.map((c) => [c.id, c.title]));
 
   // Chat hooks for running the automation
-  const { createTaskWithMessage } = useChatTask();
-  const { setSimpleModeTier } = useChatPrefs();
+  const { openTask } = useChatTask();
   const { setChatOpen } = usePanelActions();
   const { sendMessage } = useChatStream();
-  const ensureStudioPack = useEnsureStudioPack();
-  const [preferences, setPreferences] = usePreferences();
   const initialTiptapDoc =
     (automation.messages?.[0] as { metadata?: Metadata } | undefined)?.metadata
       ?.tiptapDoc ?? undefined;
   const [tiptapDoc, setTiptapDocRaw] =
     useState<Metadata["tiptapDoc"]>(initialTiptapDoc);
   const [starterOpen, setStarterOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [showCustomCron, setShowCustomCron] = useState(false);
   const [cronInput, setCronInput] = useState("");
   const [showEventForm, setShowEventForm] = useState(false);
+  const [webhookSecret, setWebhookSecret] = useState<{
+    url: string;
+    token: string;
+  } | null>(null);
   const [isImproving, setIsImproving] = useState(false);
   // The editor's first setTiptapDoc call is the mount-time normalization,
   // not a user edit — we skip it so it doesn't mark dirty / autosave.
@@ -375,8 +393,6 @@ export function SettingsTab({
         instructions_length: instructionsText.length,
       });
 
-      await ensureStudioPack(["studio-automation-manager"]);
-
       setChatOpen(true);
 
       await sendMessage({
@@ -394,12 +410,23 @@ export function SettingsTab({
   };
 
   const defaultTier: SimpleModeTier = automation.models?.tier ?? "smart";
+  const defaultModelOverride: AutomationModelOverride | null =
+    automation.models?.modelId && automation.models?.credentialId
+      ? {
+          modelId: automation.models.modelId,
+          credentialId: automation.models.credentialId,
+          title: automation.models.modelTitle ?? automation.models.modelId,
+        }
+      : null;
 
   const form = useForm<SettingsFormData>({
     defaultValues: {
       name: automation.name,
       active: automation.active,
       tier: defaultTier,
+      modelOverride: defaultModelOverride,
+      tools: automation.tools ?? null,
+      maxAgentSteps: automation.maxAgentSteps ?? null,
     },
   });
 
@@ -453,11 +480,23 @@ export function SettingsTab({
     const tiptapWasDirty = tiptapDirty;
     setTiptapDirty(false);
 
+    const models = {
+      tier: formData.tier,
+      ...(formData.modelOverride
+        ? {
+            modelId: formData.modelOverride.modelId,
+            credentialId: formData.modelOverride.credentialId,
+            modelTitle: formData.modelOverride.title,
+          }
+        : {}),
+    };
     const updatePayload = {
       id: automationId,
       name: formData.name,
       active: formData.active,
-      models: { tier: formData.tier },
+      models,
+      tools: formData.tools,
+      maxAgentSteps: formData.maxAgentSteps,
       messages: tiptapDocToMessages(tiptapDoc),
       temperature: 0,
     };
@@ -518,6 +557,7 @@ export function SettingsTab({
       automation_id: automationId,
       agent_id: agentId,
     });
+
     const saved = await flushAndSave();
     forceSessionFlush();
     if (!saved) return;
@@ -527,16 +567,18 @@ export function SettingsTab({
       return;
     }
 
-    setSimpleModeTier(form.getValues("tier"));
-
-    setChatOpen(true);
-    setPreferences({ ...preferences, toolApprovalLevel: "auto" });
-
-    const parts = derivePartsFromTiptapDoc(tiptapDoc);
-    createTaskWithMessage({
-      message: { tiptapDoc, parts },
-      virtualMcpId: agentId || undefined,
-    });
+    // Fire through the real automation path so the test honors the pinned
+    // model + tool allowlist exactly as a scheduled/triggered fire would,
+    // then open the resulting run thread in the chat panel.
+    try {
+      const result = await runMutation.mutateAsync(automationId);
+      if (result.threadId) {
+        setChatOpen(true);
+        openTask(result.threadId);
+      }
+    } catch {
+      // runMutation surfaces its own error toast.
+    }
   };
 
   return (
@@ -622,6 +664,13 @@ export function SettingsTab({
               onEventSelect={() => {
                 setShowEventForm(true);
                 setShowCustomCron(false);
+              }}
+              onWebhookCreated={(secret) => {
+                track("automation_trigger_added", {
+                  automation_id: automationId,
+                  trigger_type: "webhook",
+                });
+                setWebhookSecret(secret);
               }}
             />
           </div>
@@ -742,6 +791,15 @@ export function SettingsTab({
               />
             </Suspense>
           )}
+
+          <WebhookSecretDialog
+            open={webhookSecret !== null}
+            onOpenChange={(open) => {
+              if (!open) setWebhookSecret(null);
+            }}
+            url={webhookSecret?.url ?? null}
+            token={webhookSecret?.token ?? null}
+          />
         </div>
 
         {/* Section: Instructions */}
@@ -772,13 +830,7 @@ export function SettingsTab({
                 className="max-h-[45vh]"
               />
 
-              <div className="flex items-center justify-end gap-1.5 p-2.5">
-                <SimpleModeTierDropdown
-                  tier={form.watch("tier")}
-                  onSelect={(tier) =>
-                    form.setValue("tier", tier, { shouldDirty: true })
-                  }
-                />
+              <div className="@container/chat-bottom flex items-center justify-end gap-1.5 p-2.5">
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
@@ -798,6 +850,62 @@ export function SettingsTab({
             </div>
           </TiptapProvider>
         </div>
+
+        {/* Section: Advanced (Model, Tools, Max steps) */}
+        <Collapsible
+          open={advancedOpen}
+          onOpenChange={setAdvancedOpen}
+          className="flex flex-col gap-2.5"
+        >
+          <CollapsibleTrigger className="group flex w-fit cursor-pointer items-center gap-1.5">
+            <span className="text-xs font-semibold text-muted-foreground/60">
+              Advanced
+            </span>
+            <ChevronDown
+              size={14}
+              className="text-muted-foreground/60 transition-transform group-data-[state=open]:rotate-180"
+            />
+          </CollapsibleTrigger>
+          <CollapsibleContent className="flex flex-col gap-5 pt-0.5">
+            <AutomationModelControl
+              tier={form.watch("tier")}
+              onTierChange={(tier) =>
+                form.setValue("tier", tier, { shouldDirty: true })
+              }
+              override={form.watch("modelOverride")}
+              onOverrideChange={(o) =>
+                form.setValue("modelOverride", o, { shouldDirty: true })
+              }
+            />
+            <AutomationToolsControl
+              agentId={agentId || null}
+              value={form.watch("tools")}
+              onChange={(v) => form.setValue("tools", v, { shouldDirty: true })}
+            />
+            <div className="flex flex-col gap-2">
+              <span className="text-xs font-semibold text-muted-foreground/60">
+                Max steps
+              </span>
+              <Input
+                type="number"
+                min={1}
+                max={100}
+                className="w-40"
+                placeholder={`${DEFAULT_MAX_AGENT_STEPS} (default)`}
+                value={form.watch("maxAgentSteps") ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  const next = raw === "" ? null : Number(raw);
+                  form.setValue(
+                    "maxAgentSteps",
+                    next === null || Number.isNaN(next) ? null : next,
+                    { shouldDirty: true },
+                  );
+                }}
+              />
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
       </div>
     </>
   );

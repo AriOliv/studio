@@ -1,13 +1,15 @@
 import { ErrorBoundary } from "@/web/components/error-boundary";
 import { useProjectSidebarItems } from "@/web/hooks/use-project-sidebar-items";
 import { Suspense } from "react";
+import { Separator } from "@deco/ui/components/separator.tsx";
 import { NavigationSidebar } from "./navigation";
 import { MobileNavigationSidebar } from "./navigation-mobile";
 import { SidebarInboxFooter } from "./footer/inbox";
 import { SidebarInboxFooterMobile } from "./footer/inbox-mobile";
-import { SidebarAgentsSection } from "./agents-section";
+import { TaskGroupsList } from "./task-groups/task-groups-list";
+import { TaskGroupsSkeleton } from "./task-groups/task-groups-skeleton";
+import { SidebarAgentGroupsProvider } from "./sidebar-agent-groups-context";
 
-// Export types for external use
 export type {
   NavigationSidebarItem,
   SidebarSection,
@@ -16,42 +18,58 @@ export type {
 } from "./types";
 
 export function StudioSidebar() {
-  const sidebarSections = useProjectSidebarItems();
+  const sections = useProjectSidebarItems();
 
   return (
-    <NavigationSidebar
-      sections={sidebarSections}
-      footer={<SidebarInboxFooter />}
-      additionalContent={
-        <ErrorBoundary>
-          <Suspense fallback={null}>
-            <SidebarAgentsSection />
-          </Suspense>
-        </ErrorBoundary>
-      }
-    />
+    <SidebarAgentGroupsProvider>
+      <NavigationSidebar
+        sections={sections}
+        footer={<SidebarInboxFooter />}
+        additionalContent={
+          <ErrorBoundary>
+            <Suspense
+              fallback={
+                <>
+                  <Separator className="mb-2" />
+                  <TaskGroupsSkeleton />
+                </>
+              }
+            >
+              <Separator className="mb-2" />
+              <TaskGroupsList />
+            </Suspense>
+          </ErrorBoundary>
+        }
+      />
+    </SidebarAgentGroupsProvider>
   );
 }
 
-/**
- * Mobile sidebar content — renders inline (no Sheet wrapper).
- * Used inside the mobile sidebar Sheet in shell-layout.
- */
 export function StudioSidebarMobile({ onClose }: { onClose: () => void }) {
-  const sidebarSections = useProjectSidebarItems();
+  const sections = useProjectSidebarItems();
 
   return (
-    <MobileNavigationSidebar
-      sections={sidebarSections}
-      onClose={onClose}
-      footer={<SidebarInboxFooterMobile />}
-      additionalContent={
-        <ErrorBoundary>
-          <Suspense fallback={null}>
-            <SidebarAgentsSection />
-          </Suspense>
-        </ErrorBoundary>
-      }
-    />
+    <SidebarAgentGroupsProvider>
+      <MobileNavigationSidebar
+        sections={sections}
+        onClose={onClose}
+        footer={<SidebarInboxFooterMobile />}
+        additionalContent={
+          <ErrorBoundary>
+            <Suspense
+              fallback={
+                <>
+                  <Separator className="mb-2" />
+                  <TaskGroupsSkeleton />
+                </>
+              }
+            >
+              <Separator className="mb-2" />
+              <TaskGroupsList onNavigate={onClose} />
+            </Suspense>
+          </ErrorBoundary>
+        }
+      />
+    </SidebarAgentGroupsProvider>
   );
 }

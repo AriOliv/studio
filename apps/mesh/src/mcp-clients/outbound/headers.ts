@@ -7,11 +7,12 @@
 
 import { extractConnectionPermissions } from "@/auth/configuration-scopes";
 import { issueMeshToken } from "@/auth/jwt";
-import type { MeshContext } from "@/core/mesh-context";
+import type { StudioContext } from "@/core/studio-context";
 import { SpanStatusCode } from "@opentelemetry/api";
-import { refreshAccessToken } from "@/oauth/token-refresh";
-import { resolveOriginTokenEndpoint } from "@/oauth/resolve-token-endpoint";
+import { getValidDownstreamAccessToken } from "@/oauth/token-refresh";
 import { DownstreamTokenStorage } from "@/storage/downstream-token";
+import { ensureRepoScopedToken } from "@/oauth/github-mint";
+import { getRepoScope } from "@/shared/github-repo-scope";
 import type { ConnectionEntity } from "@/tools/connection/schema";
 import { PerUserAuthorizationRequiredError } from "./errors";
 
@@ -21,7 +22,7 @@ import { PerUserAuthorizationRequiredError } from "./errors";
  * `/api/:org/oauth-proxy/:connectionId/*` (see
  * `apps/mesh/src/api/routes/oauth-proxy.ts`).
  */
-function buildAuthorizeUrl(ctx: MeshContext, connectionId: string): string {
+function buildAuthorizeUrl(ctx: StudioContext, connectionId: string): string {
   const orgSlug = ctx.organization?.slug;
   const base = ctx.baseUrl.replace(/\/+$/, "");
   if (!orgSlug) {
@@ -68,11 +69,11 @@ function stripBindingMetadata(
  */
 export async function buildRequestHeaders(
   connection: ConnectionEntity,
-  ctx: MeshContext,
+  ctx: StudioContext,
   superUser: boolean,
 ): Promise<Record<string, string>> {
   return ctx.tracer.startActiveSpan(
-    "mesh.connection.build_headers",
+    "studio.connection.build_headers",
     { attributes: { "connection.id": connection.id } },
     async (span) => {
       try {
@@ -95,7 +96,7 @@ export async function buildRequestHeaders(
 
 async function _buildRequestHeaders(
   connection: ConnectionEntity,
-  ctx: MeshContext,
+  ctx: StudioContext,
   superUser: boolean,
 ): Promise<Record<string, string>> {
   const connectionId = connection.id;
@@ -130,7 +131,6 @@ async function _buildRequestHeaders(
           id: userId,
           email: ctxUser?.email,
           name: ctxUser?.name,
-          image: ctxUser?.image,
           role: ctxUser?.role,
         },
         metadata: {
@@ -164,9 +164,7 @@ async function _buildRequestHeaders(
   // This supports OAuth token refresh for connections that use OAuth
   let accessToken: string | null = null;
 
-  const tokenStorage = new DownstreamTokenStorage(ctx.db, ctx.vault);
-
-  // Pick the downstream token by auth_mode:
+  // Pick the downstream token identity by auth_mode:
   //   - shared:   one row per connection (`userId = null`).
   //   - per_user: one row per (connection, real caller). The superuser
   //               fallback used for JWT minting is intentionally NOT applied
@@ -178,88 +176,37 @@ async function _buildRequestHeaders(
     ? (ctxUser?.id ?? ctx.auth.apiKey?.userId ?? null)
     : null;
 
-  const cachedToken = await tokenStorage.get(connectionId, oauthUserId);
+  const repoScope = getRepoScope(connection);
+  const useLegacyRepoMint = !!repoScope?.sourceConnectionId;
 
-  if (cachedToken) {
-    const canRefresh =
-      !!cachedToken.refreshToken && !!cachedToken.tokenEndpoint;
-    // If we can refresh, treat "expiring soon" as expired to proactively refresh.
-    // If we cannot refresh, only treat as expired at actual expiry (no buffer),
-    // otherwise short-lived tokens would be deleted immediately.
-    const isExpired = tokenStorage.isExpired(
-      cachedToken,
-      canRefresh ? 5 * 60 * 1000 : 0,
-    );
-
-    if (isExpired) {
-      // Try to refresh if we have refresh capability
-      if (canRefresh) {
-        // If tokenEndpoint is a proxy URL, resolve the origin's actual endpoint
-        // to avoid a self-referential call through the proxy during refresh
-        let tokenEndpointForRefresh = cachedToken.tokenEndpoint;
-        if (
-          connection.connection_url &&
-          cachedToken.tokenEndpoint?.includes("/oauth-proxy/")
-        ) {
-          const originEndpoint = await resolveOriginTokenEndpoint(
-            connection.connection_url,
-          );
-          if (originEndpoint) {
-            tokenEndpointForRefresh = originEndpoint;
-          }
-        }
-
-        const refreshResult = await refreshAccessToken({
-          ...cachedToken,
-          tokenEndpoint: tokenEndpointForRefresh,
-        });
-
-        if (refreshResult.success && refreshResult.accessToken) {
-          // Save refreshed token (with resolved origin endpoint for future refreshes)
-          await tokenStorage.upsert({
-            connectionId,
-            userId: oauthUserId,
-            accessToken: refreshResult.accessToken,
-            refreshToken:
-              refreshResult.refreshToken ?? cachedToken.refreshToken,
-            scope: refreshResult.scope ?? cachedToken.scope,
-            expiresAt: refreshResult.expiresIn
-              ? new Date(Date.now() + refreshResult.expiresIn * 1000)
-              : null,
-            clientId: cachedToken.clientId,
-            clientSecret: cachedToken.clientSecret,
-            tokenEndpoint: tokenEndpointForRefresh,
-          });
-
-          accessToken = refreshResult.accessToken;
-        } else {
-          // Only delete on a definitive `400 invalid_grant`. Transient
-          // failures (5xx, network, non-spec status codes) leave the cached
-          // row intact so the next request retries instead of forcing a
-          // manual reconnect.
-          if (refreshResult.permanent === true) {
-            await tokenStorage.delete(connectionId, oauthUserId);
-          }
-          console.error("[Proxy] token refresh failed", {
-            connectionId,
-            status: refreshResult.status,
-            errorCode: refreshResult.errorCode,
-            permanent: refreshResult.permanent === true,
-            deleted: refreshResult.permanent === true,
-          });
-        }
-      } else {
-        // Token expired but no refresh capability - delete it
-        await tokenStorage.delete(connectionId, oauthUserId);
-        console.warn(
-          `[Proxy] Token expired for ${connectionId} with no refresh capability ` +
-            `(refreshToken: ${!!cachedToken.refreshToken}, tokenEndpoint: ${!!cachedToken.tokenEndpoint})`,
-        );
-      }
-    } else {
-      // Token is still valid
-      accessToken = cachedToken.accessToken;
+  if (useLegacyRepoMint) {
+    try {
+      accessToken = await ensureRepoScopedToken(ctx, connection);
+    } catch (err) {
+      console.error("[Proxy] repo-scoped legacy token mint failed", {
+        connectionId,
+        error: (err as Error).message,
+      });
     }
+  } else {
+    const tokenStorage = new DownstreamTokenStorage(ctx.db, ctx.vault);
+    const tokenResult = await getValidDownstreamAccessToken({
+      connectionId,
+      connectionUrl: connection.connection_url,
+      tokenStorage,
+      userId: oauthUserId,
+    });
+
+    if (tokenResult.accessToken) {
+      accessToken = tokenResult.accessToken;
+    } else if (tokenResult.state === "expired_without_refresh") {
+      console.warn(
+        `[Proxy] Token expired for ${connectionId} with no refresh capability`,
+      );
+    }
+    // `refresh_failed` is already logged (once per backoff window) by the
+    // refresh primitive with full detail; the proxy falls back to the
+    // connection token below, so no second log here.
   }
 
   // Per-user mode is strict: if the caller has no token of their own at this

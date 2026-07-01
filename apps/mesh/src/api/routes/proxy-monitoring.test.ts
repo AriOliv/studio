@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
-import type { MeshContext } from "../../core/mesh-context";
+import type { StudioContext } from "../../core/studio-context";
 import { createProxyMonitoringMiddleware } from "./proxy-monitoring";
 
 function createMockSpan() {
@@ -57,14 +57,14 @@ function createMockCtx(overrides?: {
       createHistogram,
       createCounter,
     },
-  } as unknown as MeshContext;
+  } as unknown as StudioContext;
 
   return { ctx, spans, createHistogram, createCounter };
 }
 
 describe("proxy monitoring middleware", () => {
   it("creates and ends a correlation span for CallToolResult", async () => {
-    const { ctx, spans, createHistogram, createCounter } = createMockCtx();
+    const { ctx, spans } = createMockCtx();
 
     const middleware = createProxyMonitoringMiddleware({
       ctx,
@@ -88,14 +88,6 @@ describe("proxy monitoring middleware", () => {
     expect(result.isError).toBe(true);
     expect(spans.length).toBe(1);
     expect(spans[0]!._isEnded()).toBe(true);
-    expect(createHistogram).toHaveBeenCalledWith(
-      "tool.execution.duration",
-      expect.any(Object),
-    );
-    expect(createCounter).toHaveBeenCalledWith(
-      "tool.execution.count",
-      expect.any(Object),
-    );
   });
 
   it("does not create span when monitoring is disabled", async () => {

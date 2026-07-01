@@ -76,7 +76,53 @@ import * as migration074sandboxrunnerstatehandlenonunique from "./074-sandbox-ru
 import * as migration075threadinflightasyncjobs from "./075-thread-inflight-async-jobs.ts";
 import * as migration076automationsdropagentjson from "./076-automations-drop-agent-json.ts";
 import * as migration077tieronlymodelselection from "./077-tier-only-model-selection.ts";
-import * as migration078peruseroauth from "./078-per-user-oauth.ts";
+import * as migration078automationtoolcallkind from "./078-automation-tool-call-kind.ts";
+import * as migration079striplegacyfreestylevmmapentries from "./079-strip-legacy-freestyle-vm-map-entries.ts";
+import * as migration080asyncresearchjobs from "./080-async-research-jobs.ts";
+import * as migration081asyncresearchjobsresultcontent from "./081-async-research-jobs-result-content.ts";
+import * as migration082secrets from "./082-secrets.ts";
+import * as migration083threadrunlocally from "./083-thread-run-locally.ts";
+import * as migration084drophostsandboxrows from "./084-drop-host-sandbox-rows.ts";
+import * as migration085renamerunnerkindd from "./085-rename-runner-kind.ts";
+import * as migration086threadpinsandvmmaprekey from "./086-thread-pins-and-vm-map-rekey.ts";
+import * as migration087fixvmmaprekey from "./087-fix-vm-map-rekey.ts";
+import * as migration088purgecliactivatekeys from "./088-purge-cli-activate-keys.ts";
+import * as migration089renameremoteusertodesktop from "./089-rename-remote-user-to-desktop.ts";
+import * as migration090automationwebhooktriggers from "./090-automation-webhook-triggers.ts";
+import * as migration091organizationdomainsallowmulti from "./091-organization-domains-allow-multi.ts";
+import * as migration092sandboxnaminguniformization from "./092-sandbox-naming-uniformization.ts";
+import * as migration093backfillglobalsearchbasicusage from "./093-backfill-global-search-basic-usage.ts";
+import * as migration094orgfileconfigs from "./094-org-file-configs.ts";
+import * as migration095removeautomationtoolcallkind from "./095-remove-automation-tool-call-kind.ts";
+import * as migration096orgfileconfigspublicurlbase from "./096-org-file-configs-public-url-base.ts";
+import * as migration097droplocaldockersandboxstate from "./097-drop-local-docker-sandbox-state.ts";
+import * as migration098threadmessageparts from "./098-thread-message-parts.ts";
+import * as migration099runfence from "./099-run-fence.ts";
+import * as migration100linktransport from "./100-link-transport.ts";
+import * as migration101cancelrequestedat from "./101-cancel-requested-at.ts";
+import * as migration102observationalagent from "./102-observational-agent.ts";
+import * as migration103revertobservationalagent from "./103-revert-observational-agent.ts";
+import * as migration104agentsandboxproviderkind from "./104-agent-sandbox-provider-kind.ts";
+import * as migration105orgfs from "./105-org-fs.ts";
+import * as migration106automationtools from "./106-automation-tools.ts";
+import * as migration107orgfspublicorg from "./107-org-fs-public-org.ts";
+import * as migration108automationmaxagentsteps from "./108-automation-max-agent-steps.ts";
+import * as migration109threadmessagepartspermessageseq from "./109-thread-message-parts-per-message-seq.ts";
+import * as migration110backfillghstokenexpiry from "./110-backfill-ghs-token-expiry.ts";
+import * as migration111orgfsthreadid from "./111-org-fs-thread-id.ts";
+import * as migration112orgfileconfigscredentialtype from "./112-org-file-configs-credential-type.ts";
+import * as migration113threadfailurereason from "./113-thread-failure-reason.ts";
+import * as migration114runackedseq from "./114-run-acked-seq.ts";
+import * as migration115threadprojectedseq from "./115-thread-projected-seq.ts";
+import * as migration116orgsites from "./116-org-sites.ts";
+import * as migration117orgfileconfigssiteslug from "./117-org-file-configs-site-slug.ts";
+import * as migration118organizationdomainsmultiverify from "./118-organization-domains-multi-verify.ts";
+import * as migration119organizationjoinrequests from "./119-organization-join-requests.ts";
+import * as migration120orgfsreadpublic from "./120-org-fs-read-public.ts";
+import * as migration121orgfssharepassword from "./121-org-fs-share-password.ts";
+import * as migration122splitwebresearchtier from "./122-split-web-research-tier.ts";
+import * as migration123connectioncredentialvault from "./123-connection-credential-vault.ts";
+import * as migration124peruseroauth from "./124-per-user-oauth.ts";
 
 /**
  * Core migrations for the Mesh application.
@@ -168,7 +214,63 @@ const migrations: Record<string, Migration> = {
   "075-thread-inflight-async-jobs": migration075threadinflightasyncjobs,
   "076-automations-drop-agent-json": migration076automationsdropagentjson,
   "077-tier-only-model-selection": migration077tieronlymodelselection,
-  "078-per-user-oauth": migration078peruseroauth,
+  "078-automation-tool-call-kind": migration078automationtoolcallkind,
+  "079-strip-legacy-freestyle-vm-map-entries":
+    migration079striplegacyfreestylevmmapentries,
+  "080-async-research-jobs": migration080asyncresearchjobs,
+  "081-async-research-jobs-result-content":
+    migration081asyncresearchjobsresultcontent,
+  "082-secrets": migration082secrets,
+  "083-thread-run-locally": migration083threadrunlocally,
+  "084-drop-host-sandbox-rows": migration084drophostsandboxrows,
+  "085-rename-runner-kind": migration085renamerunnerkindd,
+  "086-thread-pins-and-vm-map-rekey": migration086threadpinsandvmmaprekey,
+  "087-fix-vm-map-rekey": migration087fixvmmaprekey,
+  "088-purge-cli-activate-keys": migration088purgecliactivatekeys,
+  "089-rename-remote-user-to-desktop": migration089renameremoteusertodesktop,
+  "090-automation-webhook-triggers": migration090automationwebhooktriggers,
+  "091-organization-domains-allow-multi":
+    migration091organizationdomainsallowmulti,
+  "092-sandbox-naming-uniformization": migration092sandboxnaminguniformization,
+  "093-backfill-global-search-basic-usage":
+    migration093backfillglobalsearchbasicusage,
+  "094-org-file-configs": migration094orgfileconfigs,
+  "095-remove-automation-tool-call-kind":
+    migration095removeautomationtoolcallkind,
+  "096-org-file-configs-public-url-base":
+    migration096orgfileconfigspublicurlbase,
+  "097-drop-local-docker-sandbox-state":
+    migration097droplocaldockersandboxstate,
+  "098-thread-message-parts": migration098threadmessageparts,
+  "099-run-fence": migration099runfence,
+  "100-link-transport": migration100linktransport,
+  "101-cancel-requested-at": migration101cancelrequestedat,
+  "102-observational-agent": migration102observationalagent,
+  "103-revert-observational-agent": migration103revertobservationalagent,
+  "104-agent-sandbox-provider-kind": migration104agentsandboxproviderkind,
+  "105-org-fs": migration105orgfs,
+  "106-automation-tools": migration106automationtools,
+  "107-org-fs-public-org": migration107orgfspublicorg,
+  "108-automation-max-agent-steps": migration108automationmaxagentsteps,
+  "109-thread-message-parts-per-message-seq":
+    migration109threadmessagepartspermessageseq,
+  "110-backfill-ghs-token-expiry": migration110backfillghstokenexpiry,
+  "111-org-fs-thread-id": migration111orgfsthreadid,
+  "112-org-file-configs-credential-type":
+    migration112orgfileconfigscredentialtype,
+  "113-thread-failure-reason": migration113threadfailurereason,
+  "114-run-acked-seq": migration114runackedseq,
+  "115-thread-projected-seq": migration115threadprojectedseq,
+  "116-org-sites": migration116orgsites,
+  "117-org-file-configs-site-slug": migration117orgfileconfigssiteslug,
+  "118-organization-domains-multi-verify":
+    migration118organizationdomainsmultiverify,
+  "119-organization-join-requests": migration119organizationjoinrequests,
+  "120-org-fs-read-public": migration120orgfsreadpublic,
+  "121-org-fs-share-password": migration121orgfssharepassword,
+  "122-split-web-research-tier": migration122splitwebresearchtier,
+  "123-connection-credential-vault": migration123connectioncredentialvault,
+  "124-per-user-oauth": migration124peruseroauth,
 };
 
 export default migrations;

@@ -1,6 +1,16 @@
-import { IFRAME_BOOTSTRAP_SCRIPT } from "../shared";
+import { IFRAME_BOOTSTRAP_SCRIPT, WELL_KNOWN_STARTERS } from "../shared";
 
-export const MAX_SSE_CLIENTS = 10;
+export { WELL_KNOWN_STARTERS };
+
+// Per-daemon SSE subscriber cap. Each browser tab opens one
+// /api/.../vm-events SSE upstream to the daemon's /_sandbox/events,
+// and any failed reconnect quickly stacks: with 10 the cluster's retry
+// storm on cold-start (auto-resume vm-events SSE) blew the budget and
+// the daemon started returning 429, which the cluster surfaced as
+// `Upstream daemon SSE failed (429)` and the UI got stuck on "Starting
+// sandbox…". 100 absorbs a typical dev session's reconnect churn
+// (3–5 tabs × a few retries each) with headroom.
+export const MAX_SSE_CLIENTS = 100;
 // Per-source ring buffer cap. Real install logs (clone + npm/bun install on a
 // nontrivial repo) are easily 50–200 KB; with the prior 4 KB cap, late SSE
 // joiners only saw the last few package-manager lines. 256 KB covers a
@@ -64,8 +74,6 @@ export const PACKAGE_MANAGER_DAEMON_CONFIG: Record<
     manifests: ["deno.json", "deno.jsonc", "package.json"],
   },
 };
-
-export const WELL_KNOWN_STARTERS = ["dev", "start"] as const;
 
 export function buildDevEnv(
   config: { application?: { port?: number } },

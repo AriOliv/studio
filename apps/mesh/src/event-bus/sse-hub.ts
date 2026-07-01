@@ -17,12 +17,21 @@
  * - Pluggable broadcast: strategy handles cross-process replication
  */
 
-import type { Event } from "../storage/types";
-import type { SSEBroadcastStrategy } from "./sse-broadcast-strategy";
+import { meter } from "../observability";
 
 // ============================================================================
 // Types
 // ============================================================================
+
+/** Callback that delivers an event to local SSE listeners on this process. */
+export type LocalEmitFn = (organizationId: string, event: SSEEvent) => void;
+
+/** Abstraction for how SSE events are broadcast across processes (via NATS). */
+export interface SSEBroadcastStrategy {
+  start(localEmit?: LocalEmitFn): Promise<void>;
+  broadcast(organizationId: string, event: SSEEvent): void;
+  stop(): Promise<void>;
+}
 
 export interface SSEListener {
   /** Unique listener ID for removal */
@@ -228,27 +237,12 @@ function matchesAnyPattern(eventType: string, patterns: string[]): boolean {
 /** Global SSE hub instance */
 export const sseHub = new SSEHub();
 
-/**
- * Convert a database Event to an SSEEvent for streaming.
- */
-export function toSSEEvent(event: Event): SSEEvent {
-  return {
-    id: event.id,
-    type: event.type,
-    source: event.source,
-    subject: event.subject,
-    data: event.data ? tryParseJSON(event.data) : undefined,
-    time: event.time,
-  };
-}
-
-function tryParseJSON(value: unknown): unknown {
-  if (typeof value === "string") {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return value;
-    }
-  }
-  return value;
-}
+// Live SSE connection count (sampled at scrape time). Bounded by
+// MAX_TOTAL_CONNECTIONS — chart against that cap to spot saturation, and watch
+// for a count that never drops (a listener-cleanup leak).
+meter
+  .createObservableGauge("sse_hub.connections", {
+    description: "Active SSE listeners held by this pod",
+    unit: "{connections}",
+  })
+  .addCallback((r) => r.observe(sseHub.count));

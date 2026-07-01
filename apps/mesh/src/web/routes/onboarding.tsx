@@ -1,5 +1,9 @@
 import RequiredAuthLayout from "@/web/layouts/required-auth-layout";
 import { AuthSplitLayout } from "@/web/components/auth-split-layout";
+import {
+  OrganizationChoice,
+  type OrganizationChoiceItem,
+} from "@/web/components/organization-choice";
 import { authClient } from "@/web/lib/auth-client";
 import { KEYS } from "@/web/lib/query-keys";
 import { Avatar } from "@deco/ui/components/avatar.tsx";
@@ -53,10 +57,17 @@ function slugify(input: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
+interface DomainLookupOrganization {
+  id: string;
+  name: string;
+  slug: string;
+  logo: string | null;
+  joinMode: "off" | "auto" | "request";
+}
+
 interface DomainLookupResult {
   found: boolean;
-  autoJoinEnabled?: boolean;
-  organization?: { name: string; slug: string } | null;
+  organizations: DomainLookupOrganization[];
 }
 
 interface DomainSetupResult {
@@ -169,19 +180,9 @@ function OnboardingContent({
       enabled: isCorporateEmail,
     });
 
-  const joinOrgMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch("/api/auth/custom/domain-join", {
-        method: "POST",
-        credentials: "include",
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || "Failed to join organization");
-      }
-      window.location.href = `/${data.slug}`;
-    },
-  });
+  // Track which orgs the user has already requested, per-slug, to prevent
+  // duplicate access requests across the shared organization picker.
+  const [requestedSlugs, setRequestedSlugs] = useState<Set<string>>(new Set());
 
   const [creatingNewOrg, setCreatingNewOrg] = useState(false);
 
@@ -198,8 +199,24 @@ function OnboardingContent({
     );
   }
 
-  const hasMatchingOrg = domainLookup?.found && domainLookup?.organization;
-  const canAutoJoin = hasMatchingOrg && domainLookup?.autoJoinEnabled;
+  // domain-lookup only returns verified domains in a discoverable join mode
+  // (auto/request) — "off" and unverified claims are filtered server-side.
+  const matchingOrgs = domainLookup?.organizations ?? [];
+  const discoverableOrgs: OrganizationChoiceItem[] = matchingOrgs.flatMap(
+    (org) =>
+      org.joinMode === "auto" || org.joinMode === "request"
+        ? [
+            {
+              id: org.id,
+              name: org.name,
+              slug: org.slug,
+              logo: org.logo,
+              joinMode: org.joinMode,
+            },
+          ]
+        : [],
+  );
+  const canAutoJoin = discoverableOrgs.some((o) => o.joinMode === "auto");
 
   if (creatingNewOrg) {
     return (
@@ -214,51 +231,38 @@ function OnboardingContent({
     );
   }
 
-  // Domain already has an auto-join org → show join card + option to create own org
-  if (canAutoJoin) {
-    const org = domainLookup.organization!;
+  // One picker over every discoverable org. Auto → one-click Join; request →
+  // Request to join (needs admin approval). Both kinds can match the same
+  // domain, so they share a single list.
+  if (discoverableOrgs.length > 0) {
     return (
       <AuthSplitLayout>
         <div className="grid gap-10">
           <OnboardingHeader
-            title="You have access to an organization"
-            description="Your email domain matches an existing organization."
+            title={
+              canAutoJoin
+                ? discoverableOrgs.length === 1
+                  ? "You have access to an organization"
+                  : "You have access to multiple organizations"
+                : "Request access to an organization"
+            }
+            description={
+              canAutoJoin
+                ? "Your email domain matches an existing organization."
+                : "Your email domain matches an organization that requires admin approval to join."
+            }
           />
-          <div className="rounded-xl card-shadow bg-background dark:bg-input/30 p-4 flex items-center gap-4">
-            <Avatar
-              url={`https://www.google.com/s2/favicons?domain=${emailDomain}&sz=128`}
-              fallback={org.name.charAt(0).toUpperCase()}
-              shape="square"
-              size="base"
-              className="h-10 w-10 shrink-0"
-            />
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium truncate">{org.name}</p>
-              <p className="text-xs text-muted-foreground truncate">
-                @{emailDomain}
-              </p>
-            </div>
-            <Button
-              size="default"
-              onClick={() => joinOrgMutation.mutate()}
-              disabled={joinOrgMutation.isPending}
-            >
-              {joinOrgMutation.isPending ? (
-                <span className="flex items-center gap-2">
-                  <Loading01 size={14} className="animate-spin" /> Joining...
-                </span>
-              ) : (
-                "Join"
-              )}
-            </Button>
-          </div>
-          {joinOrgMutation.error && (
-            <p className="text-xs text-destructive">
-              {joinOrgMutation.error instanceof Error
-                ? joinOrgMutation.error.message
-                : "Failed to join organization"}
-            </p>
-          )}
+          <OrganizationChoice
+            organizations={discoverableOrgs}
+            domain={emailDomain}
+            requestedSlugs={requestedSlugs}
+            onRequestedSlug={(slug) =>
+              setRequestedSlugs((prev) => new Set(prev).add(slug))
+            }
+            onJoined={(_organization, slug) => {
+              window.location.href = `/${slug}`;
+            }}
+          />
           <button
             type="button"
             className="text-sm text-muted-foreground hover:text-foreground transition-colors text-center"
@@ -266,46 +270,6 @@ function OnboardingContent({
           >
             Create a new organization instead
           </button>
-        </div>
-      </AuthSplitLayout>
-    );
-  }
-
-  // Domain claimed but no auto-join → show info + option to create own org
-  if (hasMatchingOrg) {
-    const org = domainLookup.organization!;
-    return (
-      <AuthSplitLayout>
-        <div className="grid gap-10">
-          <OnboardingHeader
-            title={`${org.name} is already set up`}
-            description="This organization doesn't have auto-join enabled."
-          />
-          <div className="rounded-xl card-shadow bg-background dark:bg-input/30 p-4 flex items-center gap-4">
-            <Avatar
-              url={`https://www.google.com/s2/favicons?domain=${emailDomain}&sz=128`}
-              fallback={org.name.charAt(0).toUpperCase()}
-              shape="square"
-              size="base"
-              className="h-10 w-10 shrink-0"
-            />
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium truncate">{org.name}</p>
-              <p className="text-xs text-muted-foreground truncate">
-                @{emailDomain}
-              </p>
-            </div>
-            <span className="text-xs text-muted-foreground shrink-0">
-              Ask admin for invitation
-            </span>
-          </div>
-          <Button
-            size="xl"
-            className="w-full"
-            onClick={() => setCreatingNewOrg(true)}
-          >
-            Create a new organization
-          </Button>
         </div>
       </AuthSplitLayout>
     );

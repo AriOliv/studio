@@ -1,3 +1,12 @@
+import {
+  isManifestAppResolveType,
+  parseSavedBlockSchemaTitle,
+} from "./block-type-utils";
+import {
+  PAGE_MULTIVARIATE_FLAG_RESOLVE_TYPE,
+  labelFromResolveType,
+} from "./section-types";
+
 /**
  * Schema resolution for /live/_meta JSON Schemas.
  *
@@ -16,6 +25,10 @@ export interface SchemaProperty {
   properties?: Record<string, SchemaProperty>;
   items?: SchemaProperty;
   titleBy?: string;
+  /** Mustache template for array-item thumbnails (from schema `@image`) */
+  image?: string;
+  /** Loader path for dynamic-options fields (from schema `@options`) */
+  options?: string;
   /**
    * Present on "block-ref" fields — a union of compatible block types
    * (loaders, sections, etc.). The UI renders a selector instead of
@@ -25,8 +38,25 @@ export interface SchemaProperty {
     resolveType: string;
     title: string;
     description?: string;
+    schema?: SchemaProperty;
+    /** Value of the union discriminator field (e.g. `image-card`). */
+    discriminatorValue?: string;
   }>;
+  /** Property used to pick the active union branch (e.g. `type`). */
+  discriminatorKey?: string;
+  /** When true, the field should not be rendered in the form. */
+  hidden?: boolean;
+  /**
+   * For block-ref fields with loader branches: the resolved schema of the
+   * non-loader branch (e.g. the plain `{ type: "string", format: "image-uri" }`
+   * for an ImageWidget union). Used by multivariate field rendering to avoid
+   * circular detection when the variant value schema points back to the same
+   * anyOf union.
+   */
+  plainSchema?: SchemaProperty;
 }
+
+export type SchemaAnyOfRef = NonNullable<SchemaProperty["anyOfRefs"]>[number];
 
 export interface LiveMeta {
   manifest: {
@@ -40,6 +70,162 @@ export interface LiveMeta {
 
 type RawSchema = Record<string, unknown>;
 
+/** Max `$ref` / `allOf` hops while flattening top-level properties. */
+const MAX_COLLECT_PROPS_DEPTH = 12;
+
+/** Max recursion while building nested field schemas. */
+const MAX_BUILD_PROPERTY_DEPTH = 8;
+
+function isArraySchemaBranch(schema: RawSchema): boolean {
+  const t = schema.type;
+  return t === "array" || (Array.isArray(t) && t.includes("array"));
+}
+
+/**
+ * Section/loader arrays (items carry `__resolveType` or `anyOf`) vs config
+ * arrays (plain object items, e.g. app flag lists).
+ */
+function isSectionLoaderArrayBranch(
+  branch: RawSchema,
+  resolveRef: (ref: string) => RawSchema,
+): boolean {
+  let items = branch.items as RawSchema | undefined;
+  if (!items) return false;
+  if (typeof items.$ref === "string") {
+    items = resolveRef(items.$ref);
+  }
+  if (Array.isArray(items.anyOf) || Array.isArray(items.oneOf)) return true;
+  const props = items.properties as RawSchema | undefined;
+  const rtEnum = (props?.__resolveType as RawSchema | undefined)?.enum;
+  return Array.isArray(rtEnum) && typeof rtEnum[0] === "string";
+}
+
+// deco.cx convention: VideoWidget schemas don't carry `format` in their
+// JSON Schema definition, so we inject it here so the UI can render a
+// VideoField instead of a generic FileField. If the schema ever gains the
+// `format` field natively this guard becomes a no-op.
+const VIDEO_WIDGET_REF_KEY = "VideoWidget";
+
+/** Base64 encode resolveType keys — browser-safe (btoa), Node fallback in tests. */
+function toBase64(str: string): string {
+  if (typeof btoa === "function") return btoa(str);
+  return Buffer.from(str).toString("base64");
+}
+
+function parseSiteAppResolveType(
+  resolveType: string,
+): { vendor: string; app: string } | null {
+  const match = resolveType.match(/^site\/apps\/([^/]+)\/([^/.]+)\.tsx?$/);
+  if (!match) return null;
+  return { vendor: match[1]!, app: match[2]! };
+}
+
+function parseLegacyAppResolveType(
+  resolveType: string,
+): { vendor: string; app: string } | null {
+  const match = resolveType.match(/^([^/]+)\/apps\/([^/.]+)\.tsx?$/);
+  if (!match) return null;
+  return { vendor: match[1]!, app: match[2]! };
+}
+
+function appManifestResolveTypeAliases(vendor: string, app: string): string[] {
+  return [
+    `site/apps/${vendor}/${app}.ts`,
+    `site/apps/${vendor}/${app}.tsx`,
+    `${vendor}/apps/${app}.ts`,
+    `${vendor}/apps/${app}.tsx`,
+  ];
+}
+
+/** Manifest block schema entry, including legacy/modern app resolveType aliases. */
+function lookupManifestBlockSchema(
+  resolveType: string,
+  meta: LiveMeta,
+): RawSchema {
+  const allBlockTypes = meta.manifest?.blocks ?? {};
+
+  for (const blockTypeMap of Object.values(allBlockTypes)) {
+    if (blockTypeMap[resolveType]) {
+      return blockTypeMap[resolveType] as RawSchema;
+    }
+  }
+
+  const parsed =
+    parseSiteAppResolveType(resolveType) ??
+    parseLegacyAppResolveType(resolveType);
+  if (parsed) {
+    for (const alias of appManifestResolveTypeAliases(
+      parsed.vendor,
+      parsed.app,
+    )) {
+      for (const blockTypeMap of Object.values(allBlockTypes)) {
+        if (blockTypeMap[alias]) {
+          return blockTypeMap[alias] as RawSchema;
+        }
+      }
+    }
+  }
+
+  // Tanstack sites generate app schemas with base64-encoded resolveType keys
+  // (same convention as sections). Fall back when manifest.blocks.apps is empty.
+  const encodedResolveType = toBase64(resolveType);
+  for (const blockTypeMap of Object.values(allBlockTypes)) {
+    if (blockTypeMap[encodedResolveType]) {
+      return blockTypeMap[encodedResolveType] as RawSchema;
+    }
+  }
+
+  const globalSchema = meta.schema ?? {};
+  const defs = (globalSchema.$defs ?? globalSchema.definitions ?? {}) as Record<
+    string,
+    unknown
+  >;
+  if (defs[encodedResolveType]) {
+    return { $ref: `#/definitions/${encodedResolveType}` };
+  }
+
+  return {};
+}
+
+/** Whether resolveType refers to a manifest `apps` block (legacy + site/apps aliases). */
+export function isResolvableManifestApp(
+  meta: LiveMeta,
+  resolveType: string,
+): boolean {
+  if (isManifestAppResolveType(meta, resolveType)) return true;
+  const parsed =
+    parseSiteAppResolveType(resolveType) ??
+    parseLegacyAppResolveType(resolveType);
+  if (!parsed) return false;
+  const apps = meta.manifest?.blocks?.apps ?? {};
+  if (
+    appManifestResolveTypeAliases(parsed.vendor, parsed.app).some(
+      (alias) => alias in apps,
+    )
+  ) {
+    return true;
+  }
+  const encodedResolveType = toBase64(resolveType);
+  const defs = (meta.schema?.$defs ?? meta.schema?.definitions ?? {}) as Record<
+    string,
+    unknown
+  >;
+  return encodedResolveType in defs;
+}
+
+/**
+ * Whether resolveType is a deco app module path (site/apps or legacy vendor/apps),
+ * excluding the site app itself. Used to detect installed custom/local apps even
+ * when they are missing from manifest.blocks.apps.
+ */
+export function isDecoAppResolveType(resolveType: string): boolean {
+  if (resolveType === "site/apps/site.ts") return false;
+  return (
+    parseSiteAppResolveType(resolveType) !== null ||
+    parseLegacyAppResolveType(resolveType) !== null
+  );
+}
+
 /**
  * Resolve the schema for a given __resolveType by searching across ALL
  * block types in the manifest (sections, loaders, matchers, etc.).
@@ -49,20 +235,12 @@ export function resolveSchema(
   meta: LiveMeta,
 ): SchemaProperty | null {
   const globalSchema = meta.schema ?? {};
-  const allBlockTypes = meta.manifest?.blocks ?? {};
-
-  // Find the per-block schema for this resolveType across all block types
-  let blockSchema: RawSchema = {};
-  for (const blockTypeMap of Object.values(allBlockTypes)) {
-    if (blockTypeMap[resolveType]) {
-      blockSchema = blockTypeMap[resolveType] as RawSchema;
-      break;
-    }
-  }
-
-  // Merge exactly as admin-mcp does: { ...schema, ...blockSchema }
-  const merged: RawSchema = { ...globalSchema, ...blockSchema };
-  const defs = (merged.$defs ?? merged.definitions ?? {}) as Record<
+  const blockSchema = lookupManifestBlockSchema(resolveType, meta);
+  // Always read $defs/definitions from the global live schema. Manifest block
+  // entries often carry `$ref` plus an empty `definitions` object; spreading
+  // blockSchema over globalSchema clobbers the real defs and breaks $ref
+  // resolution (common for site/apps/site.ts → SiteApp).
+  const defs = (globalSchema.$defs ?? globalSchema.definitions ?? {}) as Record<
     string,
     unknown
   >;
@@ -70,6 +248,63 @@ export function resolveSchema(
   const resolveRef = (ref: string): RawSchema => {
     const key = ref.split("/").pop() ?? "";
     return (defs[key] as RawSchema | undefined) ?? {};
+  };
+
+  let schemaRoot: RawSchema;
+  if (typeof blockSchema.$ref === "string") {
+    schemaRoot = resolveRef(blockSchema.$ref);
+  } else if (Object.keys(blockSchema).length > 0) {
+    schemaRoot = blockSchema;
+  } else {
+    schemaRoot = globalSchema;
+  }
+
+  const resolveBranchDef = (branch: RawSchema): RawSchema => {
+    if (typeof branch.$ref === "string") {
+      return resolveRef(branch.$ref);
+    }
+    return branch;
+  };
+
+  const typeDiscriminatorFromBranch = (
+    branch: RawSchema,
+  ): string | undefined => {
+    const def = resolveBranchDef(branch);
+    const typeProp = (def.properties as RawSchema | undefined)?.type as
+      | RawSchema
+      | undefined;
+    if (!typeProp) return undefined;
+    if (typeof typeProp.const === "string") return typeProp.const;
+    if (typeof typeProp.default === "string") return typeProp.default;
+    if (Array.isArray(typeProp.enum) && typeof typeProp.enum[0] === "string") {
+      return typeProp.enum[0];
+    }
+    return undefined;
+  };
+
+  const branchTitle = (branch: RawSchema, fallback: string): string => {
+    const def = resolveBranchDef(branch);
+    if (typeof def.title === "string" && !def.title.startsWith("#")) {
+      return def.title;
+    }
+    return fallback;
+  };
+
+  /** Follow pure `$ref` aliases (e.g. CardType → ImageCard|TextCard). */
+  const unwrapRefAliases = (
+    s: RawSchema,
+    seen: Set<string> = new Set(),
+  ): RawSchema => {
+    if (typeof s.$ref !== "string") return s;
+    if (s.properties || s.anyOf || s.allOf || s.oneOf || s.type) return s;
+    const key = s.$ref.split("/").pop() ?? "";
+    if (!key || seen.has(key)) return s;
+    return unwrapRefAliases(resolveRef(s.$ref), new Set([...seen, key]));
+  };
+
+  const isSchemaHidden = (s: RawSchema): boolean => {
+    const hide = s.hide;
+    return hide === true || hide === "true";
   };
 
   /**
@@ -81,7 +316,7 @@ export function resolveSchema(
     seenRefs: Set<string> = new Set(),
     depth = 0,
   ): RawSchema => {
-    if (depth > 5) return {};
+    if (depth > MAX_COLLECT_PROPS_DEPTH) return {};
 
     if (typeof s.$ref === "string") {
       const key = s.$ref.split("/").pop() ?? "";
@@ -126,7 +361,12 @@ export function resolveSchema(
     let resolved = v;
     if (typeof v.$ref === "string") {
       resolved = resolveRef(v.$ref);
+      const refKey = v.$ref.split("/").pop() ?? "";
+      if (refKey === VIDEO_WIDGET_REF_KEY && !resolved.format) {
+        resolved = { ...resolved, format: "video-uri" };
+      }
     }
+    resolved = unwrapRefAliases(resolved);
 
     // Extract enum values from anyOf/oneOf const/enum branches
     let enumFromConsts: unknown[] | undefined;
@@ -158,14 +398,17 @@ export function resolveSchema(
       }
     }
 
-    // Determine type
+    // Determine type. When the schema is a nullable union
+    // (`anyOf: [T, null]`), `unionLeaf` holds the single non-null branch
+    // so downstream metadata (format, title, description) can be inherited
+    // from it — without this, `format: "image-uri"` on the inner branch
+    // would be silently dropped.
     let type: string | undefined;
+    let unionLeaf: RawSchema | undefined;
     if (resolved.type) {
       type = Array.isArray(resolved.type)
         ? String(resolved.type.find((t) => t !== "null") ?? resolved.type[0])
         : String(resolved.type);
-    } else if (typeof v.$ref === "string") {
-      type = "object";
     } else if (resolved.anyOf || resolved.allOf || resolved.oneOf) {
       const arr = (resolved.anyOf ??
         resolved.allOf ??
@@ -178,6 +421,7 @@ export function resolveSchema(
         type = "null";
       } else if (nonNull.length === 1) {
         const first = nonNull[0]!;
+        unionLeaf = first;
         type = first.type
           ? Array.isArray(first.type)
             ? String(first.type[0])
@@ -209,6 +453,60 @@ export function resolveSchema(
           )?.enum;
           return Array.isArray(rtEnum) && typeof rtEnum[0] === "string";
         });
+
+        // Site `global` / page `sections`: plain section arrays with an optional
+        // page multivariate flag branch. Prefer the array (admin hides the flag UI).
+        // App config arrays (e.g. flag lists) share anyOf with product-list loaders;
+        // prefer the array branch when items are plain objects, not section refs.
+        const arrayBranch = nonNull.find(isArraySchemaBranch);
+        const hasPageMultivariateLoader = loaderBranches.some((branch) => {
+          const rtEnum = (
+            (branch.properties as RawSchema | undefined)?.__resolveType as
+              | RawSchema
+              | undefined
+          )?.enum;
+          return (
+            Array.isArray(rtEnum) &&
+            rtEnum[0] === PAGE_MULTIVARIATE_FLAG_RESOLVE_TYPE
+          );
+        });
+        if (arrayBranch) {
+          const isConfigArray = !isSectionLoaderArrayBranch(
+            arrayBranch,
+            resolveRef,
+          );
+          if (isConfigArray && nonNull.length > 1) {
+            const built = buildProperty(arrayBranch, depth + 1);
+            return {
+              ...built,
+              type: "array",
+              title:
+                typeof resolved.title === "string"
+                  ? resolved.title
+                  : built.title,
+              description:
+                typeof resolved.description === "string"
+                  ? resolved.description
+                  : built.description,
+            };
+          }
+          if (hasPageMultivariateLoader) {
+            const built = buildProperty(arrayBranch, depth + 1);
+            return {
+              ...built,
+              type: "array",
+              title:
+                typeof resolved.title === "string"
+                  ? resolved.title
+                  : built.title,
+              description:
+                typeof resolved.description === "string"
+                  ? resolved.description
+                  : built.description,
+            };
+          }
+        }
+
         if (loaderBranches.length > 0) {
           const anyOfRefs = loaderBranches.map((branch) => {
             const rtSchema = (branch.properties as RawSchema | undefined)
@@ -220,17 +518,29 @@ export function resolveSchema(
               title:
                 typeof branch.title === "string"
                   ? branch.title
-                  : (rt
-                      .split("/")
-                      .pop()
-                      ?.replace(/\.tsx?$/, "")
-                      .replace(/[-_]/g, " ") ?? rt),
+                  : labelFromResolveType(rt),
               description:
                 typeof branch.description === "string"
                   ? branch.description
                   : undefined,
+              schema:
+                depth + 1 < MAX_BUILD_PROPERTY_DEPTH
+                  ? buildProperty(branch, depth + 1)
+                  : undefined,
             };
           });
+
+          // Preserve the non-loader (plain data) branch so multivariate
+          // field rendering can use it instead of the circular block-ref.
+          const nonLoaderBranches = nonNull.filter(
+            (a) => !loaderBranches.includes(a),
+          );
+          const plainSchema =
+            nonLoaderBranches.length === 1 &&
+            depth + 1 < MAX_BUILD_PROPERTY_DEPTH
+              ? buildProperty(nonLoaderBranches[0]!, depth + 1)
+              : undefined;
+
           return {
             type: "block-ref",
             title:
@@ -240,21 +550,77 @@ export function resolveSchema(
                 ? resolved.description
                 : undefined,
             anyOfRefs,
+            plainSchema,
+            hidden:
+              isSchemaHidden(resolved) || isSchemaHidden(v) ? true : undefined,
+          };
+        }
+
+        // Unions discriminated by a `type` field (e.g. ImageCard | TextCard).
+        const typeDiscriminators = nonNull.map((branch) =>
+          typeDiscriminatorFromBranch(branch),
+        );
+        const isTypeDiscriminatedUnion =
+          nonNull.length > 1 &&
+          typeDiscriminators.every((disc) => typeof disc === "string");
+
+        if (isTypeDiscriminatedUnion) {
+          const anyOfRefs = nonNull.map((branch, index) => {
+            const def = resolveBranchDef(branch);
+            const discriminatorValue = typeDiscriminators[index]!;
+            return {
+              resolveType: discriminatorValue,
+              title: branchTitle(branch, discriminatorValue),
+              description:
+                typeof def.description === "string"
+                  ? def.description
+                  : undefined,
+              discriminatorValue,
+              schema:
+                depth + 1 < MAX_BUILD_PROPERTY_DEPTH
+                  ? buildProperty(def, depth + 1)
+                  : undefined,
+            };
+          });
+          return {
+            type: "block-ref",
+            title:
+              typeof v.title === "string"
+                ? v.title
+                : typeof resolved.title === "string"
+                  ? resolved.title
+                  : undefined,
+            description:
+              typeof v.description === "string"
+                ? v.description
+                : typeof resolved.description === "string"
+                  ? resolved.description
+                  : undefined,
+            discriminatorKey: "type",
+            anyOfRefs,
+            hidden:
+              isSchemaHidden(resolved) || isSchemaHidden(v) ? true : undefined,
           };
         }
 
         // All branches are $refs to block/loader defs
         const allRefs = nonNull.every((a) => typeof a.$ref === "string");
         if (allRefs) {
-          const anyOfRefs: Array<{
-            resolveType: string;
-            title: string;
-            description?: string;
-          }> = [];
+          const anyOfRefs: SchemaAnyOfRef[] = [];
           for (const branch of nonNull) {
             const def = resolveRef(branch.$ref as string);
             let rt: string | undefined;
-            if (Array.isArray(def.allOf)) {
+            let title: string | undefined;
+
+            if (typeof def.title === "string") {
+              const saved = parseSavedBlockSchemaTitle(def.title);
+              if (saved) {
+                rt = saved.blockId;
+                title = saved.blockId;
+              }
+            }
+
+            if (!rt && Array.isArray(def.allOf)) {
               for (const part of def.allOf as RawSchema[]) {
                 const props = (part.properties ?? {}) as RawSchema;
                 const rtProp = (props.__resolveType ?? {}) as RawSchema;
@@ -265,22 +631,35 @@ export function resolveSchema(
                 }
               }
             }
+            // @decocms/start ≥6.10 emits flat loader defs (no allOf) with
+            // __resolveType.enum directly in properties — check that too.
+            if (!rt) {
+              const rtProp = (def.properties as RawSchema | undefined)
+                ?.__resolveType as RawSchema | undefined;
+              const e = rtProp?.enum;
+              if (Array.isArray(e) && typeof e[0] === "string") {
+                rt = e[0];
+              }
+            }
             if (!rt) {
               rt = (branch.$ref as string).split("/").pop() ?? "";
             }
+            const discriminatorValue = typeDiscriminatorFromBranch(branch);
             anyOfRefs.push({
-              resolveType: rt,
+              resolveType: discriminatorValue ?? rt,
               title:
-                typeof def.title === "string"
+                title ??
+                (typeof def.title === "string" && !def.title.startsWith("#")
                   ? def.title
-                  : (rt
-                      .split("/")
-                      .pop()
-                      ?.replace(/\.tsx?$/, "")
-                      .replace(/[-_]/g, " ") ?? rt),
+                  : labelFromResolveType(rt)),
               description:
                 typeof def.description === "string"
                   ? def.description
+                  : undefined,
+              discriminatorValue,
+              schema:
+                depth + 1 < MAX_BUILD_PROPERTY_DEPTH
+                  ? buildProperty(def, depth + 1)
                   : undefined,
             });
           }
@@ -293,16 +672,24 @@ export function resolveSchema(
                 ? resolved.description
                 : undefined,
             anyOfRefs,
+            hidden:
+              isSchemaHidden(resolved) || isSchemaHidden(v) ? true : undefined,
           };
         }
 
         type = "object";
       }
+    } else if (typeof v.$ref === "string") {
+      // Last-resort: ref points to a def with no type/union we recognize.
+      // Treat as object so nested-property recursion has a chance to fill in.
+      type = "object";
     }
 
-    // Nested properties for object types (depth < 3)
+    // Nested properties for object types. Bumped past depth 3 because real
+    // deco sections nest images at depth 4+ (`images[].desktop.src`); the
+    // old cap left those leaves un-resolved and stripped their `format`.
     let nestedProperties: Record<string, SchemaProperty> | undefined;
-    if (depth < 3) {
+    if (depth < MAX_BUILD_PROPERTY_DEPTH) {
       const nestedRaw = collectProps(resolved);
       const nestedEntries = Object.entries(nestedRaw).filter(
         ([k]) => !k.startsWith("__") && k !== "@type",
@@ -317,15 +704,40 @@ export function resolveSchema(
 
     // Array items
     let itemsSchema: SchemaProperty | undefined;
-    if ((type === "array" || resolved.type === "array") && depth < 3) {
+    if (
+      (type === "array" || resolved.type === "array") &&
+      depth < MAX_BUILD_PROPERTY_DEPTH
+    ) {
       let rawItems = resolved.items as RawSchema | undefined;
       if (rawItems) {
         if (typeof rawItems.$ref === "string") {
           rawItems = resolveRef(rawItems.$ref);
         }
         itemsSchema = buildProperty(rawItems, depth + 1);
+        if (
+          typeof rawItems.title === "string" &&
+          rawItems.title.includes("{{")
+        ) {
+          itemsSchema.titleBy = rawItems.title;
+        }
       }
     }
+
+    const fromLeaf = <T>(key: string): T | undefined => {
+      const fromUnion = unionLeaf?.[key];
+      return typeof fromUnion === "string" ? (fromUnion as T) : undefined;
+    };
+
+    // First source that has the `default` key present wins, even when
+    // the value is explicitly `null`. Using `??` here would collapse
+    // `default: null` (which deco emits for nullable fields) into "no
+    // default", losing meaningful information about the initial value.
+    const pickDefault = (): unknown => {
+      if ("default" in v) return v.default;
+      if ("default" in resolved) return resolved.default;
+      if (unionLeaf && "default" in unionLeaf) return unionLeaf.default;
+      return undefined;
+    };
 
     return {
       type: type ?? "string",
@@ -334,27 +746,41 @@ export function resolveSchema(
           ? v.title
           : typeof resolved.title === "string"
             ? resolved.title
-            : undefined,
+            : fromLeaf<string>("title"),
       description:
         typeof v.description === "string"
           ? v.description
           : typeof resolved.description === "string"
             ? resolved.description
-            : undefined,
-      default: v.default ?? resolved.default,
+            : fromLeaf<string>("description"),
+      default: pickDefault(),
       enum: Array.isArray(resolved.enum)
         ? resolved.enum
         : (enumFromConsts ?? undefined),
-      format: typeof resolved.format === "string" ? resolved.format : undefined,
+      format:
+        typeof resolved.format === "string"
+          ? resolved.format
+          : fromLeaf<string>("format"),
       properties: nestedProperties,
       items: itemsSchema,
+      hidden: isSchemaHidden(resolved) || isSchemaHidden(v) ? true : undefined,
       titleBy:
-        typeof resolved.titleBy === "string" ? resolved.titleBy : undefined,
+        typeof resolved.titleBy === "string"
+          ? resolved.titleBy
+          : fromLeaf<string>("titleBy"),
+      image:
+        typeof resolved.image === "string"
+          ? resolved.image
+          : fromLeaf<string>("image"),
+      options:
+        typeof resolved.options === "string"
+          ? resolved.options
+          : fromLeaf<string>("options"),
     };
   };
 
   // Collect top-level properties and build typed map
-  const topRaw = collectProps(merged);
+  const topRaw = collectProps(schemaRoot);
   const properties: Record<string, SchemaProperty> = {};
   for (const [key, raw] of Object.entries(topRaw)) {
     if (key.startsWith("__") || key === "@type") continue;
@@ -365,7 +791,50 @@ export function resolveSchema(
 
   return {
     type: "object",
-    title: typeof merged.title === "string" ? merged.title : undefined,
+    title: typeof schemaRoot.title === "string" ? schemaRoot.title : undefined,
     properties,
+  };
+}
+
+export interface BlockSchemaMetadata {
+  title?: string;
+  description?: string;
+  icon?: string;
+  logo?: string;
+}
+
+/**
+ * Read block schema metadata (title, description, icon) from live meta.
+ * Mirrors admin's getSchemaIcon / getSchemaTitle / getSchemaDescription.
+ */
+export function resolveBlockSchemaMetadata(
+  resolveType: string,
+  meta: LiveMeta,
+): BlockSchemaMetadata {
+  const globalSchema = meta.schema ?? {};
+  const blockSchema = lookupManifestBlockSchema(resolveType, meta);
+  const defs = (globalSchema.$defs ?? globalSchema.definitions ?? {}) as Record<
+    string,
+    RawSchema
+  >;
+
+  const resolved =
+    typeof blockSchema.$ref === "string"
+      ? (defs[blockSchema.$ref.split("/").pop() ?? ""] ?? {})
+      : Object.keys(blockSchema).length > 0
+        ? blockSchema
+        : { ...globalSchema, ...blockSchema };
+
+  const icon = (resolved as { icon?: string }).icon;
+  const logo = (resolved as { logo?: string }).logo;
+
+  return {
+    title: typeof resolved.title === "string" ? resolved.title : undefined,
+    description:
+      typeof resolved.description === "string"
+        ? resolved.description
+        : undefined,
+    icon: typeof icon === "string" ? icon : undefined,
+    logo: typeof logo === "string" ? logo : undefined,
   };
 }

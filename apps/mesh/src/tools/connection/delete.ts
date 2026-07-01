@@ -15,8 +15,9 @@ import {
   getUserId,
   requireAuth,
   requireOrganization,
-} from "../../core/mesh-context";
+} from "../../core/studio-context";
 import { getMcpListCache } from "../../mcp-clients/mcp-list-cache";
+import { invalidateConnectionCaches } from "../../mcp-clients/mcp-cache-invalidation";
 import { ConnectionEntitySchema } from "./schema";
 
 const ConnectionDeleteInputSchema = CollectionDeleteInputSchema.extend({
@@ -112,6 +113,9 @@ export const COLLECTION_CONNECTIONS_DELETE = defineTool({
     getMcpListCache()
       ?.invalidate(input.id)
       .catch(() => {});
+    // Drop cached read content and tool results for this connection across ALL
+    // replicas (per-pod caches → NATS broadcast).
+    invalidateConnectionCaches(input.id);
 
     const userId = getUserId(ctx);
     if (userId) {

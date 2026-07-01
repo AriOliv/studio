@@ -8,7 +8,8 @@ import type { Transition } from "./types";
  *
  * Precedence (highest first):
  *   identity-conflict > bootstrap > branch-change >
- *   runtime-change > pm-change > port-change > no-op
+ *   runtime-change > pm-change > port-change > env-change >
+ *   git-credential-refresh > no-op
  */
 export function classify(
   before: TenantConfig | null,
@@ -16,7 +17,7 @@ export function classify(
 ): Transition {
   // 1. Identity invariants (write-once repo path; credentials are excluded).
   // The cloneUrl embeds an OAuth token (e.g. x-access-token:TOKEN@github.com/…)
-  // that is refreshed on each VM_START. Comparing raw URLs would flag a refreshed
+  // that is refreshed on each SANDBOX_START. Comparing raw URLs would flag a refreshed
   // token as an identity conflict even though the repo hasn't changed. Strip
   // username/password before comparing so only the actual repo path is guarded.
   const beforeUrl = before?.git?.repository?.cloneUrl;
@@ -38,6 +39,8 @@ export function classify(
     return { kind: "bootstrap", config: after };
   }
   if (before === null) {
+    const envDiff = diffEnv(undefined, after.env);
+    if (envDiff) return { kind: "env-change", changed: envDiff };
     return { kind: "no-op" };
   }
 
@@ -76,7 +79,40 @@ export function classify(
     };
   }
 
+  const envDiff = diffEnv(before.env, after.env);
+  if (envDiff) {
+    return { kind: "env-change", changed: envDiff };
+  }
+
+  // 7. Git credential refresh (same repo path, rotated embedded token).
+  if (
+    beforeUrl !== undefined &&
+    afterUrl !== undefined &&
+    beforeUrl !== afterUrl &&
+    stripCredentials(beforeUrl) === stripCredentials(afterUrl)
+  ) {
+    return { kind: "git-credential-refresh", cloneUrl: afterUrl };
+  }
+
   return { kind: "no-op" };
+}
+
+function diffEnv(
+  before: Readonly<Record<string, string>> | undefined,
+  after: Readonly<Record<string, string>> | undefined,
+): { set: string[]; deleted: string[] } | null {
+  const b = before ?? {};
+  const a = after ?? {};
+  const set: string[] = [];
+  for (const [k, v] of Object.entries(a)) {
+    if (b[k] !== v) set.push(k);
+  }
+  const deleted: string[] = [];
+  for (const k of Object.keys(b)) {
+    if (!(k in a)) deleted.push(k);
+  }
+  if (set.length === 0 && deleted.length === 0) return null;
+  return { set, deleted };
 }
 
 function stripCredentials(rawUrl: string): string {

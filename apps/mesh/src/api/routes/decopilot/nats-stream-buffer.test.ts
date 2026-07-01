@@ -1,7 +1,11 @@
-import { describe, it, expect, mock } from "bun:test";
-import { NatsStreamBuffer } from "./nats-stream-buffer";
+import { describe, it, expect, mock, test } from "bun:test";
+import { StorageType } from "@nats-io/jetstream";
+import { decopilotStreamConfig, NatsStreamBuffer } from "./nats-stream-buffer";
 
-type DeferredMsg = { data: Uint8Array };
+type DeferredMsg = {
+  data: Uint8Array;
+  headers?: { get(name: string): string | undefined };
+};
 
 function createControlledSubscription() {
   const queue: Array<{ done: false; value: DeferredMsg } | { done: true }> = [];
@@ -24,7 +28,7 @@ function createControlledSubscription() {
   };
 
   const sub = {
-    unsubscribe: mock(() => {}),
+    stop: mock(() => {}),
     [Symbol.asyncIterator]() {
       return {
         next(): Promise<
@@ -50,8 +54,12 @@ function createControlledSubscription() {
   return { sub, push, end };
 }
 
-function bufferWith(subscribeFn: () => Promise<unknown>) {
-  const mockJs = { subscribe: mockOf(subscribeFn) };
+function bufferWith(consumeFn: () => Promise<unknown>) {
+  // v3 ordered-consumer fake: createTailStream calls
+  // `js.consumers.get(stream, opts)` then `.consume()`.
+  const mockJs = {
+    consumers: { get: async () => ({ consume: mockOf(consumeFn) }) },
+  };
   const buffer = new NatsStreamBuffer({
     getConnection: () => ({}) as never,
     getJetStream: () => mockJs as never,
@@ -75,6 +83,17 @@ async function readAll(stream: ReadableStream): Promise<unknown[]> {
   }
   return out;
 }
+
+test("decopilot stream is file-backed with a dedup window and SLA retention", () => {
+  const c = decopilotStreamConfig();
+  expect(c.storage).toBe(StorageType.File);
+  expect(c.duplicate_window).toBeGreaterThanOrEqual(2 * 60 * 1_000_000_000); // >= 2min (ns)
+  // Retention must outlast a day-long desktop run so seq 1 survives until the
+  // terminal projection re-reads [1..finalSeq].
+  expect(c.max_age).toBeGreaterThanOrEqual(24 * 60 * 60 * 1_000_000_000); // >= 24h
+  expect(c.max_msgs_per_subject).toBeGreaterThanOrEqual(500_000);
+  expect(c.max_bytes).toBeGreaterThanOrEqual(4 * 1024 * 1024 * 1024); // >= 4GB
+});
 
 describe("NatsStreamBuffer", () => {
   it("purge is a no-op when jsm is not initialized (no throw)", () => {
@@ -106,20 +125,19 @@ describe("NatsStreamBuffer", () => {
       },
     };
 
-    const mockNc = {
-      jetstreamManager: mock(() => Promise.resolve(mockJsm)),
-    };
+    const getJetStreamManager = mock(() => Promise.resolve(mockJsm));
 
     const mockJs = {} as never;
 
     const buffer = new NatsStreamBuffer({
-      getConnection: () => mockNc as never,
+      getConnection: () => ({}) as never,
       getJetStream: () => mockJs,
+      getJetStreamManager: getJetStreamManager as never,
     });
 
     await buffer.init();
 
-    expect(mockNc.jetstreamManager).toHaveBeenCalledTimes(1);
+    expect(getJetStreamManager).toHaveBeenCalledTimes(1);
     expect(streamInfoMock).toHaveBeenCalledWith("DECOPILOT_STREAMS");
     expect(streamUpdateMock).toHaveBeenCalledTimes(1);
   });
@@ -139,13 +157,10 @@ describe("NatsStreamBuffer", () => {
       },
     };
 
-    const mockNc = {
-      jetstreamManager: mock(() => Promise.resolve(mockJsm)),
-    };
-
     const buffer = new NatsStreamBuffer({
-      getConnection: () => mockNc as never,
+      getConnection: () => ({}) as never,
       getJetStream: () => ({}) as never,
+      getJetStreamManager: (() => Promise.resolve(mockJsm)) as never,
     });
 
     await buffer.init();
@@ -153,10 +168,127 @@ describe("NatsStreamBuffer", () => {
     expect(streamAddMock).toHaveBeenCalledTimes(1);
   });
 
+  it("init recreates the stream (delete+add) on a storage mismatch", async () => {
+    // JetStream cannot change `storage` in place, so flipping the legacy
+    // Memory stream to File makes `update` reject. The ephemeral run-scratch
+    // stream is dropped and recreated file-backed.
+    const streamInfoMock = mock(() => Promise.resolve({}));
+    const streamUpdateMock = mock(() =>
+      Promise.reject(
+        new Error("stream configuration update can not change storage type"),
+      ),
+    );
+    const streamDeleteMock = mock(() => Promise.resolve(true));
+    const streamAddMock = mock(() => Promise.resolve({}));
+
+    const mockJsm = {
+      streams: {
+        info: streamInfoMock,
+        update: streamUpdateMock,
+        delete: streamDeleteMock,
+        add: streamAddMock,
+      },
+    };
+
+    const buffer = new NatsStreamBuffer({
+      getConnection: () => ({}) as never,
+      getJetStream: () => ({}) as never,
+      getJetStreamManager: (() => Promise.resolve(mockJsm)) as never,
+    });
+
+    await buffer.init();
+
+    expect(streamUpdateMock).toHaveBeenCalledTimes(1);
+    expect(streamDeleteMock).toHaveBeenCalledWith("DECOPILOT_STREAMS");
+    expect(streamAddMock).toHaveBeenCalledTimes(1);
+  });
+
   describe("createTailStream", () => {
     function encodeMsg(payload: unknown): DeferredMsg {
       return { data: new TextEncoder().encode(JSON.stringify(payload)) };
     }
+
+    // Mirror the producer's fragment headers (see `publishChunk`): split the
+    // encoded `{ p: value }` bytes into `parts` ordered fragment messages.
+    function fragmentChunk(value: unknown, parts: number): DeferredMsg[] {
+      const bytes = new TextEncoder().encode(JSON.stringify({ p: value }));
+      const sliceSize = Math.ceil(bytes.length / parts);
+      const msgs: DeferredMsg[] = [];
+      for (let i = 0; i < parts; i++) {
+        const data = bytes.slice(i * sliceSize, (i + 1) * sliceSize);
+        const hdr: Record<string, string> = {
+          "Dp-Frag-Idx": String(i),
+          "Dp-Frag-Total": String(parts),
+        };
+        msgs.push({ data, headers: { get: (name) => hdr[name] } });
+      }
+      return msgs;
+    }
+
+    it("reassembles a fragmented chunk byte-exact", async () => {
+      const { sub, push, end } = createControlledSubscription();
+      const buffer = bufferWith(() => Promise.resolve(sub));
+      const stream = await buffer.createTailStream("task-1");
+
+      const value = { type: "text-delta", text: "x".repeat(200) };
+      for (const f of fragmentChunk(value, 4)) push(f);
+      end();
+
+      const chunks = await readAll(stream!);
+      expect(chunks).toEqual([value]);
+    });
+
+    it("keeps consecutive same-total fragmented chunks separate", async () => {
+      const { sub, push, end } = createControlledSubscription();
+      const buffer = bufferWith(() => Promise.resolve(sub));
+      const stream = await buffer.createTailStream("task-1");
+
+      const a = "A".repeat(120);
+      const b = "B".repeat(120);
+      for (const f of fragmentChunk(a, 3)) push(f);
+      for (const f of fragmentChunk(b, 3)) push(f);
+      end();
+
+      const chunks = await readAll(stream!);
+      expect(chunks).toEqual([a, b]);
+    });
+
+    it("drops a mid-sequence fragment join without poisoning the next chunk", async () => {
+      // A `deliverPolicy: "new"` subscriber can land mid-fragment, seeing
+      // index>0 first with no index-0 anchor. Those strays must be discarded
+      // so they don't corrupt the next complete chunk.
+      const { sub, push, end } = createControlledSubscription();
+      const buffer = bufferWith(() => Promise.resolve(sub));
+      const stream = await buffer.createTailStream("task-1");
+
+      const [, stale1, stale2] = fragmentChunk("X".repeat(120), 3);
+      push(stale1!); // joined mid-sequence — index 0 never seen
+      push(stale2!);
+      const good = "good-payload-after-join";
+      for (const f of fragmentChunk(good, 3)) push(f);
+      end();
+
+      const chunks = await readAll(stream!);
+      expect(chunks).toEqual([good]);
+    });
+
+    it("drops an incomplete chunk (lost fragment) and recovers on the next", async () => {
+      // A failed middle publish leaves a gap. The stale accumulator must not
+      // bleed into a following same-total chunk.
+      const { sub, push, end } = createControlledSubscription();
+      const buffer = bufferWith(() => Promise.resolve(sub));
+      const stream = await buffer.createTailStream("task-1");
+
+      const [lost0, , lost2] = fragmentChunk("Y".repeat(120), 3);
+      push(lost0!); // index 1 publish "failed" — never arrives
+      push(lost2!);
+      const recovered = "recovered-after-loss";
+      for (const f of fragmentChunk(recovered, 3)) push(f);
+      end();
+
+      const chunks = await readAll(stream!);
+      expect(chunks).toEqual([recovered]);
+    });
 
     it("returns null when JetStream is unavailable", async () => {
       const buffer = new NatsStreamBuffer({
@@ -180,7 +312,7 @@ describe("NatsStreamBuffer", () => {
 
       const chunks = await readAll(stream!);
       expect(chunks).toEqual(["chunk-1", "chunk-2"]);
-      expect(sub.unsubscribe).toHaveBeenCalled();
+      expect(sub.stop).toHaveBeenCalled();
     });
 
     it("stays open across long silent gaps between chunks", async () => {
@@ -249,7 +381,7 @@ describe("NatsStreamBuffer", () => {
       await reader.read();
 
       await reader.cancel();
-      expect(sub.unsubscribe).toHaveBeenCalled();
+      expect(sub.stop).toHaveBeenCalled();
     });
 
     it("returns null when subscribe throws", async () => {
@@ -279,7 +411,7 @@ describe("NatsStreamBuffer", () => {
 
       const chunks = await readAll(stream!);
       expect(chunks).toEqual(["chunk-1", "chunk-2"]);
-      expect(sub.unsubscribe).toHaveBeenCalled();
+      expect(sub.stop).toHaveBeenCalled();
     });
 
     it("swallows the {done} sentinel and keeps tailing across runs", async () => {
@@ -313,6 +445,99 @@ describe("NatsStreamBuffer", () => {
       end();
       const tail = await reader.read();
       expect(tail.done).toBe(true);
+    });
+  });
+
+  describe("publishRawChunk", () => {
+    function bufferWithPublish() {
+      const published: Array<{ subj: string; data: Uint8Array }> = [];
+      const mockJs = {
+        publish: mockOf((subj: string, data: Uint8Array) => {
+          published.push({ subj, data });
+          return Promise.resolve({ seq: published.length });
+        }),
+      };
+      const buffer = new NatsStreamBuffer({
+        getConnection: () => ({}) as never,
+        getJetStream: () => mockJs as never,
+      });
+      (buffer as unknown as { js: unknown }).js = mockJs;
+      return { buffer, published };
+    }
+
+    it("publishes the raw chunk under the {p} envelope on the run subject", async () => {
+      const { buffer, published } = bufferWithPublish();
+      const chunk = { type: "text-delta", id: "t", delta: "hi" };
+      await buffer.publishRawChunk("run_1", chunk);
+      expect(published).toHaveLength(1);
+      expect(published[0]!.subj).toBe("decopilot.stream.run_1");
+      expect(JSON.parse(new TextDecoder().decode(published[0]!.data))).toEqual({
+        p: chunk,
+      });
+    });
+
+    it("resolves false when JetStream is unavailable (no throw)", async () => {
+      const buffer = new NatsStreamBuffer({
+        getConnection: () => null,
+        getJetStream: () => null,
+      });
+      expect(await buffer.publishRawChunk("run_1", { type: "start" })).toBe(
+        false,
+      );
+    });
+
+    it("resolves true after the publish is confirmed", async () => {
+      const { buffer } = bufferWithPublish();
+      expect(await buffer.publishRawChunk("run_1", { type: "start" })).toBe(
+        true,
+      );
+    });
+
+    it("forwards an explicit msgId for JetStream dedup", async () => {
+      const published: Array<{ subj: string; opts?: unknown }> = [];
+      const mockJs = {
+        publish: mockOf((subj: string, _data: Uint8Array, opts?: unknown) => {
+          published.push({ subj, opts });
+          return Promise.resolve({ seq: published.length });
+        }),
+      };
+      const buffer = new NatsStreamBuffer({
+        getConnection: () => ({}) as never,
+        getJetStream: () => mockJs as never,
+      });
+      (buffer as unknown as { js: unknown }).js = mockJs;
+      await buffer.publishRawChunk(
+        "run1",
+        { type: "text-delta", delta: "x" },
+        { fenceToken: "fenceA", seq: 3 },
+      );
+      expect(published[0]?.opts).toMatchObject({ msgID: "run1:fenceA:3" });
+    });
+  });
+
+  describe("publishDone", () => {
+    it("publishDone writes an awaited done sentinel with a fence-scoped msg id", async () => {
+      const publishMock = mock(
+        (_subj: string, _data: Uint8Array, _opts?: unknown) =>
+          Promise.resolve({ seq: 9 }),
+      );
+      const buffer = new NatsStreamBuffer({
+        getConnection: () => ({}) as never,
+        getJetStream: () => ({ publish: publishMock }) as never,
+      });
+      (buffer as unknown as { js: unknown }).js = { publish: publishMock };
+
+      const ok = await buffer.publishDone("run_1", "fence_a", 7);
+
+      expect(ok).toBe(true);
+      expect(publishMock).toHaveBeenCalledTimes(1);
+      const [subject, data, opts] = publishMock.mock.calls[0]!;
+      expect(subject).toBe("decopilot.stream.run_1");
+      expect(JSON.parse(new TextDecoder().decode(data as Uint8Array))).toEqual({
+        done: true,
+        finalSeq: 7,
+      });
+      expect(opts).toMatchObject({ msgID: "run_1:fence_a:done:7" });
     });
   });
 });

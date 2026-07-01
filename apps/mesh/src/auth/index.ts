@@ -24,12 +24,12 @@ import {
   OrganizationOptions,
 } from "better-auth/plugins";
 import { emailOTP } from "better-auth/plugins/email-otp";
+import { APIError } from "better-auth/api";
 import {
   adminAc as systemAdminAc,
   defaultRoles as systemDefaultRoles,
 } from "better-auth/plugins/admin/access";
 import {
-  adminAc,
   defaultStatements,
   memberAc,
 } from "@decocms/better-auth/plugins/organization/access";
@@ -44,54 +44,13 @@ import { createEmailSender, findEmailProvider } from "./email-providers";
 import { emailButton, emailParagraph, emailTemplate } from "./email-template";
 import { createMagicLinkConfig } from "./magic-link";
 import { seedOrgDb } from "./org";
+import { hoistOrgLogo } from "./hoist-org-logo";
 import { identifyAuthenticatedUser } from "./posthog-identify";
 import { ADMIN_ROLES } from "./roles";
+import { getBuiltinRoleStatements } from "./builtin-role-permission";
 import { createSSOConfig } from "./sso";
-
-/**
- * Convert a string to a URL-friendly slug
- * Removes special characters, converts to lowercase, and replaces spaces with hyphens
- */
-function slugify(input: string): string {
-  return input
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9\s_-]+/g, "")
-    .replace(/[\s_-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-/**
- * Random words to use as suffix when organization name already exists
- */
-const ORG_NAME_TECH_SUFFIXES = [
-  "labs",
-  "agent",
-  "studio",
-  "workspace",
-  "systems",
-  "core",
-  "cloud",
-  "works",
-];
-
-const ORG_NAME_BR_SUFFIXES = [
-  "capybara",
-  "guarana",
-  "deco",
-  "samba",
-  "feijoada",
-  "capoeira",
-  "carnival",
-];
-
-function getRandomSuffix(): string {
-  const brIndex = Math.floor(Math.random() * ORG_NAME_BR_SUFFIXES.length);
-  const techIndex = Math.floor(Math.random() * ORG_NAME_TECH_SUFFIXES.length);
-  const brSuffix = ORG_NAME_BR_SUFFIXES[brIndex] ?? "deco";
-  const techSuffix = ORG_NAME_TECH_SUFFIXES[techIndex] ?? "studio";
-  return `${brSuffix}-${techSuffix}`;
-}
+import { GENERIC_EMAIL_DOMAINS } from "./org-assurance-policy";
+import { ensureUserOrganization } from "./ensure-user-organization";
 
 const allTools = Object.values(getToolsByCategory())
   .map((tool) => tool.map((t) => t.name))
@@ -100,20 +59,50 @@ const statement = { ...defaultStatements, self: ["*", ...allTools] };
 
 const ac = createAccessControl(statement);
 
-const user = ac.newRole({
-  self: ["*"],
-  ...adminAc.statements,
-}) as Role;
+// Single source of truth for built-in role → statement. The in-memory Flow 2
+// matcher (`builtin-role-permission.ts`) consumes the SAME builder, so the
+// org-plugin roles below and the in-memory resolution cannot drift.
+const builtinRoleStatements = getBuiltinRoleStatements(allTools);
 
-const admin = ac.newRole({
-  self: ["*"],
-  ...adminAc.statements,
-}) as Role;
+// The role-creating built-in roles (owner/admin) must enumerate every `self`
+// tool, not just `["*"]`. Better Auth's access-control `authorize()` matches
+// actions literally — `["*"]` authorizes only a request for the literal action
+// "*", NOT specific tools. Runtime checks bypass this for owner/admin, but
+// `create-role` gates the *creator* on whether they hold each permission they
+// grant; with `self: ["*"]` an owner is reported as "missing self:SOME_TOOL"
+// and can't create a capability-scoped custom role at all. Enumerating the full
+// tool list fixes that.
+//
+// `user`'s `self` is exactly USER_ROLE_TOOLS — the gated tools granted to every
+// member beyond basic-usage (empty by default; see registry-metadata). It is
+// enforced at runtime: only owner/admin bypass (see ADMIN_ROLES), so this grant
+// IS consulted. It must NEVER contain `"*"` — `createBoundAuthClient` falls back
+// to a `{ self: ["*"] }` wildcard probe when the exact check misses, and a `"*"`
+// here would satisfy it and hand every member full access (the bypass we removed).
+// Specific tool names match only via the exact check. A member otherwise gets
+// only basic-usage (granted out-of-band in AccessControl) plus connection-scoped
+// grants, and can't create roles (allowedRolesToCreateResources = ADMIN_ROLES).
+// `user` spreads `memberAc` (the org plugin's member role), NOT `adminAc`. These
+// org statements (organization/member/invitation/team/ac) gate Better Auth's
+// native org-plugin endpoints — not MCP tools, which our AccessControl checks on
+// `self`/connection buckets. `adminAc` grants org:update + member/invitation/team
+// management; spreading it here would let a plain member manage the org via those
+// endpoints. `memberAc` grants only `ac: ["read"]` (read roles for the UI).
+//
+// All three statements come from `getBuiltinRoleStatements` so the runtime
+// org-plugin roles and the in-memory Flow 2 matcher share one definition.
+// `getBuiltinRoleStatements` returns the loose `Permission` shape
+// (Record<string,string[]>); `newRole` wants the statement's literal `Subset`
+// type. The runtime values are exactly the statements compiled into `ac`, so
+// cast the argument to the parameter type — the result cast to `Role` is the
+// same one the original inline definitions used.
+type NewRoleArg = Parameters<typeof ac.newRole>[0];
 
-const owner = ac.newRole({
-  self: ["*"],
-  ...adminAc.statements,
-}) as Role;
+const user = ac.newRole(builtinRoleStatements.user as NewRoleArg) as Role;
+
+const admin = ac.newRole(builtinRoleStatements.admin as NewRoleArg) as Role;
+
+const owner = ac.newRole(builtinRoleStatements.owner as NewRoleArg) as Role;
 
 // Better Auth's organization plugin defaults new members to role "member".
 // Without an explicit mapping here, those rows resolve to zero permissions
@@ -249,6 +238,18 @@ const plugins = [
         await seedOrgDb(data.organization.id, data.member.userId);
       },
     },
+    organizationHooks: {
+      // Keep base64 logos out of the org row (they bloat every
+      // organization.list response). Mirrors `backfill-assets
+      // --target organizations`; raster only — SVG stays inline.
+      beforeUpdateOrganization: async ({ organization, member }) => {
+        const logo = organization.logo;
+        if (typeof logo !== "string" || !logo.startsWith("data:")) return;
+        const hoisted = await hoistOrgLogo(member.organizationId, logo);
+        if (hoisted === logo) return;
+        return { data: { ...organization, logo: hoisted } };
+      },
+    },
     ac,
     creatorRole: "owner",
     allowUserToCreateOrganization: true, // Users can create organizations by default
@@ -309,20 +310,10 @@ const plugins = [
       }
       return null;
     },
-    permissions: {
-      defaultPermissions: {
-        self: [
-          "ORGANIZATION_LIST",
-          "ORGANIZATION_GET", // Organization read access
-          "ORGANIZATION_MEMBER_LIST", // Member read access
-          "COLLECTION_CONNECTIONS_LIST",
-          "COLLECTION_CONNECTIONS_GET", // Connection read access
-          "API_KEY_CREATE", // API key creation
-          "API_KEY_LIST", // API key listing (metadata only)
-          // Note: API_KEY_UPDATE and API_KEY_DELETE are not default - users must explicitly request
-        ],
-      },
-    },
+    // No `defaultPermissions`: every key is created with an explicit scope (the
+    // API_KEY_CREATE tool requires `permissions`, and the internal minters pass
+    // their own). A key is authorized solely by its allowlist — see
+    // auth/api-key-permissions.ts. A key with no allowlist grants nothing.
     rateLimit: {
       enabled: false,
     },
@@ -350,6 +341,18 @@ const plugins = [
     jwt: {
       // Short expiration for proxy tokens (5 minutes)
       expirationTime: "5m",
+      // Only emit identity fields. The default payload is the entire user
+      // row, and this plugin attaches the signed JWT to every /get-session
+      // response via the `set-auth-jwt` header. A base64 `image` data URL
+      // (avatars can be megabytes) blows the header past the edge's limit, so
+      // the response is rejected and login breaks. Same class of bug as the
+      // mesh-token fix (#3716) — never put `image` in a header-bound JWT.
+      definePayload: ({ user }) => ({
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: (user as { role?: string }).role,
+      }),
     },
   }),
 
@@ -382,32 +385,6 @@ const plugins = [
     : []),
 ];
 
-/**
- * Generic email providers that should be skipped for domain-based auto-join.
- */
-const GENERIC_EMAIL_DOMAINS = new Set([
-  "gmail.com",
-  "googlemail.com",
-  "outlook.com",
-  "hotmail.com",
-  "live.com",
-  "yahoo.com",
-  "yahoo.co.uk",
-  "icloud.com",
-  "me.com",
-  "mac.com",
-  "aol.com",
-  "protonmail.com",
-  "proton.me",
-  "zoho.com",
-  "yandex.com",
-  "mail.com",
-  "gmx.com",
-  "gmx.net",
-  "tutanota.com",
-  "fastmail.com",
-]);
-
 export { GENERIC_EMAIL_DOMAINS };
 
 const databaseUrl = getDatabaseUrl();
@@ -439,8 +416,41 @@ function getTrustedOrigins(): string[] {
 
 const settings = getSettings();
 
+// Hard cap on inline base64 avatars stored in `user.image`. Avatar upload is
+// disabled in the UI, so `image` should only ever be a short OAuth provider
+// URL; this cap is a backstop against direct API callers. Oversized data: URLs
+// bloat every /get-session response and previously broke login via the
+// set-auth-jwt header.
+const MAX_INLINE_AVATAR_LENGTH = 256 * 1024;
+
 export const auth = betterAuth({
   secret: settings.betterAuthSecret || "deco-default-secret-k7x9m2p4q8w3n5v6",
+
+  // customAPIKeyGetter probes every `Authorization: Bearer …` as an API key,
+  // so OAuth tokens, mesh JWTs and stale keys routinely miss and Better Auth
+  // logs an ERROR + full source-mapped stack on each one — flooding prod logs.
+  // Drop only that expected 401; forward everything else with the same format.
+  logger: {
+    log: (level, message, ...args) => {
+      if (level === "error" && message.includes("validate API key")) return;
+      // Better Auth performs OAuth redirects by *throwing* an APIError with a
+      // 3xx status (e.g. "FOUND"/302 + Set-Cookie). A successful login is not
+      // a failure — drop these so they don't masquerade as errors in prod logs.
+      if (
+        level === "error" &&
+        args.some((a) => {
+          const code = (a as { statusCode?: unknown } | null)?.statusCode;
+          return typeof code === "number" && code >= 300 && code < 400;
+        })
+      ) {
+        return;
+      }
+      const line = `${new Date().toISOString()} ${level.toUpperCase()} [Better Auth]: ${message}`;
+      if (level === "error") console.error(line, ...args);
+      else if (level === "warn") console.warn(line, ...args);
+      else console.log(line, ...args);
+    },
+  },
 
   // Base URL for OAuth - will be overridden by request context
   baseURL: baseUrl,
@@ -506,79 +516,83 @@ export const auth = betterAuth({
             },
           });
 
-          // Domain-based handling for verified corporate emails (OAuth, magic link, OTP).
-          // Email/password signups have emailVerified=false at hook time and fall through
-          // to default org creation — there's no verification path to gate on.
-          // All verified corporate users go to /onboarding regardless of auto-join status
-          // so the user can explicitly choose to join an existing org or create a new one.
-          if (user.emailVerified) {
-            const emailDomain = user.email?.split("@")[1]?.toLowerCase();
-            if (emailDomain && !GENERIC_EMAIL_DOMAINS.has(emailDomain)) {
-              return;
-            }
-          }
+          const allowCreate =
+            getConfig().autoCreateOrganizationOnSignup !== false;
 
-          // Check if auto-creation is enabled (default: true)
-          if (getConfig().autoCreateOrganizationOnSignup === false) {
-            return;
-          }
+          try {
+            const result = await ensureUserOrganization({
+              db: getDb().db,
+              authApi: auth.api,
+              user: {
+                id: user.id,
+                email: user.email,
+                name: user.name ?? null,
+                emailVerified: !!user.emailVerified,
+              },
+              allowCreate,
+              createdVia: "signup",
+            });
 
-          const firstName = user.name
-            ? user.name.split(" ")[0]
-            : user.email.split("@")[0];
-
-          const maxAttempts = 3;
-          for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            const orgName = `${firstName} ${getRandomSuffix()}`;
-            const orgSlug = slugify(orgName);
-
-            try {
-              const created = await auth.api.createOrganization({
-                body: {
-                  name: orgName,
-                  slug: orgSlug,
-                  userId: user.id,
+            if (result.status === "created") {
+              posthog.groupIdentify({
+                groupType: "organization",
+                groupKey: result.organization.id,
+                properties: {
+                  name: result.organization.name,
+                  slug: result.organization.slug,
+                  created_at: new Date().toISOString(),
+                  created_via: result.createdVia,
+                  email_domain: result.domain,
                 },
               });
-
-              // Group identify for team-level analytics.
-              const orgId =
-                (created as { id?: string } | null)?.id ?? undefined;
-              if (orgId) {
-                posthog.groupIdentify({
-                  groupType: "organization",
-                  groupKey: orgId,
-                  properties: {
-                    name: orgName,
-                    slug: orgSlug,
-                    created_at: new Date().toISOString(),
-                    created_via: "signup_default",
-                  },
-                });
-                posthog.capture({
-                  distinctId: user.id,
-                  event: "organization_created",
-                  groups: { organization: orgId },
-                  properties: {
-                    organization_id: orgId,
-                    organization_slug: orgSlug,
-                    created_via: "signup_default",
-                  },
-                });
-              }
-              return;
-            } catch (error) {
-              const isConflictError =
-                error instanceof Error &&
-                "body" in error &&
-                (error as { body?: { code?: string } }).body?.code ===
-                  "ORGANIZATION_ALREADY_EXISTS";
-
-              if (!isConflictError || attempt === maxAttempts - 1) {
-                console.error("Failed to create default organization:", error);
-                return;
-              }
+              posthog.capture({
+                distinctId: user.id,
+                event: "organization_created",
+                groups: { organization: result.organization.id },
+                properties: {
+                  organization_id: result.organization.id,
+                  organization_slug: result.organization.slug,
+                  name: result.organization.name,
+                  created_via: result.createdVia,
+                  email_domain: result.domain,
+                },
+              });
             }
+
+            if (result.status === "joined") {
+              posthog.capture({
+                distinctId: user.id,
+                event: "organization_domain_joined",
+                groups: { organization: result.organization.id },
+                properties: {
+                  organization_id: result.organization.id,
+                  organization_slug: result.organization.slug,
+                  email_domain: result.domain,
+                  joined_via: result.createdVia,
+                },
+              });
+            }
+          } catch (error) {
+            posthog.captureException(error, user.id);
+            console.error("Failed to ensure organization on signup:", error);
+          }
+        },
+      },
+      update: {
+        // Defense in depth: never persist an oversized base64 avatar. Upload
+        // is disabled in the UI, but a direct API caller could still send a
+        // multi-megabyte data: URL. See MAX_INLINE_AVATAR_LENGTH.
+        before: async (data) => {
+          const image = (data as { image?: unknown }).image;
+          if (
+            typeof image === "string" &&
+            image.startsWith("data:") &&
+            image.length > MAX_INLINE_AVATAR_LENGTH
+          ) {
+            throw new APIError("PAYLOAD_TOO_LARGE", {
+              message:
+                "Avatar image is too large. Upload an image smaller than 5MB.",
+            });
           }
         },
       },

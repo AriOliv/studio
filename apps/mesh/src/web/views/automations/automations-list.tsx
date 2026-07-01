@@ -46,6 +46,13 @@ export function AutomationsList({ virtualMcpId }: { virtualMcpId: string }) {
     goToDetail(created.id);
   };
 
+  const newButton = (
+    <Button size="sm" onClick={handleNew} disabled={create.isPending}>
+      <Plus size={14} />
+      New automation
+    </Button>
+  );
+
   return (
     <Page>
       <Page.Content>
@@ -61,10 +68,7 @@ export function AutomationsList({ virtualMcpId }: { virtualMcpId: string }) {
                   className="w-full md:w-[375px]"
                 />
               )}
-              <Button size="sm" onClick={handleNew} disabled={create.isPending}>
-                <Plus size={14} />
-                New automation
-              </Button>
+              {newButton}
             </div>
           </div>
 
@@ -74,16 +78,7 @@ export function AutomationsList({ virtualMcpId }: { virtualMcpId: string }) {
                 image={<Zap size={48} className="text-muted-foreground" />}
                 title="No automations yet"
                 description="Create your first automation to run this agent on a schedule or in response to events."
-                actions={
-                  <Button
-                    size="sm"
-                    onClick={handleNew}
-                    disabled={create.isPending}
-                  >
-                    <Plus size={14} />
-                    New automation
-                  </Button>
-                }
+                actions={newButton}
               />
             </div>
           ) : filtered.length === 0 ? (

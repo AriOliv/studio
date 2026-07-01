@@ -1,5 +1,5 @@
 import type { ToolDefinition, UsageStats } from "@decocms/mesh-sdk";
-import type { ModelsConfig } from "@/api/routes/decopilot/types";
+import type { ModelsConfig } from "@decocms/harness/types";
 import type { ChatMessage } from "../types.ts";
 
 type MessagePart = ChatMessage["parts"][number];
@@ -13,12 +13,15 @@ export interface ToolMetadata {
   annotations?: NonNullable<ToolDefinition["annotations"]>;
   /** Latency in seconds (converted from ms for UI) */
   latencySeconds?: number;
+  /** UTF-8 byte length of the JSON-serialized tool result. */
+  outputBytes?: number;
   _meta?: ToolDefinition["_meta"];
 }
 
 export interface ToolSubtaskMetadata {
   usage: UsageStats;
   agent: string;
+  /** Slot-keyed harness models (per-slot credentialId, v2). */
   models: ModelsConfig;
 }
 
@@ -76,6 +79,7 @@ export function useFilterParts(message: ChatMessage | null) {
             data: {
               annotations?: unknown;
               latencyMs?: number;
+              outputBytes?: number;
               _meta?: unknown;
             };
           }
@@ -91,6 +95,13 @@ export function useFilterParts(message: ChatMessage | null) {
           Number.isFinite(data.latencyMs)
         ) {
           meta.latencySeconds = data.latencyMs / 1000;
+        }
+        if (
+          typeof data.outputBytes === "number" &&
+          Number.isFinite(data.outputBytes) &&
+          data.outputBytes >= 0
+        ) {
+          meta.outputBytes = data.outputBytes;
         }
         if (data._meta && typeof data._meta === "object") {
           meta._meta = data._meta as ToolDefinition["_meta"];
@@ -116,58 +127,54 @@ export function useFilterParts(message: ChatMessage | null) {
     }
   }
 
-  // Build render order: within each step, reasoning groups come first.
-  // A "step" is delimited by step-start parts.
+  // Build render order in pure arrival order: each reasoning group renders at
+  // the position of its first part, interleaved with the surrounding tool calls
+  // and text exactly as the model produced them. Adjacent reasoning parts are
+  // still coalesced into one group above; we deliberately do NOT hoist groups
+  // to the top of their step. With interleaved thinking a single step can emit
+  // reasoning → tool → reasoning → tool …, and hoisting collapsed all those
+  // thoughts into one disconnected stack above the tools.
   const renderOrder: RenderItem[] = [];
 
   if (message) {
-    // Collect items per step, then flush with reasoning-groups first
-    let stepReasoningGroups: ReasoningGroup[] = [];
-    let stepParts: { index: number }[] = [];
-    const groupsEmitted = new Set<ReasoningGroup>();
-
-    const flushStep = () => {
-      for (const group of stepReasoningGroups) {
-        if (!groupsEmitted.has(group)) {
-          groupsEmitted.add(group);
-          renderOrder.push({ kind: "reasoning-group", group });
-        }
-      }
-      for (const item of stepParts) {
-        renderOrder.push({ kind: "part", index: item.index });
-      }
-      stepReasoningGroups = [];
-      stepParts = [];
-    };
-
     for (let i = 0; i < message.parts.length; i++) {
       const p = message.parts[i]!;
 
+      // step-start parts are structural only — they never render.
       if (p.type === "step-start") {
-        flushStep();
         continue;
       }
 
-      // Skip individual reasoning parts (handled as groups)
+      // Reasoning parts render as groups. Emit the group once, at the index of
+      // its first part; later parts of the same group emit nothing.
       if (reasoningIndices.has(i)) {
-        // If this is the first index of a group, queue it
         const group = reasoningGroups.find((g) => g.startIndex === i);
         if (group) {
-          stepReasoningGroups.push(group);
+          renderOrder.push({ kind: "reasoning-group", group });
         }
         continue;
       }
 
-      stepParts.push({ index: i });
-    }
+      // Skip invisible data-* parts (they're consumed above into the
+      // dataParts maps and the MessagePart switch returns null for them).
+      // Including them in renderOrder would let them claim
+      // `isLastVisiblePart` and steal the message-bottom usage stats from
+      // the real last visible part.
+      if (p.type.startsWith("data-")) {
+        continue;
+      }
 
-    // Flush the last step
-    flushStep();
+      renderOrder.push({ kind: "part", index: i });
+    }
   }
 
   return {
     reasoningGroups,
     renderOrder,
-    dataParts: { toolMetadata, toolSubtaskMetadata, webSearchStreaming },
+    dataParts: {
+      toolMetadata,
+      toolSubtaskMetadata,
+      webSearchStreaming,
+    },
   };
 }

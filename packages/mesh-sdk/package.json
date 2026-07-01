@@ -1,6 +1,6 @@
 {
   "name": "@decocms/mesh-sdk",
-  "version": "1.2.2",
+  "version": "1.15.0",
   "description": "SDK for building external apps that integrate with Mesh MCP servers",
   "type": "module",
   "scripts": {
@@ -11,8 +11,7 @@
     ".": "./src/index.ts",
     "./hooks": "./src/hooks/index.ts",
     "./context": "./src/context/index.ts",
-    "./types": "./src/types/index.ts",
-    "./plugins": "./src/plugins/index.ts"
+    "./types": "./src/types/index.ts"
   },
   "dependencies": {
     "@decocms/bindings": "^1.1.1",

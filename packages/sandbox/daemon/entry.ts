@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { sleep } from "@decocms/std";
 import { join } from "node:path";
 import { bumpActivity } from "./activity";
 import { requireToken } from "./auth";
@@ -8,10 +10,16 @@ import { REPLAY_BYTES } from "./constants";
 import { Broadcaster } from "./events/broadcast";
 import type { DaemonStatus } from "./events/types";
 import { BranchStatusMonitor } from "./git/branch-status";
-import { gitSync } from "./git/git-sync";
 import { InstallState } from "./install/install-state";
 import { LifecycleManager } from "./lifecycle/manager";
 import { readConfig } from "./persistence";
+import { MountManager } from "./org-fs/mount-manager";
+import { createRcloneMounter, detachMount } from "./org-fs/mounter";
+import { parseOrgFsConfig } from "./org-fs/config";
+import { repointOutputLink, repointUploadLink } from "./org-fs/thread-links";
+import { ensureRepoOrgLink } from "./org-fs/repo-link";
+import type { SidecarStatus } from "./org-fs/sidecar";
+import { makeOrgFsConfigHandler } from "./routes/orgfs-config";
 import { createPortSniffer } from "./process/port-sniffer";
 import { TaskManager } from "./process/task-manager";
 import { PhaseManager } from "./process/phase-manager";
@@ -20,14 +28,40 @@ import { makeProxyHandler } from "./proxy";
 import { jsonResponse } from "./routes/body-parser";
 import { makeBashHandler } from "./routes/bash";
 import {
+  makeGitDiffHandler,
+  makeGitDiscardHandler,
+  makeGitPublishHandler,
+  makeGitRebaseHandler,
+  makeGitStatusHandler,
+  publish,
+} from "./routes/git";
+import {
   makeConfigReadHandler,
   makeConfigUpdateHandler,
 } from "./routes/config";
+import { handleCancelRequest, handleDispatchRequest } from "./routes/dispatch";
+// Import harness factories from their subpaths (rather than the mesh barrel).
+// The daemon runs desktop CLI harnesses only; Decopilot remains cluster-side.
+import { claudeCodeHarnessFactory } from "@decocms/harness/claude-code/index";
+import { codexHarnessFactory } from "@decocms/harness/codex/index";
+import {
+  getHarnessFactory,
+  registerHarnessFactory,
+} from "@decocms/harness/registry";
+import type {
+  HarnessContext,
+  HarnessId,
+  HarnessStreamInput,
+} from "@decocms/harness/types";
+import { metrics, trace } from "@opentelemetry/api";
 import { makeEventsHandler } from "./routes/events-stream";
 import { makeExecHandler } from "./routes/exec";
 import {
   makeReadHandler,
   makeWriteHandler,
+  makeUnlinkHandler,
+  makeMkdirHandler,
+  makeRenameHandler,
   makeEditHandler,
   makeGrepHandler,
   makeGlobHandler,
@@ -72,6 +106,21 @@ const bootConfig = {
   appRoot: APP_ROOT,
   repoDir: join(APP_ROOT, "repo"),
   proxyPort: parseInt(resolvedDaemonPort, 10),
+  // Offload re-inflate config for `/dispatch`. These gate which hosts an
+  // offloaded `messagesRef.url` may be fetched from (the SSRF allowlist) and
+  // whether http:// loopback is permitted for local dev. They come from the
+  // daemon's boot env, NEVER from the request frame.
+  //
+  // CONTRACT: mesh must populate these when spawning the daemon —
+  //   OFFLOAD_ALLOWED_HOSTS      comma-separated hostnames (object-store host(s))
+  //   OFFLOAD_ALLOW_SAME_HOST_DEV "1" to allow http:// loopback (dev only)
+  // The default is an EMPTY allowlist, which fails CLOSED: with no env wired,
+  // every offload fetch is rejected (safe — no SSRF surface).
+  offloadAllowedHosts: (process.env.OFFLOAD_ALLOWED_HOSTS ?? "")
+    .split(",")
+    .map((h) => h.trim())
+    .filter((h) => h.length > 0),
+  offloadAllowSameHostDev: process.env.OFFLOAD_ALLOW_SAME_HOST_DEV === "1",
 };
 // Ensure repoDir exists so bash commands with the default cwd don't fail with
 // ENOENT when no repo has been cloned yet (tool-only sandboxes, no-repo agents).
@@ -105,6 +154,7 @@ function setStatus(next: DaemonStatus) {
 const store = new TenantConfigStore();
 const installState = new InstallState();
 const lifecycle = new LifecycleManager({ broadcaster });
+let resetProbeState = (): void => {};
 // Drop the sniffed port whenever we leave `running` — the next dev start
 // may bind somewhere else and we need to re-sniff its announcement.
 const lifecycleTransitionRaw = lifecycle.transition.bind(lifecycle);
@@ -113,7 +163,10 @@ lifecycle.transition = (next) => {
   const prev = lifecycle.current().phase;
   const wasRunning = prev === "running";
   lifecycleTransitionRaw(next);
-  if (wasRunning && next.phase !== "running") portSniffer.reset();
+  if (wasRunning && next.phase !== "running") {
+    portSniffer.reset();
+    resetProbeState();
+  }
   if (prev !== next.phase) {
     console.log(`[lifecycle] ${prev} → ${next.phase}`);
   }
@@ -217,11 +270,13 @@ const lastProbe = startUpstreamProbe({
         return;
       }
       lastRunningPort = s.port;
+      const wasDown = phase === "starting" || phase === "crashed";
       lifecycle.transition({
         phase: "running",
         port: s.port,
         htmlSupport: s.htmlSupport,
       });
+      if (wasDown) broadcaster.emit("reload", {});
       if (!baselineTimer) {
         baselineTimer = setTimeout(() => {
           baselineTimer = null;
@@ -245,6 +300,11 @@ const lastProbe = startUpstreamProbe({
   },
   onLog: (msg) => broadcaster.broadcastChunk("setup", msg),
 });
+resetProbeState = () => {
+  lastProbe.status = "booting";
+  lastProbe.port = null;
+  lastProbe.htmlSupport = false;
+};
 
 // HTTP/WS proxy forwards to the same port the probe is HEAD-checking.
 // `application.port` is what mesh configured, but vite/etc. routinely
@@ -256,9 +316,48 @@ const getDevPort = (): number | null =>
   // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- TODO: refactor render-time .current access
   portSniffer.current() ?? store.read()?.application?.port ?? null;
 const { appRoot, repoDir } = bootConfig;
-const fsDeps = { appRoot, repoDir };
+let fileChangedDebounce: ReturnType<typeof setTimeout> | null = null;
+let pendingPaths = new Set<string>();
+
+const FILE_CHANGED_DEBOUNCE_MS = 300;
+
+function emitFileChanged(filePath: string) {
+  pendingPaths.add(filePath);
+  if (fileChangedDebounce) clearTimeout(fileChangedDebounce);
+  fileChangedDebounce = setTimeout(() => {
+    fileChangedDebounce = null;
+    const paths = pendingPaths;
+    pendingPaths = new Set();
+    for (const p of paths) {
+      broadcaster.emit("file-changed", { path: p });
+    }
+  }, FILE_CHANGED_DEBOUNCE_MS);
+}
+
+// Filesystem watcher callback — fires for any repo file change (editor, build
+// tool, agent write, etc.) detected by BranchStatusMonitor's recursive
+// fs.watch. Shares the same debounce as onWorkingTreeWrite so rapid edits
+// (save + HMR rewrite) coalesce into one SSE burst.
+branchStatus.onFileChanged = (filePath: string) => {
+  emitFileChanged(filePath);
+};
+
+const fsDeps = {
+  appRoot,
+  repoDir,
+  onWorkingTreeWrite: (filePath: string) => {
+    if (process.env.DEBUG_SAVE_CHANGES === "1") {
+      console.log("[branch-status] fs write/edit → refresh", { repoDir });
+    }
+    branchStatus.refresh();
+    emitFileChanged(filePath);
+  },
+};
 const readH = makeReadHandler(fsDeps);
 const writeH = makeWriteHandler(fsDeps);
+const unlinkH = makeUnlinkHandler(fsDeps);
+const mkdirH = makeMkdirHandler(fsDeps);
+const renameH = makeRenameHandler(fsDeps);
 const editH = makeEditHandler(fsDeps);
 const grepH = makeGrepHandler(fsDeps);
 const globH = makeGlobHandler(fsDeps);
@@ -269,6 +368,17 @@ const bashH = makeBashHandler({
   repoDir,
   taskManager,
 });
+const gitDeps = {
+  appRoot,
+  repoDir,
+  getCloneUrl: () => store.read()?.git?.repository?.cloneUrl ?? null,
+  getOperator: () => store.read()?.operator ?? null,
+};
+const gitStatusH = makeGitStatusHandler(gitDeps);
+const gitDiffH = makeGitDiffHandler(gitDeps);
+const gitPublishH = makeGitPublishHandler(gitDeps);
+const gitDiscardH = makeGitDiscardHandler(gitDeps);
+const gitRebaseH = makeGitRebaseHandler(gitDeps);
 const execH = makeExecHandler({
   repoDir,
   store,
@@ -321,6 +431,54 @@ const eventsH = makeEventsHandler({
 
 const idleH = makeIdleHandler();
 const proxyH = makeProxyHandler({ broadcaster, getDevPort });
+
+// ─── Harness dispatch ──────────────────────────────────────────────────
+// Authenticated by the bearer `bootConfig.daemonToken` (see `./auth`). The
+// link daemon's `handleLocalDispatch` posts a HarnessStreamInput here over
+// loopback when it pulls a work item; the daemon spawns the named factory's
+// CLI in-process and streams `UIMessageChunk` back as SSE.
+//
+// The CLI factories live in the daemon. The cluster `decopilotHarnessFactory`
+// (RunRegistry, run-stream internals, StudioContext) is NOT here.
+// Register the daemon's harness factories into the shared @decocms/harness
+// registry (the same registry the cluster barrel uses, but a separate
+// module-singleton in the daemon process). Keys are the factory ids
+// (claude-code / codex). Lookup goes through `getHarnessFactory` so the daemon
+// and the cluster share one registry abstraction.
+registerHarnessFactory(claudeCodeHarnessFactory);
+registerHarnessFactory(codexHarnessFactory);
+const dispatchTracer = trace.getTracer("link-daemon");
+const dispatchMeter = metrics.getMeter("link-daemon");
+const lookupDispatchHarness = (id: string, input: unknown) => {
+  const factory = getHarnessFactory(id as HarnessId);
+  if (!factory) throw new Error(`unknown harness: ${id}`);
+  // Build a minimal HarnessContext. CLI harnesses don't read storage,
+  // db, vault, or aiProviders — they only need tracer/meter for OTel
+  // and metadata for span attributes. The cluster's richer StudioContext
+  // is structurally compatible with this shape (see
+  // `apps/mesh/src/core/harness-context.ts`).
+  const harnessInput = input as HarnessStreamInput;
+  const ctx: HarnessContext = {
+    tracer: dispatchTracer,
+    meter: dispatchMeter,
+    metadata: {
+      threadId: harnessInput.threadId,
+      orgId: harnessInput.organizationId,
+      userId: harnessInput.user?.id,
+    },
+  };
+  const harness = factory.create(ctx);
+  return {
+    // Share-files-back: point `org/output` at this run's thread subtree of the
+    // outputs volume before the harness can touch it. Awaited so the link is
+    // correct from the run's first write; failures degrade to no link (never
+    // block the run).
+    stream: async function* () {
+      await repointOutputLinkForRun(harnessInput.threadId);
+      yield* harness.stream(harnessInput);
+    },
+  };
+};
 const wsProxy = makeWsUpgrader(getDevPort, { onClientMessage: bumpActivity });
 
 const configReadH = makeConfigReadHandler({
@@ -334,6 +492,7 @@ const configReadH = makeConfigReadHandler({
     ready: isReady(),
   }),
   getTasks: () => phaseManager.recent(20),
+  repoDir: bootConfig.repoDir,
 });
 // Closure mutates `bootConfig.daemonToken` in place so the
 // `requireToken(req, bootConfig.daemonToken)` calls below — which read the
@@ -370,17 +529,49 @@ void lastProbe;
 
 let firstWorkLogged = false;
 
-async function configH(req: Request): Promise<Response> {
+// Canonical and legacy daemon route prefixes. The cluster speaks only
+// `/_sandbox/*` (see T11 in 2026-05-22-sandbox-naming-uniformization.md);
+// `/_decopilot_vm/*` is dual-served for one release window so old clusters
+// rolling out keep working until they pick up the rename. Remove the
+// legacy prefix in a follow-up release once all clusters and the
+// housekeeper sweep script have updated.
+const SANDBOX_PREFIX = "/_sandbox";
+const LEGACY_SANDBOX_PREFIX = "/_decopilot_vm";
+const SANDBOX_IDLE_PATH = `${SANDBOX_PREFIX}/idle`;
+const LEGACY_SANDBOX_IDLE_PATH = `${LEGACY_SANDBOX_PREFIX}/idle`;
+
+/**
+ * If `pathname` is under one of the known sandbox prefixes, return the
+ * prefix actually used plus the suffix. Otherwise `null`. Used by the
+ * top-level fetch dispatcher and propagated into HMAC verification so
+ * the daemon validates against the same prefix the cluster signed.
+ */
+function matchSandboxPrefix(
+  pathname: string,
+): { prefix: string; suffix: string } | null {
+  for (const prefix of [SANDBOX_PREFIX, LEGACY_SANDBOX_PREFIX]) {
+    if (pathname === prefix || pathname === `${prefix}/`) {
+      return { prefix, suffix: "/" };
+    }
+    if (pathname.startsWith(`${prefix}/`)) {
+      return { prefix, suffix: pathname.slice(prefix.length) };
+    }
+  }
+  return null;
+}
+
+async function configH(req: Request, prefix: string): Promise<Response> {
   const { method } = req;
   if (method === "GET") return configReadH();
   if (method === "PUT" || method === "POST") return configUpdateH(req);
-  return jsonResponse({ error: "Not found: /_decopilot_vm/config" }, 404);
+  return jsonResponse({ error: `Not found: ${prefix}/config` }, 404);
 }
 
 function tasksRouteH(
   req: Request,
   method: string,
   vmPath: string,
+  prefix: string,
 ): Response | Promise<Response> {
   if (method === "GET" && vmPath === "/tasks") return tasksListH(req);
   if (method === "POST" && vmPath === "/tasks/kill-all") return tasksKillAllH();
@@ -392,7 +583,7 @@ function tasksRouteH(
     return tasksDeleteH(req);
   if (method === "GET" && /^\/tasks\/[^/]+$/.test(vmPath))
     return tasksGetH(req);
-  return jsonResponse({ error: `Not found: /_decopilot_vm${vmPath}` }, 404);
+  return jsonResponse({ error: `Not found: ${prefix}${vmPath}` }, 404);
 }
 
 function execRouteH(
@@ -416,12 +607,23 @@ function execRouteH(
 const fsH: Record<string, (req: Request) => Response | Promise<Response>> = {
   "/read": readH,
   "/write": writeH,
+  "/unlink": unlinkH,
+  "/mkdir": mkdirH,
+  "/rename": renameH,
   "/edit": editH,
   "/grep": grepH,
   "/glob": globH,
   "/write_from_url": writeFromUrlH,
   "/upload_to_url": uploadToUrlH,
   "/bash": bashH,
+};
+
+const gitH: Record<string, (req: Request) => Response | Promise<Response>> = {
+  "/git/status": gitStatusH,
+  "/git/diff": gitDiffH,
+  "/git/publish": gitPublishH,
+  "/git/discard": gitDiscardH,
+  "/git/rebase": gitRebaseH,
 };
 
 const setupH: Record<string, () => Response> = {
@@ -437,28 +639,78 @@ const CORS_HEADERS = {
     "Content-Type, Accept, Cache-Control, Authorization",
 };
 
-function vmRouteH(
+async function vmRouteH(
   req: Request,
   method: string,
   vmPath: string,
-): Response | Promise<Response> {
+  prefix: string,
+): Promise<Response> {
   if (method === "GET" && vmPath === "/idle") return idleH();
-  if (method === "GET" && vmPath === "/events") return eventsH();
+  if (method === "GET" && vmPath === "/events") return eventsH(req);
   if (method === "GET" && vmPath === "/scripts") return scriptsHandler();
   if (method === "OPTIONS")
     return new Response(null, { status: 204, headers: CORS_HEADERS });
 
+  // Harness dispatch + cancel read their own body, so keep them inline
+  // (they run the bearer-token check themselves before parsing).
+  if (method === "POST" && vmPath === "/dispatch") {
+    return handleDispatchRequest(req, {
+      daemonToken: bootConfig.daemonToken,
+      lookupHarness: lookupDispatchHarness,
+      allowedHosts: bootConfig.offloadAllowedHosts,
+      allowSameHostDev: bootConfig.offloadAllowSameHostDev,
+    });
+  }
+  if (method === "DELETE" && vmPath.startsWith("/runs/")) {
+    return handleCancelRequest(req, {
+      daemonToken: bootConfig.daemonToken,
+    });
+  }
+
   const denied = requireToken(req, bootConfig.daemonToken);
   if (denied) return denied;
 
-  if (vmPath === "/config") return configH(req);
-  if (vmPath.startsWith("/tasks")) return tasksRouteH(req, method, vmPath);
-  if (method === "POST" && vmPath in setupH) return setupH[vmPath]();
-  if (method === "POST" && vmPath in fsH) return fsH[vmPath](req);
-  if (method === "POST" && vmPath.startsWith("/exec/"))
-    return execRouteH(req, vmPath);
+  // Hosted harnesses drive the sandbox through the fs/exec tool routes
+  // WITHOUT a /dispatch envelope, so the org links must be ensured here too —
+  // before bash/read/write resolve the prompts' relative `org/...` paths.
+  // vm-tools stamp the thread on each call (x-thread-id) so `org/output` can
+  // point at the running thread's folder; memoized, so repeat calls cost one
+  // lstat. ONLY those routes: gating /orgfs-config would deadlock cluster
+  // provisioning into the full fail-open wait (the mounts the gate polls for
+  // appear only after that POST lands), and gating /setup/clone would create
+  // `repo/org` ahead of the clone — the boot-time hazard repo-link.ts exists
+  // to avoid. The other routes (config/tasks/git) never resolve org paths.
+  if (method === "POST" && (vmPath in fsH || vmPath.startsWith("/exec/"))) {
+    const vmThreadId = req.headers.get("x-thread-id");
+    if (vmThreadId) {
+      await repointOutputLinkForRun(vmThreadId);
+    } else {
+      await ensureOrgRepoLink();
+    }
+  }
 
-  return jsonResponse({ error: `Not found: /_decopilot_vm${vmPath}` }, 404);
+  // Buffer body once and re-inject as a fresh Request for downstream
+  // handlers that re-read it.
+  const hasBody = method !== "GET" && method !== "HEAD" && method !== "DELETE";
+  const body = hasBody ? await req.text() : "";
+
+  const rebuilt = hasBody
+    ? new Request(req.url, { method, headers: req.headers, body })
+    : req;
+
+  if (vmPath === "/config") return configH(rebuilt, prefix);
+  if (method === "POST" && vmPath === "/orgfs-config")
+    return orgFsConfigH(rebuilt);
+  if (vmPath.startsWith("/tasks"))
+    return tasksRouteH(rebuilt, method, vmPath, prefix);
+  if (method === "POST" && vmPath in setupH) return setupH[vmPath]();
+  if (method === "GET" && vmPath in gitH) return gitH[vmPath](rebuilt);
+  if (method === "POST" && vmPath in fsH) return fsH[vmPath](rebuilt);
+  if (method === "POST" && vmPath in gitH) return gitH[vmPath](rebuilt);
+  if (method === "POST" && vmPath.startsWith("/exec/"))
+    return execRouteH(rebuilt, vmPath);
+
+  return jsonResponse({ error: `Not found: ${prefix}${vmPath}` }, 404);
 }
 
 Bun.serve<WsProxyData, never>({
@@ -469,7 +721,11 @@ Bun.serve<WsProxyData, never>({
     const { pathname: p } = new URL(req.url);
     const { method } = req;
 
-    if (p !== "/health" && p !== "/_decopilot_vm/idle") {
+    if (
+      p !== "/health" &&
+      p !== SANDBOX_IDLE_PATH &&
+      p !== LEGACY_SANDBOX_IDLE_PATH
+    ) {
       bumpActivity();
       if (!firstWorkLogged) {
         firstWorkLogged = true;
@@ -479,9 +735,11 @@ Bun.serve<WsProxyData, never>({
       }
     }
 
+    const sandboxMatch = matchSandboxPrefix(p);
+
     if (
       req.headers.get("upgrade")?.toLowerCase() === "websocket" &&
-      !p.startsWith("/_decopilot_vm/")
+      !sandboxMatch
     ) {
       const ok = server.upgrade(req, { data: wsProxy.upgradeData(req) });
       return ok
@@ -490,8 +748,8 @@ Bun.serve<WsProxyData, never>({
     }
 
     if (method === "GET" && p === "/health") return healthH();
-    if (p.startsWith("/_decopilot_vm/"))
-      return vmRouteH(req, method, p.slice("/_decopilot_vm".length));
+    if (sandboxMatch)
+      return vmRouteH(req, method, sandboxMatch.suffix, sandboxMatch.prefix);
     return proxyH(req);
   },
   websocket: {
@@ -501,31 +759,190 @@ Bun.serve<WsProxyData, never>({
   },
 });
 
-process.on("SIGTERM", () => {
+// --- Org-filesystem mounts ---------------------------------------------------
+// Desktop links: the mesh sets ORGFS_CONFIG (a JSON OrgFsMountConfig) +
+// ORGFS_RCLONE_PATH at spawn — as boot env, like OFFLOAD_ALLOWED_HOSTS, so the
+// daemon itself mounts here at boot.
+// Cluster pods: this container can't mount (locked-down securityContext); a
+// privileged sidecar does (org-fs/sidecar.ts). The mesh runner POSTs the
+// config to /_sandbox/orgfs-config post-bind (warm-pool claims reject
+// spec.env) and the handler relays it onto the shared control volume the
+// sidecar watches. Both paths are inert unless their env is set; every step
+// is guarded — a mount failure never affects the daemon or harnesses.
+let mountManager: MountManager | null = null;
+{
+  const orgFs = parseOrgFsConfig(process.env.ORGFS_CONFIG);
+  const rclonePath = process.env.ORGFS_RCLONE_PATH;
+  if (orgFs && rclonePath) {
+    mountManager = new MountManager(createRcloneMounter(rclonePath));
+    void mountManager
+      .start(orgFs, bootConfig.appRoot)
+      .catch((err) => console.warn("[org-fs] mount start failed", err));
+  }
+}
+const orgFsConfigH = makeOrgFsConfigHandler({
+  configPath: process.env.ORGFS_SIDECAR_CONFIG_PATH,
+});
+
+/**
+ * Per-run thread links (`org/output` → `.outputs/<threadId>` and
+ * `org/upload` → `.uploads/<threadId>`, see org-fs/thread-links.ts). Gated on
+ * the volumes being ACTUALLY mounted — a mount-point dir exists locally even
+ * when the mount failed, and linking into that would silently strand files on
+ * local disk. The mount is either ours (desktop) or the sidecar's (cluster —
+ * its status file reports what it mounted). Hoisted declaration: called from
+ * `lookupDispatchHarness` above, which only runs post-boot.
+ */
+const orgFsLog = (msg: string, err?: unknown) =>
+  err ? console.warn(`[org-fs] ${msg}`, err) : console.log(`[org-fs] ${msg}`);
+
+/** Org-fs is expected on this daemon (desktop boot env or cluster sidecar). */
+const orgFsExpected =
+  Boolean(process.env.ORGFS_CONFIG) ||
+  Boolean(process.env.ORGFS_SIDECAR_CONFIG_PATH);
+
+/** Active org-fs mounts: ours (desktop) or the sidecar's (cluster). */
+async function activeOrgFsMounts(): Promise<{ mountPath: string }[]> {
+  const own = mountManager?.list() ?? [];
+  if (own.length > 0) return own;
+  const statusPath = process.env.ORGFS_SIDECAR_STATUS_PATH;
+  if (!statusPath) return [];
+  const status = await readFile(statusPath, "utf8")
+    .then((raw) => JSON.parse(raw) as SidecarStatus)
+    .catch(() => null);
+  return status?.mounts ?? [];
+}
+
+const FIRST_MOUNT_WAIT_MS = 10_000;
+const FIRST_MOUNT_POLL_MS = 250;
+let firstMountWait: Promise<boolean> | null = null;
+
+/**
+ * First-touch grace: a freshly provisioned sandbox can receive its first tool
+ * call while the sidecar is still attaching the mounts (~2-5s after the config
+ * relay), making the agent's very first `ls org/` race the mount. Wait once —
+ * shared across concurrent requests, deadline-bounded, fail-open (timeout →
+ * proceed without the link; the lazy hook self-heals on a later call). After
+ * this single window every request takes the cheap path, so a broken sidecar
+ * can never introduce a recurring stall.
+ */
+function waitForFirstMounts(): Promise<boolean> {
+  firstMountWait ??= (async () => {
+    const deadline = Date.now() + FIRST_MOUNT_WAIT_MS;
+    while (Date.now() < deadline) {
+      if ((await activeOrgFsMounts()).length > 0) return true;
+      await sleep(FIRST_MOUNT_POLL_MS);
+    }
+    orgFsLog(
+      `mounts not up after ${FIRST_MOUNT_WAIT_MS}ms; continuing without`,
+    );
+    return false;
+  })();
+  return firstMountWait;
+}
+
+/**
+ * Make the prompts' relative `org/...` paths resolve from the harness cwd
+ * (`<appRoot>/repo`) — see org-fs/repo-link.ts. Lazy + idempotent: called on
+ * every vm tool request, no-op while nothing is mounted, one lstat after.
+ */
+async function ensureOrgRepoLink(): Promise<void> {
+  if (!orgFsExpected) return;
+  if ((await activeOrgFsMounts()).length === 0) {
+    if (!(await waitForFirstMounts())) return;
+    if ((await activeOrgFsMounts()).length === 0) return;
+  }
+  await ensureRepoOrgLink(bootConfig.repoDir, orgFsLog);
+}
+
+// Last thread `org/output` points at. Owned by repointOutputLinkForRun so
+// EVERY caller (the /dispatch path and the vm-route x-thread-id header)
+// keeps it consistent with the actual symlink — a cache updated by only one
+// surface would let the other silently misroute writes across threads.
+let lastOutputThread: string | null = null;
+
+async function repointOutputLinkForRun(threadId: string): Promise<boolean> {
+  if (!orgFsExpected) return false;
+  if (threadId === lastOutputThread) {
+    // Link already points here; keep the repo link fresh (one lstat).
+    await ensureRepoOrgLink(bootConfig.repoDir, orgFsLog);
+    return true;
+  }
+  let mounts = await activeOrgFsMounts();
+  if (mounts.length === 0) {
+    if (!(await waitForFirstMounts())) return false;
+    mounts = await activeOrgFsMounts();
+    if (mounts.length === 0) return false;
+  }
+  await ensureRepoOrgLink(bootConfig.repoDir, orgFsLog);
+  // Uploads link is best-effort: sandboxes provisioned before the uploads
+  // volume existed have no .uploads mount, and inbound attachments flow
+  // through the mesh regardless — never fail the run over it.
+  const uploadsMountPath = join(bootConfig.appRoot, "org", ".uploads");
+  if (mounts.some((m) => m.mountPath === uploadsMountPath)) {
+    await repointUploadLink(bootConfig.appRoot, threadId, orgFsLog);
+  }
+  const outputsMountPath = join(bootConfig.appRoot, "org", ".outputs");
+  if (!mounts.some((m) => m.mountPath === outputsMountPath)) return false;
+  // Cache only a CONFIRMED repoint — repointOutputLink fails soft (logs and
+  // returns false), and caching a failure would pin the memo at this thread
+  // while the symlink still points at the PREVIOUS one, with no retry.
+  if (!(await repointOutputLink(bootConfig.appRoot, threadId, orgFsLog))) {
+    return false;
+  }
+  lastOutputThread = threadId;
+  return true;
+}
+
+let shuttingDown = false;
+async function shutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
   taskManager.shutdown();
   branchStatus.stop();
+  // Best-effort unmount before exit (rclone --daemon detaches, so it would
+  // otherwise outlive us). A truly abrupt SIGKILL skips this — the sync `exit`
+  // handler below and the next boot's reclaim are the backstops.
+  if (mountManager) {
+    await mountManager.stop().catch(() => {});
+  }
+  // Reuse the same publish() path as POST /_sandbox/git/publish so the
+  // shutdown sync inherits credentialed-remote setup, hook-skipping, and
+  // non-interactive push — the blind add/commit/push it replaced silently
+  // failed on GitHub repos whose origin URL lacked embedded credentials and
+  // could hang on a credential prompt until SIGKILL.
   const branch = store.read()?.git?.repository?.branch;
   if (branch) {
     try {
-      gitSync(["-c", "safe.directory=*", "add", "-A"], {
-        cwd: bootConfig.repoDir,
-      });
-      gitSync(
-        [
-          "-c",
-          "safe.directory=*",
-          "commit",
-          "-m",
-          `chore(daemon): sync all local changes to remote on shutdown`,
-        ],
-        { cwd: bootConfig.repoDir },
+      publish(
+        gitDeps,
+        "chore(daemon): sync all local changes to remote on shutdown",
       );
-      gitSync(["-c", "safe.directory=*", "push", "origin", branch], {
-        cwd: bootConfig.repoDir,
-      });
+    } catch (err) {
+      console.warn("[daemon] shutdown publish failed", err);
+    }
+  }
+  process.exit(0);
+}
+
+// SIGINT too: the user Ctrl-C'ing the `decocms link` terminal signals the whole
+// process group, and without a handler the default action skips the unmount —
+// leaving a stale macOS NFS mount that hangs and pops the reconnect dialog.
+process.on("SIGTERM", () => void shutdown());
+process.on("SIGINT", () => void shutdown());
+
+// Last-resort synchronous detach for any path that bypassed shutdown() (a raw
+// process.exit, or shutdown() not finishing). After stop() ran, list() is empty
+// so this is a no-op; it only does work on the residual exit path. `umount -f`
+// is the non-blocking force-detach — detaching the kernel mount is what stops
+// the hang/dialog; the orphaned rclone child then exits on its own.
+const isMac = process.platform === "darwin";
+process.on("exit", () => {
+  for (const { mountPath } of mountManager?.list() ?? []) {
+    try {
+      detachMount(mountPath, isMac);
     } catch {
       // best-effort
     }
   }
-  process.exit(0);
 });

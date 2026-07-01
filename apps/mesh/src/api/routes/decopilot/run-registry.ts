@@ -18,13 +18,21 @@ import { decide } from "./run-decider";
 import { project } from "./run-projector";
 import type { RunReactorDeps } from "./run-reactor";
 import { reactAll } from "./run-reactor";
-import type { Thread } from "@/storage/types";
+import { effectiveLastProgressAt, isRunStuck } from "./liveness";
 import { meter } from "@/observability";
 
 export type { RunReactorDeps };
 
 const REAP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const MAX_RUN_AGE_MS = 30 * 60 * 1000; // 30 minutes
+/**
+ * Idle timeout for the PROGRESS-based reaper. A run is reaped only after it has
+ * gone `RUN_IDLE_TIMEOUT_MS` with no progress (no `last_progress_at` bump and,
+ * as a fallback for runs that never bumped, no time since `startedAt`). This
+ * replaces the old absolute 30-min age cap so legitimate hours-long runs that
+ * keep streaming are never killed (A1), while a flapping run that resumes but
+ * makes no real progress still trips (A2).
+ */
+const RUN_IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 /** Events that mark a new inflight run. */
 const INFLIGHT_START_EVENTS = new Set(["RUN_STARTED", "RUN_RESUMED"]);
@@ -36,10 +44,30 @@ const INFLIGHT_END_EVENTS = new Set([
   "PREVIOUS_RUN_ABORTED",
 ]);
 
-const inflightRuns = meter.createUpDownCounter("decopilot.stream.inflight", {
-  description: "Number of in-flight decopilot stream requests",
-  unit: "{requests}",
-});
+// `meter` is a NoopMeter until initObservability() runs at bootstrap
+// (index.ts); this module is imported before that, so module-top instruments
+// bind the noop and never export. Create lazily on first use (post-init).
+const lazyInstrument = <T>(make: () => T): (() => T) => {
+  let v: T | undefined;
+  return () => (v ??= make());
+};
+
+const inflightRuns = lazyInstrument(() =>
+  meter.createUpDownCounter("decopilot.stream.inflight", {
+    description: "Number of in-flight decopilot stream requests",
+    unit: "{requests}",
+  }),
+);
+
+// I1: counter for reaper-forced run terminations — tagged by org.id and reason.
+// Incremented in reapStaleRuns whenever a stuck run is force-failed.
+const reapedRunsCounter = lazyInstrument(() =>
+  meter.createCounter("decopilot.run.reaped", {
+    description:
+      "Number of decopilot runs force-failed by the progress-based reaper",
+    unit: "{runs}",
+  }),
+);
 
 export class RunRegistry {
   private readonly states = new Map<string, RunState>();
@@ -47,13 +75,13 @@ export class RunRegistry {
 
   constructor(
     private readonly deps: RunReactorDeps,
-    private readonly podId: string,
     private readonly clock: () => Date = () => new Date(),
   ) {
-    this.reaperTimer = setInterval(
-      () => this.reapStaleRuns(),
-      REAP_INTERVAL_MS,
-    );
+    this.reaperTimer = setInterval(() => {
+      this.reapStaleRuns().catch((err) => {
+        console.error("[RunRegistry] Reaper sweep failed", err);
+      });
+    }, REAP_INTERVAL_MS);
   }
 
   /**
@@ -104,12 +132,12 @@ export class RunRegistry {
       // Update inflight metric — only decrement when this registry had a
       // running state; ghost FORCE_FAIL events have no prior increment.
       if (INFLIGHT_START_EVENTS.has(event.type)) {
-        inflightRuns.add(1, { "org.id": event.orgId });
+        inflightRuns().add(1, { "org.id": event.orgId });
       } else if (
         INFLIGHT_END_EVENTS.has(event.type) &&
         stateBeforeEvent?.status.tag === "running"
       ) {
-        inflightRuns.add(-1, { "org.id": event.orgId });
+        inflightRuns().add(-1, { "org.id": event.orgId });
       }
     }
 
@@ -140,108 +168,18 @@ export class RunRegistry {
   }
 
   /**
-   * Graceful shutdown: orphan all runs in the DB first (so they are resumable
-   * if the process dies), then abort in-memory controllers and clear state.
-   * The DB write MUST happen before states.clear() — if the process dies
-   * between clear() and the DB write, threads would be permanently stuck.
+   * Graceful shutdown: abort in-memory controllers (stops streamText loops and
+   * cancels the daemon via the run's abort path) and clear state. Recovery of an
+   * interrupted run is DBOS's job — the thread-gate workflow is durable and its
+   * dispatch step is retriable, so DBOS re-runs it on another executor.
    */
   async stopAll(): Promise<void> {
-    // 1. DB: orphan all runs owned by this pod FIRST
-    //    (if process dies after this, runs are resumable)
-    try {
-      await this.deps.storage.orphanRunsByPod(this.podId);
-    } catch (err) {
-      console.error("[RunRegistry] Failed to orphan runs in DB:", err);
-    }
-    // 2. In-memory: abort all controllers (stops streamText loops)
     for (const [, state] of this.states) {
       if (state.status.tag === "running") {
         state.status.abortController.abort();
       }
     }
-    // 3. In-memory: clear map
     this.states.clear();
-  }
-
-  /**
-   * Recover all orphaned runs on startup. Server crashes shouldn't
-   * punish users — every in-progress run gets resumed automatically.
-   * Concurrency is capped at 5 concurrent resumes.
-   */
-  async recoverOrphanedRuns(
-    resumeFn: (thread: Thread) => Promise<void>,
-  ): Promise<void> {
-    const orphans = await this.deps.storage.listOrphanedRuns(this.podId);
-    if (orphans.length === 0) return;
-
-    // Concurrency cap: max 5 concurrent resumes
-    const CONCURRENCY = 5;
-    for (let i = 0; i < orphans.length; i += CONCURRENCY) {
-      const batch = orphans.slice(i, i + CONCURRENCY);
-      await Promise.allSettled(
-        batch.map(async (thread) => {
-          const claimed = await this.deps.storage.claimOrphanedRun(
-            thread.id,
-            thread.organization_id,
-            this.podId,
-          );
-          if (!claimed) return; // Another pod got it
-
-          try {
-            await resumeFn(thread);
-          } catch (err) {
-            console.error(`[RunRegistry] Failed to resume ${thread.id}:`, err);
-            await this.deps.storage
-              .forceFailIfInProgress(thread.id, thread.organization_id)
-              .catch(() => {});
-          }
-        }),
-      );
-    }
-  }
-
-  /**
-   * Handle a dead pod notification from the heartbeat watcher. Finds all
-   * in-progress threads owned by the dead pod, broadcasts cancel (in case
-   * it's partitioned, not dead), then CAS-claims and resumes each orphan.
-   */
-  async handlePodDeath(
-    deadPodId: string,
-    resumeFn: (thread: Thread) => Promise<void>,
-    cancelBroadcast?: { broadcast(taskId: string): void },
-  ): Promise<void> {
-    const orphans = await this.deps.storage.listOrphanedRunsByPod(deadPodId);
-    if (orphans.length === 0) return;
-
-    // Cancel running threads on the dead pod (in case it's alive but partitioned)
-    for (const thread of orphans) {
-      cancelBroadcast?.broadcast(thread.id);
-    }
-
-    const CONCURRENCY = 5;
-    for (let i = 0; i < orphans.length; i += CONCURRENCY) {
-      const batch = orphans.slice(i, i + CONCURRENCY);
-      await Promise.allSettled(
-        batch.map(async (thread) => {
-          if (this.isRunning(thread.id)) return;
-          const claimed = await this.deps.storage.claimOrphanedRun(
-            thread.id,
-            thread.organization_id,
-            this.podId,
-          );
-          if (!claimed) return;
-
-          try {
-            await resumeFn(thread);
-          } catch (err) {
-            console.error(`[RunRegistry] Failed to resume ${thread.id}:`, err);
-            await this.deps.storage
-              .forceFailIfInProgress(thread.id, thread.organization_id)
-              .catch(() => {});
-          }
-        }),
-      );
-    }
   }
 
   /** Stop the reaper timer. Call once during server shutdown. */
@@ -252,24 +190,95 @@ export class RunRegistry {
     }
   }
 
-  private reapStaleRuns(): void {
+  /**
+   * Progress-based reaper. For each running run, read the thread's
+   * `last_progress_at` and force-fail only when `isRunStuck` — i.e. no progress
+   * within `RUN_IDLE_TIMEOUT_MS`. When `last_progress_at` is null (a brand-new
+   * run that hasn't streamed a chunk yet), the run's in-memory `startedAt` is
+   * the baseline, so a just-started run is never instakilled. A DB read failure
+   * is treated as "made progress" (skip) — the reaper must never kill a run on
+   * a transient storage blip.
+   *
+   * Async (the previous version was sync) because it reads progress per run;
+   * the timer fires it fire-and-forget.
+   */
+  private async reapStaleRuns(): Promise<void> {
     const now = this.clock().getTime();
-    for (const [taskId, state] of this.states) {
-      if (
-        state.status.tag === "running" &&
-        now - state.status.startedAt.getTime() > MAX_RUN_AGE_MS
-      ) {
-        console.warn(
-          `[RunRegistry] Reaping stale run for thread ${taskId} ...`,
-        );
-        this.execute({
-          type: "FORCE_FAIL",
+    // Snapshot to avoid mutating the map while iterating across awaits.
+    const running = [...this.states].filter(
+      ([, state]) => state.status.tag === "running",
+    );
+    for (const [taskId, state] of running) {
+      // Re-check liveness: the run may have finished during a prior await.
+      const current = this.states.get(taskId);
+      if (current?.status.tag !== "running") continue;
+
+      let lastProgressAt: number;
+      try {
+        const progress = await this.deps.storage.getProgress(
           taskId,
-          reason: "reaped",
-        }).catch((err) => {
-          console.error("[RunRegistry] Reaper execute failed", err);
+          state.orgId,
+        );
+        // Baseline when the run hasn't recorded progress yet: its in-memory
+        // start time. We use `state.status.startedAt` (this pod's clock, the
+        // same one the reaper reads `now` from) rather than the DB
+        // `run_started_at` (a wall-clock string written by whichever pod
+        // claimed the run) so the idle window is measured consistently and a
+        // brand-new run is never instakilled.
+        lastProgressAt = effectiveLastProgressAt({
+          persistedLastProgressAt: progress?.lastProgressAt ?? null,
+          currentRunStartedAt: state.status.startedAt.getTime(),
         });
+      } catch (err) {
+        // Storage blip — assume progress, skip this sweep for this run.
+        console.warn(
+          `[RunRegistry] Reaper progress read failed for ${taskId}; skipping`,
+          err,
+        );
+        continue;
       }
+
+      if (
+        !isRunStuck({ lastProgressAt, now, idleTimeoutMs: RUN_IDLE_TIMEOUT_MS })
+      )
+        continue;
+
+      // The durable status is authoritative: a desktop/link run is completed
+      // (or failed) by the projector OUT-OF-BAND, so its in-memory entry lingers
+      // as "running" with no in-process progress bumps. Such a run is finished,
+      // not stuck — evict the stale entry WITHOUT force-failing, so the reaper
+      // never overwrites a `completed` run with `failed`. A DB read failure
+      // falls through to the force-fail path (the reaper must still be able to
+      // kill a genuinely stuck run when storage is momentarily unavailable).
+      const durable = await this.deps.storage
+        .get(taskId, state.orgId)
+        .catch(() => null);
+      if (durable && durable.status !== "in_progress") {
+        const lingering = this.states.get(taskId);
+        if (lingering?.status.tag === "running") {
+          lingering.status.abortController.abort();
+        }
+        this.states.delete(taskId);
+        continue;
+      }
+
+      console.warn(
+        `[RunRegistry] Reaping stuck run for thread ${taskId} (idle > ${
+          RUN_IDLE_TIMEOUT_MS / 60_000
+        }m) ...`,
+      );
+      // I1: emit metric before force-fail so it's visible even if execute() throws.
+      reapedRunsCounter().add(1, {
+        "org.id": state.orgId,
+        reason: "idle_timeout",
+      });
+      await this.execute({
+        type: "FORCE_FAIL",
+        taskId,
+        reason: "reaped",
+      }).catch((err) => {
+        console.error("[RunRegistry] Reaper execute failed", err);
+      });
     }
   }
 }

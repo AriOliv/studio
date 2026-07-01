@@ -6,11 +6,12 @@
  * falling back to a live tools/list request on cache miss.
  */
 
-import type { MeshContext } from "@/core/mesh-context";
+import type { StudioContext } from "@/core/studio-context";
 import {
   type McpListCache,
   getMcpListCache,
   fetchWithCache,
+  REVALIDATE_MIN_INTERVAL_MS,
 } from "@/mcp-clients/mcp-list-cache";
 import type { ConnectionEntity } from "@/tools/connection/schema";
 import { AccessControl } from "@/core/access-control";
@@ -25,7 +26,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 const MCP_MESH_KEY = "mcp.mesh";
 
 interface AuthTransportOptions {
-  ctx: MeshContext;
+  ctx: StudioContext;
   connection: ConnectionEntity;
   superUser?: boolean;
   cache?: McpListCache;
@@ -100,6 +101,7 @@ export class AuthTransport extends WrapperTransport {
       },
       cache,
       (p) => this.options.ctx.pendingRevalidations.push(p),
+      REVALIDATE_MIN_INTERVAL_MS,
     );
 
     if (!tools) {
@@ -165,7 +167,6 @@ export class AuthTransport extends WrapperTransport {
     // org in the URL — e.g. owner of /api/foo with no/different active org
     // would otherwise lose the admin/owner bypass and 403 on every tool call.
     const connectionAccessControl = new AccessControl(
-      ctx.authInstance,
       ctx.auth.user?.id ?? ctx.auth.apiKey?.userId,
       toolName, // Tool being called
       ctx.boundAuth, // Bound auth client (encapsulates headers)

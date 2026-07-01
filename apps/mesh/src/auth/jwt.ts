@@ -9,7 +9,7 @@
  * If not set, a random secret is generated (not persistent across restarts).
  */
 
-import { decodeJwt, type JWTPayload, jwtVerify, SignJWT } from "jose";
+import { type JWTPayload, jwtVerify, SignJWT } from "jose";
 import { randomBytes } from "crypto";
 import { getSettings } from "../settings";
 
@@ -50,7 +50,6 @@ export interface MeshTokenPayload {
     id: string;
     email?: string;
     name?: string;
-    image?: string;
     role?: string;
   };
   /** Metadata */
@@ -113,19 +112,6 @@ export async function verifyMeshToken(
 }
 
 /**
- * Decode a mesh token without verification
- *
- * Use this when you just need to read the payload.
- * WARNING: Does not verify signature - do not trust for authorization!
- *
- * @param token - JWT string to decode
- * @returns Decoded payload
- */
-export function decodeMeshToken(token: string): MeshJwtPayload {
-  return decodeJwt<MeshTokenPayload>(token);
-}
-
-/**
  * Mint a gateway-compatible Mesh JWT for the given user.
  *
  * Uses the same MESH_JWT_SECRET and payload shape that the AI Gateway's
@@ -134,10 +120,12 @@ export function decodeMeshToken(token: string): MeshJwtPayload {
  * only need the user identity, not the full proxy-token metadata.
  *
  * @param userId - The authenticated user's ID
+ * @param email - The authenticated user's email (forwarded to Stripe checkout)
  * @param expiresIn - Expiration time in seconds (default: 1 hour)
  */
 export async function mintGatewayJwt(
   userId: string,
+  email?: string,
   expiresIn = 3600,
 ): Promise<string> {
   const settings = getSettings();
@@ -148,7 +136,11 @@ export async function mintGatewayJwt(
     );
   }
   const secret = new TextEncoder().encode(gwSecret);
-  return await new SignJWT({ iss: "mesh", sub: userId })
+  return await new SignJWT({
+    iss: "mesh",
+    sub: userId,
+    ...(email && { email }),
+  })
     .setProtectedHeader({ alg: "HS256", typ: "JWT" })
     .setIssuedAt()
     .setExpirationTime(Math.floor(Date.now() / 1000) + expiresIn)

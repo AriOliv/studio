@@ -6,22 +6,58 @@
  */
 
 import type { MiddlewareHandler } from "hono";
-import { SpanStatusCode, type Exception, type Span } from "@opentelemetry/api";
 import {
+  SpanStatusCode,
+  type Exception,
+  type Histogram,
+  type Span,
+} from "@opentelemetry/api";
+import {
+  meter,
   tracer,
   withRequest,
   reqCorrelationId,
   setCorrelationIdHeader,
 } from "./index";
 import type { Env } from "../api/hono-env";
+import { isHealthPath } from "../api/utils/paths";
+
+// Lazily created on first request: `meter` is a no-op until initObservability()
+// runs sdk.start(), so creating the instrument at module load would bind it to
+// the NoopMeter. The ESM live binding means reading `meter` here picks up the
+// real meter once it's reassigned.
+let _durationHistogram: Histogram | undefined;
+const durationHistogram = (): Histogram =>
+  (_durationHistogram ??= meter.createHistogram(
+    "http.server.request.duration",
+    {
+      description: "Duration of inbound HTTP requests handled by the API.",
+      unit: "s",
+      // We record seconds, so the boundaries must be seconds too. Without this
+      // advice the SDK applies its default millisecond boundaries (5, 10, …,
+      // 10000), into which every sub-5s request collapses — making the quantiles
+      // meaningless. These are the OTel HTTP semconv buckets for the metric.
+      advice: {
+        explicitBucketBoundaries: [
+          0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5,
+          10,
+        ],
+      },
+    },
+  ));
 
 /**
  * Tracing middleware that creates a span for each request
  * with common HTTP attributes and mesh-specific context.
  */
 export const tracingMiddleware: MiddlewareHandler<Env> = async (c, next) => {
+  if (isHealthPath(c.req.path)) {
+    return next();
+  }
+
   const req = c.req.raw;
   const url = new URL(req.url);
+  const start = performance.now();
 
   // Create context with request for sampling decisions
   const parentContext = withRequest(req);
@@ -75,14 +111,14 @@ export const tracingMiddleware: MiddlewareHandler<Env> = async (c, next) => {
         const meshContext = c.get("meshContext");
         if (meshContext) {
           if (meshContext.auth.user?.id) {
-            span.setAttribute("mesh.user.id", meshContext.auth.user.id);
+            span.setAttribute("studio.user.id", meshContext.auth.user.id);
           }
           if (meshContext.auth.apiKey?.id) {
-            span.setAttribute("mesh.api_key.id", meshContext.auth.apiKey.id);
+            span.setAttribute("studio.api_key.id", meshContext.auth.apiKey.id);
           }
           if (meshContext.organization?.id) {
             span.setAttribute(
-              "mesh.organization.id",
+              "studio.organization.id",
               meshContext.organization.id,
             );
           }
@@ -92,6 +128,15 @@ export const tracingMiddleware: MiddlewareHandler<Env> = async (c, next) => {
         if (correlationId) {
           setCorrelationIdHeader(c.res.headers, correlationId);
         }
+
+        // Latency histogram for Prometheus (the span carries the trace; this is
+        // the only HTTP-duration signal scraped at /metrics). Labelled by the
+        // matched route pattern — not the raw path — to keep cardinality bounded.
+        durationHistogram().record((performance.now() - start) / 1000, {
+          "http.request.method": req.method,
+          "http.route": c.req.routePath,
+          "http.response.status_code": status,
+        });
 
         span.end();
       }

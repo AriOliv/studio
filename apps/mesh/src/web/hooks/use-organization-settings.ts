@@ -1,19 +1,16 @@
-import {
-  SELF_MCP_ALIAS_ID,
-  useMCPClient,
-  useProjectContext,
-  WellKnownOrgMCPId,
-} from "@decocms/mesh-sdk";
+import { useProjectContext, WellKnownOrgMCPId } from "@decocms/mesh-sdk";
 import {
   useMutation,
   useQuery,
   useQueryClient,
-  useSuspenseQuery,
   type MutateOptions,
   type UseMutationResult,
   type UseQueryResult,
 } from "@tanstack/react-query";
+import { useRef } from "react";
 import { KEYS } from "@/web/lib/query-keys";
+import { callStudioTool, useStudioTools } from "@/web/lib/studio-tools";
+import type { ToolInput } from "@/tools/io-types";
 
 export type { SimpleModeTier } from "@/tools/organization/schema";
 import type { SimpleModeTier } from "@/tools/organization/schema";
@@ -63,9 +60,38 @@ const EMPTY_SIMPLE_MODE: SimpleModeConfig = {
     smart: null,
     thinking: null,
     image: null,
-    web_research: null,
+    web_search: null,
+    deep_research: null,
   },
 };
+
+/**
+ * Query options for the shared org-settings row. Shared by both the suspense
+ * and non-suspense hooks below and by parallel-prefetch batches, so all callers
+ * build the same query key + queryFn and read one cache entry.
+ */
+export function organizationSettingsQueryOptions(
+  orgSlug: string,
+  orgId: string,
+) {
+  return {
+    queryKey: KEYS.organizationSettings(orgId),
+    queryFn: async (): Promise<OrganizationSettings> => {
+      // GET is best-effort: a failed read falls back to empty settings rather
+      // than erroring the shell/home (the REST client throws on non-2xx).
+      try {
+        return (await callStudioTool(
+          orgSlug,
+          "ORGANIZATION_SETTINGS_GET",
+          {},
+        )) as OrganizationSettings;
+      } catch {
+        return { ...EMPTY_SETTINGS, organizationId: orgId };
+      }
+    },
+    staleTime: 60_000,
+  };
+}
 
 /**
  * Core query hook over the single shared `organization_settings` row.
@@ -76,67 +102,31 @@ function useOrganizationSettings<T = OrganizationSettings>(
   select?: (settings: OrganizationSettings) => T,
 ): UseQueryResult<T> {
   const { org } = useProjectContext();
-  const client = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
 
   return useQuery({
-    queryKey: KEYS.organizationSettings(org.id),
-    queryFn: async () => {
-      const result = (await client.callTool({
-        name: "ORGANIZATION_SETTINGS_GET",
-        arguments: {},
-      })) as { structuredContent?: OrganizationSettings; isError?: boolean };
-      if (result?.isError) {
-        return { ...EMPTY_SETTINGS, organizationId: org.id };
-      }
-      return (
-        result.structuredContent ?? {
-          ...EMPTY_SETTINGS,
-          organizationId: org.id,
-        }
-      );
-    },
-    staleTime: 60_000,
+    ...organizationSettingsQueryOptions(org.slug, org.id),
     select: select as (data: OrganizationSettings) => T,
   });
 }
 
 /**
- * Suspense variant used by shell-layout, which mounts ProjectContextProvider
- * and therefore can't call useProjectContext() yet — so it passes `orgId`
- * explicitly. Same query key as the non-suspense variant — shares the cache.
+ * Non-blocking shell read. Used by shell-layout, which mounts
+ * ProjectContextProvider and therefore can't call useProjectContext() yet — so
+ * it passes `orgId`/`orgSlug` explicitly. Same query key as the other variants.
+ *
+ * Deliberately non-suspense: the shell must NOT block its whole subtree
+ * (sidebar, home, tiles) on the org-settings round-trip. `enabled_plugins` is
+ * the only field consumed downstream and every consumer is null-safe, so we
+ * render immediately with `null` and let the value fill in when the query
+ * resolves.
  */
-export function useOrganizationSettingsSuspense(
+export function useOrganizationSettingsNonBlocking(
   orgId: string,
   orgSlug: string,
-): OrganizationSettings {
-  const client = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId,
-    orgSlug,
-  });
+): OrganizationSettings | null {
+  const { data } = useQuery(organizationSettingsQueryOptions(orgSlug, orgId));
 
-  const { data } = useSuspenseQuery({
-    queryKey: KEYS.organizationSettings(orgId),
-    queryFn: async () => {
-      const result = (await client.callTool({
-        name: "ORGANIZATION_SETTINGS_GET",
-        arguments: {},
-      })) as { structuredContent?: OrganizationSettings; isError?: boolean };
-      if (result?.isError) {
-        return { ...EMPTY_SETTINGS, organizationId: orgId };
-      }
-      return (
-        result.structuredContent ?? { ...EMPTY_SETTINGS, organizationId: orgId }
-      );
-    },
-    staleTime: 60_000,
-  });
-
-  return data;
+  return data ?? null;
 }
 
 type OrgSettingsUpdateInput = Partial<
@@ -150,46 +140,28 @@ type OrgSettingsUpdateInput = Partial<
   >
 >;
 
-type ToolErrorEnvelope = {
-  isError?: boolean;
-  content?: Array<{ type?: string; text?: string }>;
-};
-
 /**
  * Core mutation hook. Accepts any subset of updatable org-settings fields.
  * On success, writes the full returned row into the shared cache entry so
- * every consumer sees fresh data without a refetch.
+ * every consumer sees fresh data without a refetch. Module-local — consumed by
+ * the field-specific hooks below.
  */
-export function useUpdateOrganizationSettings(): UseMutationResult<
+function useUpdateOrganizationSettings(): UseMutationResult<
   OrganizationSettings,
   Error,
   OrgSettingsUpdateInput
 > {
   const { org } = useProjectContext();
-  const client = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
+  const studio = useStudioTools();
   const queryClient = useQueryClient();
 
   return useMutation({
     mutationFn: async (input: OrgSettingsUpdateInput) => {
-      const result = (await client.callTool({
-        name: "ORGANIZATION_SETTINGS_UPDATE",
-        arguments: {
-          organizationId: org.id,
-          ...input,
-        },
-      })) as {
-        structuredContent?: OrganizationSettings;
-      } & ToolErrorEnvelope;
-      if (result?.isError) {
-        throw new Error(
-          result.content?.[0]?.text ?? "Failed to update organization settings",
-        );
-      }
-      const payload = result.structuredContent;
+      // Throws on non-2xx (validation/auth/etc.) — no silent false success.
+      const payload = (await studio.call("ORGANIZATION_SETTINGS_UPDATE", {
+        organizationId: org.id,
+        ...input,
+      } as ToolInput<"ORGANIZATION_SETTINGS_UPDATE">)) as OrganizationSettings;
       if (!payload) {
         throw new Error("ORGANIZATION_SETTINGS_UPDATE returned no payload");
       }
@@ -220,7 +192,8 @@ function normalizeSimpleMode(cfg: SimpleModeConfig | null): SimpleModeConfig {
       smart: cfg.tiers.smart ?? null,
       thinking: cfg.tiers.thinking ?? null,
       image: cfg.tiers.image ?? null,
-      web_research: cfg.tiers.web_research ?? null,
+      web_search: cfg.tiers.web_search ?? null,
+      deep_research: cfg.tiers.deep_research ?? null,
     },
   };
 }
@@ -277,7 +250,7 @@ export function useDefaultHomeAgents(): DefaultHomeAgentsConfig | null {
   return data ?? null;
 }
 
-export function useUpdateDefaultHomeAgents() {
+function useUpdateDefaultHomeAgents() {
   const mutation = useUpdateOrganizationSettings();
   return {
     ...mutation,
@@ -290,6 +263,69 @@ export function useUpdateDefaultHomeAgents() {
       options?: OrgSettingsMutateOptions,
     ) => mutation.mutateAsync({ default_home_agents: config }, options),
   };
+}
+
+export interface HomeAgentsWriter {
+  /** The freshest id list, read live from the cache (not a render snapshot). */
+  currentIds: () => string[];
+  /**
+   * Queue a write. `transform` receives the freshest id list and returns the
+   * next one, or `null` to skip (no-op guards like "already on home").
+   */
+  apply: (transform: (ids: string[]) => string[] | null) => Promise<void>;
+}
+
+/**
+ * Serialized, optimistic writer for `default_home_agents`.
+ *
+ * Both the home board and the manage-home drawer mutate this same ordered list,
+ * often via rapid clicks (add / remove / reorder). Three guarantees keep that
+ * safe — and are why callers must go through here instead of touching the cache
+ * and mutation directly:
+ *  - each write derives its next id list from the *live* cache, never a
+ *    render-time snapshot, so concurrent edits can't clobber each other;
+ *  - writes run strictly in order (a per-instance promise chain), so two
+ *    in-flight requests can't reach the server out of order and commit stale ids;
+ *  - the cache is patched optimistically and rolled back if the write fails.
+ */
+export function useHomeAgentsWriter(): HomeAgentsWriter {
+  const { org } = useProjectContext();
+  const update = useUpdateDefaultHomeAgents();
+  const queryClient = useQueryClient();
+  const chain = useRef<Promise<unknown>>(Promise.resolve());
+  const key = KEYS.organizationSettings(org.id);
+
+  const currentIds = (): string[] =>
+    queryClient.getQueryData<OrganizationSettings>(key)?.default_home_agents
+      ?.ids ?? [];
+
+  const apply = (
+    transform: (ids: string[]) => string[] | null,
+  ): Promise<void> => {
+    const run = chain.current.then(async () => {
+      const snapshot = queryClient.getQueryData<OrganizationSettings>(key);
+      const next = transform(snapshot?.default_home_agents?.ids ?? []);
+      if (next === null) return;
+      queryClient.setQueryData<OrganizationSettings | undefined>(key, (prev) =>
+        prev ? { ...prev, default_home_agents: { ids: next } } : prev,
+      );
+      try {
+        await update.mutateAsync({ ids: next });
+        await queryClient.refetchQueries({
+          queryKey: KEYS.homeNextActions(org.slug),
+          type: "active",
+        });
+      } catch (err) {
+        queryClient.setQueryData(key, snapshot);
+        throw err;
+      }
+    });
+    // Keep the chain alive even when a write rejects, so later writes still run.
+    chain.current = run.catch(() => {});
+    return run;
+  };
+
+  return { currentIds, apply };
 }
 
 export function useIsRegistryEnabled(): (connectionId: string) => boolean {

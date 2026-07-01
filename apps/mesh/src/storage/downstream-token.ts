@@ -24,8 +24,11 @@ import { generatePrefixedId } from "@/shared/utils/generate-id";
  */
 export interface DownstreamTokenData {
   connectionId: string;
-  /** Null for shared tokens; user id for per-user tokens. */
-  userId: string | null;
+  /**
+   * Null (or omitted) for shared tokens; a user id for per-user tokens.
+   * Optional so shared-token callers don't have to spell out `userId: null`.
+   */
+  userId?: string | null;
   accessToken: string;
   refreshToken: string | null;
   scope: string | null;
@@ -46,7 +49,7 @@ export interface DownstreamTokenStoragePort {
    */
   get(
     connectionId: string,
-    userId: string | null,
+    userId?: string | null,
   ): Promise<DownstreamToken | null>;
 
   /**
@@ -57,7 +60,7 @@ export interface DownstreamTokenStoragePort {
   /**
    * Delete the token for a (connection, user) pair.
    */
-  delete(connectionId: string, userId: string | null): Promise<void>;
+  delete(connectionId: string, userId?: string | null): Promise<void>;
 
   /**
    * Delete every token attached to a connection (shared + all per-user
@@ -82,7 +85,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
 
   async get(
     connectionId: string,
-    userId: string | null,
+    userId: string | null = null,
   ): Promise<DownstreamToken | null> {
     const base = this.db
       .selectFrom("downstream_tokens")
@@ -111,6 +114,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
     const encryptedClientSecret = data.clientSecret
       ? await this.vault.encrypt(data.clientSecret)
       : null;
+    const tokenUserId = data.userId ?? null;
 
     // Use transaction to prevent race conditions during upsert
     return await this.db.transaction().execute(async (trx) => {
@@ -120,8 +124,8 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
         .select(["id", "createdAt"])
         .where("connectionId", "=", data.connectionId);
 
-      const existing = await (data.userId
-        ? existingBase.where("userId", "=", data.userId)
+      const existing = await (tokenUserId
+        ? existingBase.where("userId", "=", tokenUserId)
         : existingBase.where("userId", "is", null)
       ).executeTakeFirst();
 
@@ -145,7 +149,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
         return {
           id: existing.id,
           connectionId: data.connectionId,
-          userId: data.userId,
+          userId: tokenUserId,
           accessToken: data.accessToken,
           refreshToken: data.refreshToken,
           scope: data.scope,
@@ -166,7 +170,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
         .values({
           id,
           connectionId: data.connectionId,
-          userId: data.userId,
+          userId: tokenUserId,
           accessToken: encryptedAccessToken,
           refreshToken: encryptedRefreshToken,
           scope: data.scope,
@@ -182,7 +186,7 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
       return {
         id,
         connectionId: data.connectionId,
-        userId: data.userId,
+        userId: tokenUserId,
         accessToken: data.accessToken,
         refreshToken: data.refreshToken,
         scope: data.scope,
@@ -196,7 +200,10 @@ export class DownstreamTokenStorage implements DownstreamTokenStoragePort {
     });
   }
 
-  async delete(connectionId: string, userId: string | null): Promise<void> {
+  async delete(
+    connectionId: string,
+    userId: string | null = null,
+  ): Promise<void> {
     const base = this.db
       .deleteFrom("downstream_tokens")
       .where("connectionId", "=", connectionId);

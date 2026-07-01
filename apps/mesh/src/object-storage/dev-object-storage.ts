@@ -48,10 +48,24 @@ export class DevObjectStorage implements BoundObjectStorage {
     private readonly baseUrl?: string,
   ) {}
 
-  async get(key: string): Promise<GetObjectResult | GetObjectTooLargeResult> {
+  async getBytesOrPresign(
+    key: string,
+    opts: { presignWhenLargerThan: number; presignExpiresIn?: number },
+  ): Promise<GetObjectResult | GetObjectTooLargeResult> {
     const path = filePath(this.orgId, key);
     const info = await stat(path);
     const contentType = detectContentType(key);
+
+    if (info.size > opts.presignWhenLargerThan) {
+      return {
+        error: "FILE_TOO_LARGE",
+        size: info.size,
+        maxInlineSize: opts.presignWhenLargerThan,
+        presignedUrl: await this.presignedGetUrl(key),
+        contentType,
+      };
+    }
+
     const bytes = await readFile(path);
     const isText = isTextContentType(contentType);
 
@@ -64,6 +78,11 @@ export class DevObjectStorage implements BoundObjectStorage {
       size: info.size,
       lastModified: info.mtime,
     };
+  }
+
+  async getBytes(key: string): Promise<Uint8Array> {
+    const bytes = await readFile(filePath(this.orgId, key));
+    return new Uint8Array(bytes);
   }
 
   async put(
@@ -173,14 +192,26 @@ export class DevObjectStorage implements BoundObjectStorage {
    * AI SDK and vision models reject localhost URLs, so we inline the bytes
    * instead of generating an HMAC-signed redirect to /api/dev-assets/.
    * The /api/dev-assets/ route is still used by external clients (e.g. the UI)
-   * via the stable redirect endpoint (/api/:org/files/:key).
+   * via the stable files endpoint (/api/:org/files/:key).
    */
-  async presignedGetUrl(key: string): Promise<string> {
+  async presignedGetUrl(
+    key: string,
+    _expiresIn?: number,
+    opts?: { requireFetchable?: boolean },
+  ): Promise<string> {
+    if (opts?.requireFetchable) {
+      // DevObjectStorage only produces inline data: URLs, which a remote daemon
+      // cannot fetch. Throw before reading/encoding the (possibly large) blob.
+      throw new Error(
+        "object storage returned a not fetchable (data:) URL; configure real S3/R2/MinIO for large-payload offload",
+      );
+    }
     const path = filePath(this.orgId, key);
     const bytes = await readFile(path);
     const contentType = detectContentType(key);
     const base64 = Buffer.from(bytes).toString("base64");
-    return `data:${contentType};base64,${base64}`;
+    const url = `data:${contentType};base64,${base64}`;
+    return url;
   }
 
   async presignedPutUrl(key: string, expiresIn = 3600): Promise<string> {

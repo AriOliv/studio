@@ -1,7 +1,19 @@
+---
+name: pptx
+description: Read and inspect existing .pptx PowerPoint files (text, speaker notes, slide images). Use only for reading uploaded PowerPoint files — to AUTHOR a deck use the slides skill instead.
+---
+
 # pptx — PowerPoint presentations
 
 Reading and inspection of `.pptx` files. Editing and creation are not yet
 supported.
+
+> **Making a presentation, slide deck, or "slides"?** This is NOT the
+> skill — use the **`slides`** skill (`org/public/core/slides/SKILL.md`),
+> which authors HTML decks with a live, editable preview. Reach for `pptx`
+> ONLY when the user explicitly works with a PowerPoint `.pptx` file —
+> reading one they uploaded, or when they specifically ask for `.pptx`
+> output (not yet supported here).
 
 ## Quick reference
 

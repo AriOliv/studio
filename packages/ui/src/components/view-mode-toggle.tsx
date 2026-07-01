@@ -19,7 +19,7 @@ type ViewModeSize = "sm" | "md" | "lg";
 interface ViewModeToggleProps<T extends string = string> {
   value: T;
   onValueChange: (value: T) => void;
-  options: [ViewModeOption<T>, ViewModeOption<T>];
+  options: Array<ViewModeOption<T>>;
   size?: ViewModeSize;
   fullWidth?: boolean;
   className?: string;
@@ -28,14 +28,17 @@ interface ViewModeToggleProps<T extends string = string> {
 const sizeConfig = {
   sm: {
     button: "size-7",
+    buttonWithLabel: "h-7",
     icon: "size-4",
   },
   md: {
     button: "size-9",
+    buttonWithLabel: "h-9",
     icon: "size-5",
   },
   lg: {
     button: "size-12",
+    buttonWithLabel: "h-12",
     icon: "size-6",
   },
 };
@@ -48,29 +51,24 @@ export function ViewModeToggle<T extends string = string>({
   fullWidth = false,
   className,
 }: ViewModeToggleProps<T>) {
-  const firstRef = useRef<HTMLButtonElement>(null);
-  const secondRef = useRef<HTMLButtonElement>(null);
+  const buttonRefsRef = useRef<(HTMLButtonElement | null)[]>([]);
   const [indicatorPosition, setIndicatorPosition] = useState({
     left: 0,
     width: 0,
     opacity: 0,
   });
 
-  const updateIndicator = (ref: React.RefObject<HTMLButtonElement | null>) => {
-    if (!ref.current) return;
-    const { offsetLeft, offsetWidth } = ref.current;
-    setIndicatorPosition({
-      left: offsetLeft,
-      width: offsetWidth,
-      opacity: 1,
-    });
-  };
-
   // Initialize indicator position based on current value
   // oxlint-disable-next-line ban-use-effect/ban-use-effect
   useEffect(() => {
-    const ref = value === options[0].value ? firstRef : secondRef;
-    updateIndicator(ref);
+    const idx = options.findIndex((o) => o.value === value);
+    const el = buttonRefsRef.current[idx];
+    if (!el) return;
+    setIndicatorPosition({
+      left: el.offsetLeft,
+      width: el.offsetWidth,
+      opacity: 1,
+    });
   }, [value, options]);
 
   const config = sizeConfig[size];
@@ -78,17 +76,21 @@ export function ViewModeToggle<T extends string = string>({
   return (
     <div className={cn("relative flex gap-0 bg-muted rounded-lg", className)}>
       {options.map((option, i) => {
-        const ref = i === 0 ? firstRef : secondRef;
         const btn = (
           <button
-            ref={ref}
+            ref={(el) => {
+              buttonRefsRef.current[i] = el;
+            }}
             key={option.value}
             type="button"
             onClick={() => onValueChange(option.value)}
             className={cn(
               "relative z-10 flex items-center justify-center gap-2 rounded-lg transition-colors [transition-timing-function:var(--ease-out-cubic)] duration-200",
-              fullWidth ? "flex-1 h-12 px-4" : config.button,
-              !fullWidth && option.label ? "px-3" : "",
+              fullWidth
+                ? "flex-1 h-12 px-4"
+                : option.label
+                  ? cn(config.buttonWithLabel, "px-3")
+                  : config.button,
             )}
           >
             <span

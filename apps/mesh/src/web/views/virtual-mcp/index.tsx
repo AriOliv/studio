@@ -1,3 +1,4 @@
+import { formatDistanceToNow } from "date-fns";
 import { generatePrefixedId } from "@/shared/utils/generate-id";
 import type { VirtualMCPEntity } from "@/tools/virtual/schema";
 import { getUIResourceUri } from "@/mcp-apps/types.ts";
@@ -5,7 +6,6 @@ import { useChatStream } from "@/web/components/chat/context";
 import { buildImprovePromptDoc } from "@/web/components/chat/tiptap/build-improve-prompt-doc";
 import { EmptyState } from "@/web/components/empty-state.tsx";
 import { ErrorBoundary } from "@/web/components/error-boundary";
-import { useEnsureStudioPack } from "@/web/components/home/use-ensure-studio-pack";
 import { IntegrationIcon } from "@/web/components/integration-icon.tsx";
 import { usePanelActions } from "@/web/layouts/shell-layout";
 import { User } from "@/web/components/user/user";
@@ -16,7 +16,7 @@ import {
   isConnectionAuthenticated,
 } from "@/web/lib/mcp-oauth";
 import { KEYS } from "@/web/lib/query-keys";
-import { unwrapToolResult } from "@/web/lib/unwrap-tool-result";
+import { useStudioTools } from "@/web/lib/studio-tools";
 import { getConnectionSlug } from "@/shared/utils/connection-slug";
 import {
   AlertDialog,
@@ -55,15 +55,15 @@ import {
 import { cn } from "@deco/ui/lib/utils.ts";
 import {
   type ConnectionEntity,
-  SELF_MCP_ALIAS_ID,
+  ENV_VAR_KEY_RE,
   StudioPackAgentId,
   useConnection,
   useConnectionActions,
   useConnections,
-  useMCPClient,
   useProjectContext,
   useVirtualMCP,
   useVirtualMCPActions,
+  useVirtualMCPsLastUsed,
 } from "@decocms/mesh-sdk";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -74,6 +74,8 @@ import {
   Maximize01,
   Play,
   Plus,
+  Power01,
+  SlashCircle01,
   Stars01,
   Trash01,
   XClose,
@@ -86,6 +88,8 @@ import { IconPicker } from "../../components/icon-picker";
 import { SimpleIconPicker } from "../../components/simple-icon-picker";
 import { Page } from "@/web/components/page";
 import { AddConnectionDialog } from "./add-connection-dialog";
+import { FilesSection } from "./files-section";
+import { SubAgentsSection } from "./sub-agents-section";
 import { track } from "@/web/lib/posthog-client";
 import { DependencySelectionDialog } from "./dependency-selection-dialog";
 import { ALL_ITEMS_SELECTED } from "./selection-utils";
@@ -96,10 +100,16 @@ import {
 } from "./types";
 import { VirtualMCPShareModal } from "./virtual-mcp-share-modal";
 import { getActiveGithubRepo } from "@/web/lib/github-repo";
+import {
+  agentHasClonableSource,
+  agentHasConnectedGithub,
+} from "@/web/lib/agent-capabilities";
+import { DevAgentSetup } from "@/web/components/dev-agent/dev-agent-setup.tsx";
 import { FIXED_SYSTEM_TABS } from "@/web/layouts/main-panel-tabs/tab-id";
 import { toTitleCase } from "@/web/components/chat/message/parts/tool-call-part/utils";
-import { RepoRow } from "@/web/components/vm/runtime-card/repo-row";
-import { RuntimeFields } from "@/web/components/vm/runtime-card/runtime-fields";
+import { EnvVarsField } from "@/web/components/sandbox/runtime-card/env-vars-field";
+import { RepoRow } from "@/web/components/sandbox/runtime-card/repo-row";
+import { RuntimeFields } from "@/web/components/sandbox/runtime-card/runtime-fields";
 
 type DialogState = {
   shareDialogOpen: boolean;
@@ -181,6 +191,42 @@ function editSessionReducer(
 }
 
 /**
+ * Drops in-progress / invalid env rows from the autosave payload. A row is
+ * stripped when: key is empty, key fails the shell-portable regex, or it's a
+ * secret-kind row with no secretId. The partial/invalid row stays in form
+ * state so the user can keep editing; the server-side Zod schema would
+ * reject these anyway and we'd surface a noisy validation error on every
+ * keystroke without this filter.
+ */
+function stripIncompleteEnvEntries(
+  data: VirtualMcpFormData,
+): VirtualMcpFormData {
+  const env = data.metadata?.runtime?.env;
+  if (!env || env.length === 0) return data;
+  const cleaned = env.filter((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    const key = ((entry as { key?: string }).key ?? "").trim();
+    if (!key || !ENV_VAR_KEY_RE.test(key)) return false;
+    if (entry.kind === "literal") return true;
+    if (entry.kind === "secret") {
+      return Boolean((entry as { secretId?: string }).secretId);
+    }
+    return false;
+  });
+  if (cleaned.length === env.length) return data;
+  return {
+    ...data,
+    metadata: {
+      ...data.metadata,
+      runtime: {
+        ...(data.metadata?.runtime ?? {}),
+        env: cleaned,
+      },
+    },
+  };
+}
+
+/**
  * Connection Item - Card layout inspired by the reference design:
  * Body: icon + name + description (clickable → connection detail page)
  * Footer: instance selector + resources summary + edit (resource config) + remove
@@ -219,6 +265,7 @@ function ConnectionItem({
         connectionDescription={connection.description}
         connectionIcon={connection.icon}
         connectionType={connection.connection_type}
+        connectionStatus={connection.status}
         slug={slug}
         orgSlug={org.slug}
         appName={connection.app_name}
@@ -362,6 +409,7 @@ function ConnectionItemWithAuth({
   connectionDescription,
   connectionIcon,
   connectionType,
+  connectionStatus,
   slug,
   orgSlug,
   appName,
@@ -377,6 +425,7 @@ function ConnectionItemWithAuth({
   connectionDescription?: string | null;
   connectionIcon?: string | null;
   connectionType: string;
+  connectionStatus: ConnectionEntity["status"];
   slug: string;
   orgSlug: string;
   appName?: string | null;
@@ -388,15 +437,33 @@ function ConnectionItemWithAuth({
   onNewInstance?: () => void;
 }) {
   const authStatus = useMCPAuthStatus({ connectionId: connection_id });
+  const connectionActions = useConnectionActions();
   const isVirtual = connectionType === "VIRTUAL";
   const needsAuth =
     !isVirtual && authStatus.supportsOAuth && !authStatus.isAuthenticated;
+  const isDisabled = connectionStatus !== "active";
+
+  const toggleStatus = async (status: "active" | "inactive") => {
+    try {
+      await connectionActions.update.mutateAsync({
+        id: connection_id,
+        data: { status },
+      });
+      toast.success(
+        status === "active" ? "Connection enabled" : "Connection disabled",
+      );
+    } catch {
+      toast.error("Failed to update connection");
+    }
+  };
 
   return (
     <div
       className={cn(
         "rounded-xl border overflow-hidden transition-colors",
-        needsAuth ? "border-destructive/50 bg-destructive/5" : "border-border",
+        needsAuth || isDisabled
+          ? "border-destructive/50 bg-destructive/5"
+          : "border-border bg-card",
       )}
     >
       {/* Body — clickable, navigates to connection detail */}
@@ -420,6 +487,10 @@ function ConnectionItemWithAuth({
             <span className="text-xs text-destructive font-medium">
               Needs authorization
             </span>
+          ) : isDisabled ? (
+            <span className="text-xs text-destructive font-medium">
+              {connectionStatus === "error" ? "Disabled (error)" : "Disabled"}
+            </span>
           ) : (
             connectionDescription && (
               <p className="text-xs text-muted-foreground truncate">
@@ -440,6 +511,20 @@ function ConnectionItemWithAuth({
             }}
           >
             Authorize
+          </Button>
+        ) : isDisabled ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs gap-1.5 shrink-0"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              toggleStatus("active");
+            }}
+          >
+            <Power01 size={13} />
+            Enable
           </Button>
         ) : (
           <Tooltip delayDuration={0}>
@@ -481,6 +566,22 @@ function ConnectionItemWithAuth({
             </TooltipTrigger>
             <TooltipContent side="bottom">Configure resources</TooltipContent>
           </Tooltip>
+          {!isDisabled && (
+            <Tooltip delayDuration={0}>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 text-muted-foreground"
+                  onClick={() => toggleStatus("inactive")}
+                  aria-label="Disable connection"
+                >
+                  <SlashCircle01 size={13} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Disable</TooltipContent>
+            </Tooltip>
+          )}
           <Tooltip delayDuration={0}>
             <TooltipTrigger asChild>
               <Button
@@ -557,7 +658,9 @@ function ConnectionItemSkeleton() {
 
 interface UITool {
   name: string;
+  title?: string;
   description?: string;
+  resourceUri: string;
 }
 
 interface PinnedView {
@@ -584,12 +687,7 @@ function LayoutTabContent({
   form: VirtualMcpFormReturn;
   flushAndSave: () => Promise<unknown>;
 }) {
-  const { org } = useProjectContext();
-  const client = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
+  const studio = useStudioTools();
 
   const virtualMcp = useVirtualMCP(virtualMcpId);
 
@@ -604,24 +702,21 @@ function LayoutTabContent({
       const results = await Promise.all(
         connectionIds.map(async (connId) => {
           try {
-            const result = await client.callTool({
-              name: "COLLECTION_CONNECTIONS_GET",
-              arguments: { id: connId },
+            const { item } = await studio.call("COLLECTION_CONNECTIONS_GET", {
+              id: connId,
             });
-            const { item } = unwrapToolResult<{
-              item: {
-                title?: string;
-                icon?: string | null;
-                tools?: Array<{
-                  name: string;
-                  description?: string;
-                  _meta?: Record<string, unknown>;
-                }> | null;
-              } | null;
-            }>(result);
-            const uiTools: UITool[] = (item?.tools ?? [])
-              .filter((t) => !!getUIResourceUri(t._meta))
-              .map((t) => ({ name: t.name, description: t.description }));
+            const uiTools: UITool[] = (item?.tools ?? []).flatMap((t) => {
+              const resourceUri = getUIResourceUri(t._meta);
+              if (!resourceUri) return [];
+              return [
+                {
+                  name: t.name,
+                  title: t.title,
+                  description: t.description,
+                  resourceUri,
+                },
+              ];
+            });
             return {
               fetchOk: true,
               id: connId,
@@ -658,7 +753,6 @@ function LayoutTabContent({
   const layoutMeta = form.watch("metadata.ui.layout") ?? null;
   const currentDefaultMain = layoutMeta?.defaultMainView ?? null;
   const chatDefaultOpen = layoutMeta?.chatDefaultOpen ?? false;
-
   // Convert the stored {type, id, toolName} object into the string composite
   // key used by the <Select> UI. Legacy tab types fold into "settings".
   const defaultMainView = (() => {
@@ -764,12 +858,15 @@ function LayoutTabContent({
         writeLayout({ defaultMainView: { type: "chat" } });
       }
     } else {
+      const toolTitle = connectionsData
+        .find((c) => c.id === connectionId)
+        ?.uiTools.find((t) => t.name === toolName)?.title;
       writePinned([
         ...pinnedViews,
         {
           connectionId,
           toolName,
-          label: toTitleCase(toolName),
+          label: toolTitle ?? toTitleCase(toolName),
           icon: null,
         },
       ]);
@@ -819,20 +916,20 @@ function LayoutTabContent({
   const noInteractiveTools =
     connectionsWithTools && connectionsData.length === 0;
 
-  // Check if virtual MCP has an active GitHub repo (enables preview)
-  const hasGithubRepo = !!getActiveGithubRepo(virtualMcp);
+  // Preview is available whenever the agent has a clonable source —
+  // either a Start Website template or a connected GitHub repo — matching
+  // the gating in `use-main-panel-tabs.ts`.
+  const hasClonableSource = agentHasClonableSource(virtualMcp?.metadata);
 
   // Build options for the default main view selector.
   // Order mirrors the right-panel tab order in the unified chat layout:
   // Chat (no main panel), then fixed system tabs, then pinned ext-apps.
-  // Terminal and Preview are gated behind an active GitHub repo,
-  // matching the gating in main-panel-tabs/index.tsx.
   const defaultMainOptions: { value: string; label: string }[] = [
     { value: "chat", label: "Chat" },
     { value: "settings", label: "Settings" },
     { value: "automations", label: "Automations" },
   ];
-  if (hasGithubRepo) {
+  if (hasClonableSource) {
     defaultMainOptions.push({ value: "preview", label: "Preview" });
   }
   for (const pv of pinnedViews) {
@@ -987,7 +1084,7 @@ function LayoutTabContent({
                                   value={
                                     pinned && pinnedView
                                       ? pinnedView.label
-                                      : toTitleCase(tool.name)
+                                      : (tool.title ?? toTitleCase(tool.name))
                                   }
                                   onChange={(e) =>
                                     handleLabelChange(
@@ -1038,13 +1135,11 @@ function VirtualMcpDetailViewWithData({
 }) {
   const { org } = useProjectContext();
   const actions = useVirtualMCPActions();
+  const { data: lastUsedMap } = useVirtualMCPsLastUsed([virtualMcp.id]);
+  const lastUsedAt = lastUsedMap?.get(virtualMcp.id)?.last_used_at;
   const connectionActions = useConnectionActions();
   const queryClient = useQueryClient();
-  const client = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
+  const studio = useStudioTools();
 
   // Form setup
   const form = useForm<VirtualMcpFormData>({
@@ -1055,10 +1150,10 @@ function VirtualMcpDetailViewWithData({
   // Watch connections for reactive UI
   const connections = form.watch("connections");
 
-  // GitHub repo connected — instructions become read-only
-  const hasGithubRepo = !!getActiveGithubRepo(virtualMcp);
+  // GitHub repo connected (real auth) — instructions become read-only
+  const hasGithubRepo = agentHasConnectedGithub(virtualMcp);
 
-  // Repo info for the Runtime card (same source as hasGithubRepo)
+  // Repo info for the Runtime card (display-only — loose check is intentional)
   const githubRepoForRuntimeCard = getActiveGithubRepo(virtualMcp);
   const runtimeCardRepo = githubRepoForRuntimeCard
     ? {
@@ -1080,7 +1175,6 @@ function VirtualMcpDetailViewWithData({
   const [isImproving, setIsImproving] = useState(false);
   const { createNewTask, setChatOpen } = usePanelActions();
   const { sendMessage } = useChatStream();
-  const ensureStudioPack = useEnsureStudioPack();
 
   const handleImprovePrompt = async () => {
     if (isImproving) return;
@@ -1094,8 +1188,6 @@ function VirtualMcpDetailViewWithData({
         agent_id: virtualMcp.id,
         instructions_length: currentInstructions.length,
       });
-
-      await ensureStudioPack(["studio-agent-manager"]);
 
       setChatOpen(true);
 
@@ -1169,9 +1261,14 @@ function VirtualMcpDetailViewWithData({
     // current form values; only _defaultValues advances.
     form.reset(formData, { keepValues: true });
 
+    // Strip in-progress env rows (no key, or kind=secret with no secretId).
+    // The partial row stays in the form state so the user keeps editing it,
+    // but the request body only carries entries the server schema accepts.
+    const payload = stripIncompleteEnvEntries(formData);
+
     await actions.update.mutateAsync({
       id: virtualMcp.id,
-      data: formData,
+      data: payload,
     });
 
     // Accumulate into the current edit session and (re)schedule a flush
@@ -1280,13 +1377,9 @@ function VirtualMcpDetailViewWithData({
 
     // We need the full connection entity to clone from
     try {
-      const result = await client.callTool({
-        name: "COLLECTION_CONNECTIONS_GET",
-        arguments: { id: connectionId },
+      const { item: base } = await studio.call("COLLECTION_CONNECTIONS_GET", {
+        id: connectionId,
       });
-      const { item: base } = (result.structuredContent ?? {}) as {
-        item: ConnectionEntity | null;
-      };
       if (!base) return;
 
       const baseName = base.title.replace(/\s*\(.*?\)\s*$/, "");
@@ -1488,7 +1581,7 @@ Define step-by-step how the agent should handle requests.
                       size="sm"
                       onClick={handleTestAgent}
                     >
-                      <Play size={14} className="!size-[14px]" />
+                      <Play size={14} className="size-[14px]!" />
                       Test Agent
                     </Button>
                     <Button
@@ -1528,7 +1621,6 @@ Define step-by-step how the agent should handle requests.
                     size="md"
                     className="shrink-0"
                     avatarClassName="[&_svg]:w-1/2 [&_svg]:h-1/2"
-                    disabled={hasGithubRepo}
                   />
                 )}
               />
@@ -1614,19 +1706,26 @@ Define step-by-step how the agent should handle requests.
             </div>
 
             {/* Creator metadata */}
-            <div className="flex items-center gap-2 -mt-6 text-muted-foreground">
+            <div className="flex items-center gap-2 -mt-6 text-sm text-muted-foreground">
               <User
                 id={virtualMcp.created_by}
                 size="2xs"
                 className="text-sm text-muted-foreground"
               />
-              <span className="text-muted-foreground/50 text-sm">·</span>
-              <span className="text-sm">
+              <span className="text-muted-foreground/50">·</span>
+              <span>
+                Created{" "}
                 {new Date(virtualMcp.created_at).toLocaleDateString("en-US", {
                   month: "short",
                   day: "numeric",
                   year: "numeric",
                 })}
+              </span>
+              <span className="text-muted-foreground/50">·</span>
+              <span>
+                {lastUsedAt
+                  ? `Last used ${formatDistanceToNow(new Date(lastUsedAt), { addSuffix: true })}`
+                  : "Never used"}
               </span>
             </div>
 
@@ -1696,31 +1795,29 @@ Define step-by-step how the agent should handle requests.
                 <h2 className="text-sm font-medium text-foreground">
                   Instructions
                 </h2>
-                {!hasGithubRepo && (
-                  <div className="flex items-center gap-2">
-                    {!form.watch("metadata.instructions")?.trim() && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={handleInsertTemplate}
-                      >
-                        + Prompt template
-                      </Button>
-                    )}
+                <div className="flex items-center gap-2">
+                  {!form.watch("metadata.instructions")?.trim() && (
                     <Button
                       variant="outline"
                       size="sm"
-                      disabled={
-                        isImproving ||
-                        !form.watch("metadata.instructions")?.trim()
-                      }
-                      onClick={handleImprovePrompt}
+                      onClick={handleInsertTemplate}
                     >
-                      <Stars01 size={13} />
-                      Improve
+                      + Prompt template
                     </Button>
-                  </div>
-                )}
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={
+                      isImproving ||
+                      !form.watch("metadata.instructions")?.trim()
+                    }
+                    onClick={handleImprovePrompt}
+                  >
+                    <Stars01 size={13} />
+                    Improve
+                  </Button>
+                </div>
               </div>
               <Controller
                 name="metadata.instructions"
@@ -1737,7 +1834,6 @@ Define step-by-step how the agent should handle requests.
                         field.onBlur();
                         flushAndSave();
                       }}
-                      disabled={hasGithubRepo}
                       placeholder="Define how this agent should behave, what tone to use, any constraints or guidelines..."
                       className="min-h-[200px] max-h-[360px] overflow-auto resize-none text-base text-muted-foreground placeholder:text-muted-foreground/40 leading-relaxed border-0 shadow-none px-4 py-3 pr-11 focus-visible:ring-0 focus-visible:ring-offset-0 bg-transparent"
                       style={{ boxShadow: "none" }}
@@ -1762,12 +1858,34 @@ Define step-by-step how the agent should handle requests.
               />
             </section>
 
+            {/* Files section — files attached to the agent as reference */}
+            <FilesSection form={form} />
+
+            {/* Sub-agents section — delegation allowlist for the subtask tool */}
+            <ErrorBoundary fallback={() => null}>
+              <Suspense
+                fallback={
+                  <section className="flex flex-col gap-3">
+                    <h2 className="text-sm font-medium text-foreground">
+                      Sub-agents
+                    </h2>
+                    <div className="h-16 rounded-lg border border-dashed border-border animate-pulse" />
+                  </section>
+                }
+              >
+                <SubAgentsSection form={form} currentAgentId={virtualMcp.id} />
+              </Suspense>
+            </ErrorBoundary>
+
             {/* Layout section */}
             <LayoutTabContent
               virtualMcpId={virtualMcp.id}
               form={form}
               flushAndSave={flushAndSave}
             />
+
+            {/* Development agent section (link a dev counterpart) */}
+            <DevAgentSetup virtualMcp={virtualMcp} />
 
             {/* Sandbox section */}
             <div className="flex flex-col gap-3">
@@ -1778,6 +1896,12 @@ Define step-by-step how the agent should handle requests.
                 <CardContent className="p-0 space-y-5">
                   <RepoRow repo={runtimeCardRepo} />
                   <RuntimeFields control={form.control} />
+                  <EnvVarsField
+                    control={form.control}
+                    form={form}
+                    virtualMcpId={virtualMcp.id}
+                    orgSlug={org.slug}
+                  />
                 </CardContent>
               </Card>
             </div>

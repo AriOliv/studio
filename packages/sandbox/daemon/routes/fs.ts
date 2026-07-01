@@ -4,7 +4,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
 import { safePath } from "../paths";
-import { parseBase64JsonBody, jsonResponse } from "./body-parser";
+import { parseJsonBody, jsonResponse } from "./body-parser";
 
 /**
  * Wall-clock cap for fetches in write_from_url / upload_to_url.
@@ -23,6 +23,12 @@ export interface FsDeps {
    * bash's cwd.
    */
   repoDir: string;
+  /**
+   * Called after a successful write/edit to the working tree (not a git
+   * checkout or remote change). Lets the daemon refresh branch dirty state
+   * without waiting for the `.git/` watcher poll.
+   */
+  onWorkingTreeWrite?: (path: string) => void;
 }
 
 function spawnOpts(
@@ -103,9 +109,14 @@ function resolveReadPath(
 
 export function makeReadHandler(deps: FsDeps) {
   return async (req: Request): Promise<Response> => {
-    let body: { path?: string; offset?: number; limit?: number };
+    let body: {
+      path?: string;
+      offset?: number;
+      limit?: number;
+      full?: boolean;
+    };
     try {
-      body = (await parseBase64JsonBody(req)) as typeof body;
+      body = (await parseJsonBody(req)) as typeof body;
     } catch (e) {
       return jsonResponse({ error: (e as Error).message }, 400);
     }
@@ -161,8 +172,8 @@ export function makeReadHandler(deps: FsDeps) {
 
     const raw = fs.readFileSync(filePath, "utf-8");
     const lines = raw.split("\n");
-    const offset = Math.max(1, body.offset ?? 1);
-    const limit = body.limit ?? 2000;
+    const offset = body.full ? 1 : Math.max(1, body.offset ?? 1);
+    const limit = body.full ? lines.length : (body.limit ?? 2000);
     const slice = lines.slice(offset - 1, offset - 1 + limit);
     const numbered = slice.map((l, i) => `${offset + i}\t${l}`).join("\n");
     return jsonResponse({
@@ -177,7 +188,7 @@ export function makeWriteHandler(deps: FsDeps) {
   return async (req: Request): Promise<Response> => {
     let body: { path?: string; content?: string };
     try {
-      body = (await parseBase64JsonBody(req)) as typeof body;
+      body = (await parseJsonBody(req)) as typeof body;
     } catch (e) {
       return jsonResponse({ error: (e as Error).message }, 400);
     }
@@ -187,10 +198,140 @@ export function makeWriteHandler(deps: FsDeps) {
     if (!filePath) return jsonResponse({ error: "Path escapes app root" }, 400);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.writeFileSync(filePath, body.content, "utf-8");
+    deps.onWorkingTreeWrite?.(body.path ?? "");
     return jsonResponse({
       ok: true,
       bytesWritten: Buffer.byteLength(body.content, "utf-8"),
     });
+  };
+}
+
+/**
+ * Delete a file or directory inside the workspace. Symmetric with `write` —
+ * same safePath clamp, same onWorkingTreeWrite signal so the branch
+ * dirty-state recomputes. Idempotent (returns ok with `existed: false`
+ * for a missing path) so the client can retry without races.
+ */
+export function makeUnlinkHandler(deps: FsDeps) {
+  return async (req: Request): Promise<Response> => {
+    let body: { path?: string; recursive?: boolean };
+    try {
+      body = (await parseJsonBody(req)) as typeof body;
+    } catch (e) {
+      return jsonResponse({ error: (e as Error).message }, 400);
+    }
+    if (!body.path || typeof body.path !== "string")
+      return jsonResponse({ error: "path is required" }, 400);
+    const normalized = body.path.replaceAll("\\", "/");
+    const unlinkError = assertUnlinkAllowed(
+      normalized,
+      body.recursive === true,
+    );
+    if (unlinkError) {
+      return jsonResponse({ error: unlinkError }, 400);
+    }
+    const filePath = safePath(deps.appRoot, deps.repoDir, body.path);
+    if (!filePath) return jsonResponse({ error: "Path escapes app root" }, 400);
+    let existed = true;
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.isDirectory()) {
+        if (!body.recursive) {
+          return jsonResponse(
+            { error: "Refusing to unlink directory without recursive: true" },
+            400,
+          );
+        }
+        fs.rmSync(filePath, { recursive: true, force: true });
+      } else {
+        fs.unlinkSync(filePath);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        existed = false;
+      } else {
+        return jsonResponse({ error: (err as Error).message }, 500);
+      }
+    }
+    if (existed) deps.onWorkingTreeWrite?.(body.path ?? "");
+    return jsonResponse({ ok: true, existed });
+  };
+}
+
+export function makeMkdirHandler(deps: FsDeps) {
+  return async (req: Request): Promise<Response> => {
+    let body: { path?: string };
+    try {
+      body = (await parseJsonBody(req)) as typeof body;
+    } catch (e) {
+      return jsonResponse({ error: (e as Error).message }, 400);
+    }
+    if (!body.path || typeof body.path !== "string")
+      return jsonResponse({ error: "path is required" }, 400);
+    const normalized = body.path.replaceAll("\\", "/");
+    if (!normalized || normalized.includes("..")) {
+      return jsonResponse({ error: "Invalid path" }, 400);
+    }
+    const dirPath = safePath(deps.appRoot, deps.repoDir, body.path);
+    if (!dirPath) return jsonResponse({ error: "Path escapes app root" }, 400);
+    try {
+      fs.mkdirSync(dirPath, { recursive: true });
+    } catch (err) {
+      return jsonResponse({ error: (err as Error).message }, 500);
+    }
+    deps.onWorkingTreeWrite?.(body.path);
+    return jsonResponse({ ok: true });
+  };
+}
+
+export function makeRenameHandler(deps: FsDeps) {
+  return async (req: Request): Promise<Response> => {
+    let body: { from?: string; to?: string };
+    try {
+      body = (await parseJsonBody(req)) as typeof body;
+    } catch (e) {
+      return jsonResponse({ error: (e as Error).message }, 400);
+    }
+    if (!body.from || typeof body.from !== "string")
+      return jsonResponse({ error: "from is required" }, 400);
+    if (!body.to || typeof body.to !== "string")
+      return jsonResponse({ error: "to is required" }, 400);
+    const fromNormalized = body.from.replaceAll("\\", "/");
+    const toNormalized = body.to.replaceAll("\\", "/");
+    if (
+      !fromNormalized ||
+      !toNormalized ||
+      fromNormalized.includes("..") ||
+      toNormalized.includes("..")
+    ) {
+      return jsonResponse({ error: "Invalid path" }, 400);
+    }
+    const fromPath = safePath(deps.appRoot, deps.repoDir, body.from);
+    const toPath = safePath(deps.appRoot, deps.repoDir, body.to);
+    if (!fromPath || !toPath) {
+      return jsonResponse({ error: "Path escapes app root" }, 400);
+    }
+    try {
+      fs.statSync(fromPath);
+    } catch {
+      return jsonResponse({ error: `Path not found: ${body.from}` }, 400);
+    }
+    try {
+      fs.statSync(toPath);
+      return jsonResponse({ error: `Path already exists: ${body.to}` }, 400);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        return jsonResponse({ error: (err as Error).message }, 500);
+      }
+    }
+    try {
+      fs.mkdirSync(path.dirname(toPath), { recursive: true });
+      fs.renameSync(fromPath, toPath);
+    } catch (err) {
+      return jsonResponse({ error: (err as Error).message }, 500);
+    }
+    deps.onWorkingTreeWrite?.(body.to!);
+    return jsonResponse({ ok: true });
   };
 }
 
@@ -203,7 +344,7 @@ export function makeEditHandler(deps: FsDeps) {
       replace_all?: boolean;
     };
     try {
-      body = (await parseBase64JsonBody(req)) as typeof body;
+      body = (await parseJsonBody(req)) as typeof body;
     } catch (e) {
       return jsonResponse({ error: (e as Error).message }, 400);
     }
@@ -240,7 +381,12 @@ export function makeEditHandler(deps: FsDeps) {
       ? content.replaceAll(body.old_string, body.new_string)
       : content.replace(body.old_string, body.new_string);
     fs.writeFileSync(filePath, updated, "utf-8");
-    return jsonResponse({ ok: true, replacements: replaceAll ? count : 1 });
+    deps.onWorkingTreeWrite?.(body.path ?? "");
+    return jsonResponse({
+      ok: true,
+      replacements: replaceAll ? count : 1,
+      content: updated,
+    });
   };
 }
 
@@ -256,7 +402,7 @@ export function makeGrepHandler(deps: FsDeps) {
       limit?: number;
     };
     try {
-      body = (await parseBase64JsonBody(req)) as typeof body;
+      body = (await parseJsonBody(req)) as typeof body;
     } catch (e) {
       return jsonResponse({ error: (e as Error).message }, 400);
     }
@@ -347,7 +493,7 @@ export function makeWriteFromUrlHandler(deps: FsDeps) {
   return async (req: Request): Promise<Response> => {
     let body: { path?: string; url?: string };
     try {
-      body = (await parseBase64JsonBody(req)) as typeof body;
+      body = (await parseJsonBody(req)) as typeof body;
     } catch (e) {
       return jsonResponse({ error: (e as Error).message }, 400);
     }
@@ -452,7 +598,7 @@ export function makeUploadToUrlHandler(deps: FsDeps) {
   return async (req: Request): Promise<Response> => {
     let body: { path?: string; url?: string; contentType?: string };
     try {
-      body = (await parseBase64JsonBody(req)) as typeof body;
+      body = (await parseJsonBody(req)) as typeof body;
     } catch (e) {
       return jsonResponse({ error: (e as Error).message }, 400);
     }
@@ -544,14 +690,176 @@ const GLOB_EXCLUDE_DIRS = new Set([
   "build",
   ".turbo",
   ".cache",
+  ".ssh",
+  ".aws",
+  ".gnupg",
 ]);
-const GLOB_RESULT_LIMIT = 1000;
+/** Default cap for agent glob calls. */
+export const GLOB_RESULT_LIMIT = 1000;
+/** Hard ceiling when callers pass an explicit `limit` (file explorer). */
+export const GLOB_MAX_RESULT_LIMIT = 10_000;
+
+export function pathSegmentDepth(relPath: string): number {
+  return relPath.split("/").filter(Boolean).length;
+}
+
+/** Register repo-relative ancestor directories up to `maxDepth`. */
+export function registerGlobAncestorDirectories(
+  repoRelativePath: string,
+  maxDepth: number,
+  directoryPaths: Set<string>,
+  isFile: boolean,
+): void {
+  const parts = repoRelativePath.split("/").filter(Boolean);
+  const dirParts = isFile ? parts.slice(0, -1) : parts;
+  for (let i = 1; i <= Math.min(dirParts.length, maxDepth); i++) {
+    directoryPaths.add(dirParts.slice(0, i).join("/"));
+  }
+}
+
+export function resolveGlobResultLimit(limit: unknown): number {
+  if (limit === undefined || limit === null) return GLOB_RESULT_LIMIT;
+  const n = typeof limit === "number" ? limit : Number(limit);
+  if (!Number.isFinite(n) || n < 1) return GLOB_RESULT_LIMIT;
+  return Math.min(Math.floor(n), GLOB_MAX_RESULT_LIMIT);
+}
+
+function repoRelativePrefix(searchPath: string, repoDir: string): string {
+  if (searchPath === repoDir) return "";
+  return path.relative(repoDir, searchPath).replace(/\\/g, "/");
+}
+
+function joinRepoRelative(prefix: string, name: string): string {
+  return prefix ? `${prefix}/${name}` : name;
+}
+
+type GlobScanState = {
+  filePaths: string[];
+  directoryPaths: Set<string>;
+  resultLimit: number;
+};
+
+/** Depth-bounded directory walk — avoids scanning the full tree for maxDepth. */
+function walkRepoWithinMaxDepth(
+  absDir: string,
+  repoRelDir: string,
+  maxDepth: number,
+  state: GlobScanState,
+): boolean {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(absDir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  for (const entry of entries) {
+    const childRel = joinRepoRelative(repoRelDir, entry.name);
+    if (!isGlobPathAllowed(childRel)) continue;
+    if (entry.isSymbolicLink()) continue;
+
+    const depth = pathSegmentDepth(childRel);
+
+    if (entry.isDirectory()) {
+      if (depth > maxDepth) {
+        registerGlobAncestorDirectories(
+          childRel,
+          maxDepth,
+          state.directoryPaths,
+          false,
+        );
+        continue;
+      }
+      state.directoryPaths.add(childRel);
+      if (depth < maxDepth) {
+        const childAbs = path.join(absDir, entry.name);
+        if (walkRepoWithinMaxDepth(childAbs, childRel, maxDepth, state)) {
+          return true;
+        }
+      }
+    } else if (entry.isFile()) {
+      if (depth > maxDepth) {
+        registerGlobAncestorDirectories(
+          childRel,
+          maxDepth,
+          state.directoryPaths,
+          true,
+        );
+        continue;
+      }
+      state.filePaths.push(childRel);
+      if (state.filePaths.length >= state.resultLimit) return true;
+    }
+  }
+  return false;
+}
+
+function isGlobPathAllowed(rel: string): boolean {
+  for (const seg of rel.split("/")) {
+    if (GLOB_EXCLUDE_DIRS.has(seg)) return false;
+  }
+  return true;
+}
+
+/** Paths that must not be deleted via the sandbox unlink API. */
+function assertUnlinkAllowed(
+  normalized: string,
+  recursive: boolean,
+): string | null {
+  if (!normalized || normalized.includes("..")) return "Invalid path";
+  if (recursive && (normalized === "." || normalized === "")) {
+    return "Refusing to recursively delete the repository root";
+  }
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.includes(".git")) {
+    return "Refusing to delete .git";
+  }
+  return null;
+}
+
+function toRepoRelativePath(
+  abs: string,
+  searchPath: string,
+  repoDir: string,
+): string {
+  return abs.startsWith(`${repoDir}/`)
+    ? abs.slice(repoDir.length + 1)
+    : abs.startsWith(`${searchPath}/`)
+      ? abs.slice(searchPath.length + 1)
+      : abs;
+}
+
+/** Empty directories have no nested files and no nested directories in the scan. */
+export function collectEmptyDirectories(
+  filePaths: readonly string[],
+  directoryPaths: readonly string[],
+): string[] {
+  const dirSet = new Set(directoryPaths);
+  const empty: string[] = [];
+  for (const dir of directoryPaths) {
+    if (!dir) continue;
+    const prefix = `${dir}/`;
+    const hasNestedFile = filePaths.some((file) => file.startsWith(prefix));
+    const hasNestedDirectory = [...dirSet].some(
+      (other) => other !== dir && other.startsWith(prefix),
+    );
+    if (!hasNestedFile && !hasNestedDirectory) {
+      empty.push(dir);
+    }
+  }
+  return empty;
+}
 
 export function makeGlobHandler(deps: FsDeps) {
   return async (req: Request): Promise<Response> => {
-    let body: { pattern?: string; path?: string };
+    let body: {
+      pattern?: string;
+      path?: string;
+      limit?: number;
+      maxDepth?: number;
+    };
     try {
-      body = (await parseBase64JsonBody(req)) as typeof body;
+      body = (await parseJsonBody(req)) as typeof body;
     } catch (e) {
       return jsonResponse({ error: (e as Error).message }, 400);
     }
@@ -563,28 +871,76 @@ export function makeGlobHandler(deps: FsDeps) {
     if (!searchPath)
       return jsonResponse({ error: "Path escapes app root" }, 400);
 
+    const resultLimit = resolveGlobResultLimit(body.limit);
+    const maxDepth =
+      body.maxDepth === undefined || body.maxDepth === null
+        ? undefined
+        : Math.max(1, Math.floor(body.maxDepth));
+
     // Bun.Glob — no external binary dependency. Returns paths relative
     // to `cwd`, which we re-anchor to repoDir for consistent UX.
-    const glob = new Bun.Glob(body.pattern);
-    const files: string[] = [];
+    const filePaths: string[] = [];
+    const directoryPaths = new Set<string>();
+    let truncated = false;
     try {
-      for await (const rel of glob.scan({
-        cwd: searchPath,
-        onlyFiles: true,
-        followSymlinks: false,
-      })) {
-        if (rel.split("/").some((seg) => GLOB_EXCLUDE_DIRS.has(seg))) continue;
-        const abs = path.join(searchPath, rel);
-        files.push(
-          abs.startsWith(`${deps.repoDir}/`)
-            ? abs.slice(deps.repoDir.length + 1)
-            : abs,
+      if (maxDepth !== undefined && body.pattern === "**/*") {
+        const state: GlobScanState = {
+          filePaths,
+          directoryPaths,
+          resultLimit,
+        };
+        truncated = walkRepoWithinMaxDepth(
+          searchPath,
+          repoRelativePrefix(searchPath, deps.repoDir),
+          maxDepth,
+          state,
         );
-        if (files.length >= GLOB_RESULT_LIMIT) break;
+      } else {
+        const glob = new Bun.Glob(body.pattern);
+        for await (const rel of glob.scan({
+          cwd: searchPath,
+          onlyFiles: false,
+          followSymlinks: false,
+          dot: true,
+        })) {
+          if (!isGlobPathAllowed(rel)) continue;
+          const abs = path.join(searchPath, rel);
+          let relPath: string;
+          try {
+            const stat = fs.statSync(abs);
+            relPath = toRepoRelativePath(abs, searchPath, deps.repoDir);
+            const depth = pathSegmentDepth(relPath);
+            if (maxDepth !== undefined && depth > maxDepth) {
+              registerGlobAncestorDirectories(
+                relPath,
+                maxDepth,
+                directoryPaths,
+                stat.isFile(),
+              );
+              continue;
+            }
+            if (stat.isDirectory()) {
+              directoryPaths.add(relPath);
+            } else if (stat.isFile()) {
+              filePaths.push(relPath);
+            }
+          } catch {
+            continue;
+          }
+          if (filePaths.length >= resultLimit) {
+            truncated = true;
+            break;
+          }
+        }
       }
     } catch (e) {
       return jsonResponse({ error: (e as Error).message }, 500);
     }
-    return jsonResponse({ files });
+    const directories = collectEmptyDirectories(filePaths, [...directoryPaths]);
+    return jsonResponse({
+      files: filePaths,
+      directories,
+      ...(truncated ? { truncated: true } : {}),
+    });
   };
 }

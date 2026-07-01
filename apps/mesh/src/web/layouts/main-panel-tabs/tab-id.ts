@@ -8,6 +8,9 @@
  *   - Expanded-from-chat: <toolName> (from task.metadata.expanded_tools)
  *   - Pinned view: "app:<connectionId>:<toolName>" (from metadata.ui.pinnedViews)
  *   - Ephemeral automation: "automation:<id>"
+ *   - Ephemeral file preview: "file:<encoded output key>" (thread output viewer)
+ *   - Ephemeral deck preview: "deck:<encoded home-volume path>" (slides skill)
+ *   - Ephemeral Library file preview: "library-file:<encoded browse path>"
  *   - "0" = closed sentinel (not an actual tab id)
  *
  * The "settings" tab bundles what used to be separate instructions,
@@ -67,14 +70,108 @@ export function parsePinnedViewTabId(
   return { connectionId, toolName };
 }
 
+export interface DeckTabParsed {
+  /** Home-volume-relative deck path, e.g. `decks/q3-launch.html`. */
+  path: string;
+}
+
+/** Paths carry `/`, so the tab id encodes them to keep the
+ *  `<kind>:<rest>` grammar unambiguous in the `?main=` URL param. */
+export function formatDeckTabId(path: string): string {
+  return `deck:${encodeURIComponent(path)}`;
+}
+
+export function parseDeckTabId(
+  tabId: string | undefined,
+): DeckTabParsed | null {
+  if (!tabId || !tabId.startsWith("deck:")) return null;
+  const encoded = tabId.slice("deck:".length);
+  if (!encoded) return null;
+  try {
+    return { path: decodeURIComponent(encoded) };
+  } catch {
+    return null;
+  }
+}
+
+export interface FileTabParsed {
+  /** Thread-output key: an S3 key ("model-outputs/<threadId>/x.pdf") or an
+   *  org-fs ref ("org-fs:outputs/<threadId>/x.pdf") — same shape the
+   *  thread-outputs endpoint returns. */
+  key: string;
+}
+
+/** Keys carry `/` and `:`, so the tab id encodes them to keep the
+ *  `<kind>:<rest>` grammar unambiguous in the `?main=` URL param. */
+export function formatFileTabId(key: string): string {
+  return `file:${encodeURIComponent(key)}`;
+}
+
+export function parseFileTabId(
+  tabId: string | undefined,
+): FileTabParsed | null {
+  if (!tabId || !tabId.startsWith("file:")) return null;
+  const encoded = tabId.slice("file:".length);
+  if (!encoded) return null;
+  try {
+    return { key: decodeURIComponent(encoded) };
+  } catch {
+    return null;
+  }
+}
+
+export interface LibraryFileTabParsed {
+  /** Library browse path, e.g. `home/docs/a.md` or `public/core/a.ts`. */
+  path: string;
+}
+
+/** Browse paths carry `/`, so the tab id encodes them to keep the
+ *  `<kind>:<rest>` grammar unambiguous in the `?main=` URL param. */
+export function formatLibraryFileTabId(path: string): string {
+  return `library-file:${encodeURIComponent(path)}`;
+}
+
+export function parseLibraryFileTabId(
+  tabId: string | undefined,
+): LibraryFileTabParsed | null {
+  if (!tabId || !tabId.startsWith("library-file:")) return null;
+  const encoded = tabId.slice("library-file:".length);
+  if (!encoded) return null;
+  try {
+    return { path: decodeURIComponent(encoded) };
+  } catch {
+    return null;
+  }
+}
+
 export const FIXED_SYSTEM_TABS = [
   "settings",
   "automations",
   "preview",
+  "content",
   "git",
 ] as const;
 
 const FIXED_SYSTEM_TAB_SET = new Set<string>(FIXED_SYSTEM_TABS);
+
+/**
+ * Returns true for tab ids that are scoped to a specific thread and must not
+ * be carried across task switches:
+ *   - "app:<connectionId>:<toolName>"  (expanded tool / pinned view)
+ *   - "automation:<id>"               (ephemeral automation detail)
+ *   - "file:<encoded key>"            (ephemeral thread-output file preview)
+ *   - "deck:<encoded path>"           (ephemeral HTML-artifact preview/editor)
+ *   - "library-file:<encoded path>"   (ephemeral org Library file preview)
+ */
+export function isPerThreadTab(tabId: string): boolean {
+  return (
+    tabId.startsWith("app:") ||
+    tabId.startsWith("automation:") ||
+    tabId.startsWith("file:") ||
+    tabId.startsWith("deck:") ||
+    tabId.startsWith("library-file:")
+  );
+}
 
 /**
  * Legacy tab ids that were merged into the unified "settings" tab. Kept

@@ -6,6 +6,7 @@ import {
   RECONNECT_ERROR,
   refreshAndStore,
 } from "@/oauth/token-refresh";
+import { getRepoScope } from "@/shared/github-repo-scope";
 import { DownstreamTokenStorage } from "../../storage/downstream-token";
 
 const GITHUB_API = "https://api.github.com";
@@ -38,6 +39,27 @@ export const GITHUB_LIST_USER_ORGS = defineTool({
   }),
   handler: async (input, ctx) => {
     await ctx.access.check();
+
+    // Connection-ownership guard: confirm the named connection belongs to the
+    // caller's org before reading its token. Mirrors the guard in
+    // POST /connections/:id/oauth-token. Without this, any member could read
+    // another org's GitHub token by passing its connectionId.
+    const organizationId = ctx.organization?.id;
+    if (!organizationId) {
+      throw new Error("Organization context required");
+    }
+    const connection = await ctx.storage.connections.findById(
+      input.connectionId,
+      organizationId,
+    );
+    if (!connection) {
+      throw new Error("Connection not found");
+    }
+    if (getRepoScope(connection)) {
+      throw new Error(
+        "Repo-scoped connections cannot list installations — use an org-level mcp-github connection",
+      );
+    }
 
     const tokenStorage = new DownstreamTokenStorage(ctx.db, ctx.vault);
     let token = await tokenStorage.get(input.connectionId, null);

@@ -1,3 +1,4 @@
+import { sleep } from "@decocms/std";
 import { existsSync, readdirSync } from "node:fs";
 import { isSyntheticBranch } from "../constants";
 import type { Config } from "../types";
@@ -39,7 +40,9 @@ function runStep(cmd: string, deps: CloneDeps): Promise<number> {
     ...deps,
     onChunk: (src, data) => deps.onChunk(src, normalizeCarriageReturns(data)),
   };
-  return spawnSetupStep(cmd, normalized.onChunk, deps.dropPrivileges);
+  return spawnSetupStep(cmd, normalized.onChunk, {
+    dropPrivileges: deps.dropPrivileges,
+  });
 }
 
 const TRANSIENT_ERRORS = [
@@ -61,10 +64,6 @@ const CLONE_RETRY_DELAY_MS = 3000;
 
 function isTransient(output: string): boolean {
   return TRANSIENT_ERRORS.some((e) => output.includes(e));
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function runNetworkStep(cmd: string, deps: CloneDeps): Promise<number> {
@@ -112,7 +111,11 @@ export async function spawnClone(deps: CloneDeps): Promise<number> {
     return 1;
   }
 
-  const gc = `git -c safe.directory='*' -c credential.helper= -c http.connectTimeout=10 -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10`;
+  // GIT_TERMINAL_PROMPT=0 + GIT_ASKPASS=true: refuse to ever prompt for
+  // credentials. Without this the PTY makes git think it has a terminal, so
+  // a private repo without credentials hangs forever instead of failing fast.
+  // Public repos clone fine — no prompt is needed in the first place.
+  const gc = `GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git -c safe.directory='*' -c credential.helper= -c http.connectTimeout=10 -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10`;
   const dir = config.repoDir;
 
   const requestedBranch = config.git?.repository?.branch;

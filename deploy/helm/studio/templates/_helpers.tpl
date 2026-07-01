@@ -38,6 +38,21 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{/*
+Pod-template labels — same as .labels but WITHOUT helm.sh/chart. The chart label
+carries the chart version, so putting it on a pod template makes every chart
+version bump change the template hash and roll ALL deployments. Keep it on
+Deployment metadata (.labels), not the pod template, so a version bump only
+rolls a Deployment whose actual pod spec changed.
+*/}}
+{{- define "chart-deco-studio.podLabels" -}}
+{{ include "chart-deco-studio.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/*
 Selector labels
 */}}
 {{- define "chart-deco-studio.selectorLabels" -}}
@@ -116,8 +131,34 @@ Global validations to ensure scaling requirements are met.
 {{- if and .Values.autoscaling.enabled (not (or $distributed $usesPostgres)) }}
 {{- fail "chart-deco-studio: autoscaling.enabled=true exige storage distribuído (persistence.distributed=true ou accessMode=ReadWriteMany) ou database.engine=postgresql" -}}
 {{- end }}
-{{- if and $usesPostgres (not .Values.database.url) (not .Values.secret.secretName) }}
+{{- if and $usesPostgres (not .Values.database.url) (not .Values.secret.secretName) (not .Values.externalSecret.enabled) }}
 {{- fail "chart-deco-studio: defina database.url quando database.engine=postgresql ou use secret.secretName para fornecer DATABASE_URL via Secret" -}}
+{{- end }}
+{{- end }}
+
+{{/*
+Guards the API/worker split: the main deployment is API-only behind nginx, so
+there must be a worker deployment to pick up run queues.
+*/}}
+{{- define "chart-deco-studio.validateDispatchRole" -}}
+{{- if not .Values.worker.enabled }}
+{{- fail "chart-deco-studio: worker.enabled=true is required because the main Deployment runs API-only containers behind nginx; otherwise no pod dequeues the run queues and runs never dispatch." -}}
+{{- end }}
+{{- $usesPostgresStr := include "chart-deco-studio.usesPostgres" . | trim -}}
+{{- if ne $usesPostgresStr "true" }}
+{{- fail "chart-deco-studio: database.engine=postgresql is required for the split API/worker topology because workers and API pods must share the DBOS run queue. Provide DATABASE_URL via database.url, secret.secretName, or externalSecret." -}}
+{{- end }}
+{{- range $env := .Values.env }}
+{{- $name := get $env "name" | default "" -}}
+{{- if or (eq $name "PORT") (eq $name "MESH_DISPATCH_ROLE") (eq $name "POD_NAME") (eq $name "POD_NAME_BASE") }}
+{{- fail (printf "chart-deco-studio: env contains reserved variable %s; API container PORT, MESH_DISPATCH_ROLE, POD_NAME, and POD_NAME_BASE are managed by the chart." $name) -}}
+{{- end }}
+{{- end }}
+{{- range $env := .Values.worker.env }}
+{{- $name := get $env "name" | default "" -}}
+{{- if or (eq $name "PORT") (eq $name "MESH_DISPATCH_ROLE") }}
+{{- fail (printf "chart-deco-studio: worker.env contains reserved variable %s; worker PORT and MESH_DISPATCH_ROLE are managed by the chart." $name) -}}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -138,8 +179,8 @@ Determines the deployment strategy based on database and storage configuration.
 Uses RollingUpdate if PostgreSQL or distributed storage, otherwise Recreate.
 */}}
 {{- define "chart-deco-studio.deploymentStrategy" -}}
-{{- $distributed := eq (include "chart-deco-studio.isDistributedStorage" .) "true" -}}
-{{- $usesPostgres := eq (include "chart-deco-studio.usesPostgres" .) "true" -}}
+{{- $distributed := eq (include "chart-deco-studio.isDistributedStorage" . | trim) "true" -}}
+{{- $usesPostgres := eq (include "chart-deco-studio.usesPostgres" . | trim) "true" -}}
 {{- if and .Values.strategy .Values.strategy.type -}}
 {{- .Values.strategy.type | trim -}}
 {{- else if or $distributed $usesPostgres -}}
@@ -162,6 +203,26 @@ Otherwise, uses the generated name.
 {{- end }}
 
 {{/*
+Returns the Secret name that contains Studio's internal NATS cluster creds file.
+Defaults to the same Secret used by envFrom, but can point at a dedicated
+Secret owned by SRE.
+*/}}
+{{- define "chart-deco-studio.natsClusterCredsSecretName" -}}
+{{- if .Values.tunnel.nats.clusterCreds.secretName -}}
+{{- .Values.tunnel.nats.clusterCreds.secretName | trim -}}
+{{- else -}}
+{{- include "chart-deco-studio.secretName" . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Absolute path exposed through NATS_CREDS when cluster creds mounting is enabled.
+*/}}
+{{- define "chart-deco-studio.natsClusterCredsPath" -}}
+{{- printf "%s/%s" (trimSuffix "/" .Values.tunnel.nats.clusterCreds.mountDir) .Values.tunnel.nats.clusterCreds.fileName -}}
+{{- end }}
+
+{{/*
 Validate OTel collector/S3 configuration.
 */}}
 {{- define "chart-deco-studio.validateOtel" -}}
@@ -175,6 +236,48 @@ Validate OTel collector/S3 configuration.
 {{- end }}
 {{- if and .Values.otel.collector.enabled (not .Values.otel.enabled) }}
 {{- fail "chart-deco-studio: otel.collector.enabled=true requires otel.enabled=true" -}}
+{{- end }}
+{{- if and .Values.dbosConductor .Values.dbosConductor.enabled }}
+{{- if and .Values.dbosConductor.key .Values.dbosConductor.existingSecret }}
+{{- fail "chart-deco-studio: dbosConductor.key and dbosConductor.existingSecret are mutually exclusive" -}}
+{{- end }}
+{{- if and (not .Values.dbosConductor.key) (not .Values.dbosConductor.existingSecret) }}
+{{- fail "chart-deco-studio: dbosConductor.enabled=true requires either dbosConductor.key or dbosConductor.existingSecret" -}}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Validates ExternalSecret configuration.
+*/}}
+{{- define "chart-deco-studio.validateExternalSecret" -}}
+{{- if and .Values.externalSecret.enabled .Values.secret.secretName }}
+{{- fail "chart-deco-studio: externalSecret.enabled=true and secret.secretName are mutually exclusive — remove secret.secretName when using ExternalSecret" -}}
+{{- end }}
+{{- if and .Values.externalSecret.enabled (not .Values.externalSecret.secretPath) }}
+{{- fail "chart-deco-studio: externalSecret.secretPath is required when externalSecret.enabled=true" -}}
+{{- end }}
+{{- end }}
+
+{{/*
+Validates public NATS tunnel cluster-creds mount configuration.
+*/}}
+{{- define "chart-deco-studio.validateNatsTunnel" -}}
+{{- with .Values.tunnel.nats.clusterCreds }}
+{{- if .enabled }}
+{{- if not .secretKey }}
+{{- fail "chart-deco-studio: tunnel.nats.clusterCreds.secretKey is required when clusterCreds.enabled=true" -}}
+{{- end }}
+{{- if not .mountDir }}
+{{- fail "chart-deco-studio: tunnel.nats.clusterCreds.mountDir is required when clusterCreds.enabled=true" -}}
+{{- end }}
+{{- if not .fileName }}
+{{- fail "chart-deco-studio: tunnel.nats.clusterCreds.fileName is required when clusterCreds.enabled=true" -}}
+{{- end }}
+{{- if and (not .secretName) (not $.Values.secret.secretName) (not $.Values.externalSecret.enabled) (not $.Values.secret.NATS_CLUSTER_CREDS) }}
+{{- fail "chart-deco-studio: secret.NATS_CLUSTER_CREDS is required when clusterCreds.enabled=true and no existing Secret/ExternalSecret/dedicated clusterCreds.secretName is configured" -}}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 

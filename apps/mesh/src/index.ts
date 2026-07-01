@@ -6,8 +6,19 @@
  * Or: bun run src/index.ts
  */
 
+import { sleep } from "@decocms/std";
+// Side-effect-free queue names — safe to import before DBOS.setConfig (unlike
+// the workflow modules, which register workflows at import time).
+import {
+  AUTOMATIONS_QUEUE,
+  BACKGROUND_TOOLS_QUEUE,
+  HOSTED_HARNESS_QUEUE,
+  THREAD_GATE_QUEUE,
+} from "./dispatch-queue/queue-names";
+import { buildDbosConfig } from "./dbos/config";
 import { getSettings } from "./settings";
 import { initObservability } from "./observability";
+import { startProfiling } from "./observability/profiling";
 
 const settings = getSettings();
 
@@ -29,24 +40,65 @@ const { DBOS } = await import("@dbos-inc/dbos-sdk");
 // DBOS uses its own pg client (separate from mesh's pool), so the `sslmode`
 // must travel in the URL. RDS's pg_hba.conf rejects unencrypted connections
 // with `no pg_hba.conf entry for host ... no encryption` when this is missing.
+// Use `verify-full` explicitly: pg-connection-string v2 silently upgrades
+// `require` to `verify-full`, but v3 / pg v9 will drop that upgrade and treat
+// `require` as encrypt-without-verification (libpq semantics).
 function withSslmode(url: string, ssl: boolean): string {
   if (!ssl) return url;
   const u = new URL(url);
-  if (!u.searchParams.has("sslmode")) u.searchParams.set("sslmode", "require");
+  if (!u.searchParams.has("sslmode")) {
+    u.searchParams.set("sslmode", "verify-full");
+  }
   return u.toString();
 }
-DBOS.setConfig({
-  name: "decocms",
-  systemDatabaseUrl: withSslmode(settings.databaseUrl, settings.databasePgSsl),
-  systemDatabaseSchemaName: "dbos",
-  // SDK default is 10. Cap lower so N replicas don't exhaust RDS slots —
-  // bump via `DBOS_POOL_SIZE` if the workflow workload demands more in-flight
-  // steps per pod.
-  systemDatabasePoolSize: Number(process.env.DBOS_POOL_SIZE ?? 5),
-  // N workers all call DBOS.launch(); the admin server would otherwise fight
-  // over port 3001. Re-enable per-process once we need workflow admin HTTP.
-  runAdminServer: false,
-});
+// ── Pod dispatch role (horizontal split) ────────────────────────────────────
+// `settings.dispatchRole` (from `MESH_DISPATCH_ROLE`, resolved in
+// resolve-config) selects which DBOS queues this pod DEQUEUES (via the SDK's
+// `listenQueues` filter). It lets you run two Deployments off the SAME
+// image/DB/auth and scale them independently:
+//   - "all"    (default) — dequeue every queue. Unchanged single-deployment
+//                          behavior; safe default, no opt-in required.
+//   - "worker" — dequeue only the agent/automation RUN queues, so these pods
+//                execute decopilot streams + automation fires. Scale these on
+//                CPU (the LLM-stream load) without touching API pods.
+//   - "api"    — dequeue NOTHING (only DBOS's internal queue still runs). These
+//                pods serve HTTP, enqueue runs, and tail NATS for /stream, but
+//                never run the heavy agent loop.
+// Scheduled (cron) workflows and enqueueing are unaffected — they run on every
+// pod and stay exactly-once via DBOS's row-locked schedule, so an "api" pod can
+// still fire a cron that a "worker" pod then executes. REQUIREMENT: at least
+// one "worker" (or "all") pod must exist or runs never dispatch.
+const RUN_QUEUES = [
+  AUTOMATIONS_QUEUE,
+  THREAD_GATE_QUEUE,
+  HOSTED_HARNESS_QUEUE,
+  // Heavy backgroundable built-ins (generate_image) are worker load, so
+  // "worker"-role pods must dequeue them too — otherwise a split deployment
+  // enqueues the job but never runs it.
+  BACKGROUND_TOOLS_QUEUE,
+];
+const listenQueues: string[] | undefined =
+  settings.dispatchRole === "worker"
+    ? RUN_QUEUES
+    : settings.dispatchRole === "api"
+      ? []
+      : undefined; // "all" → omit → DBOS listens to every queue
+
+DBOS.setConfig(
+  buildDbosConfig({
+    systemDatabaseUrl: withSslmode(
+      settings.databaseUrl,
+      settings.databasePgSsl,
+    ),
+    // SDK default is 10. Cap lower so N replicas don't exhaust RDS slots —
+    // bump via `DBOS_POOL_SIZE` if the workflow workload demands more in-flight
+    // steps per pod.
+    poolSize: Number(process.env.DBOS_POOL_SIZE ?? 5),
+    executorID: settings.podName,
+    // Pod-role queue filter (see RUN_QUEUES above). undefined => "all".
+    listenQueues,
+  }),
+);
 
 const { createApp } = await import("./api/app");
 const { isServerPath } = await import("./api/utils/paths");
@@ -86,9 +138,6 @@ function withSecurityHeaders(res: Response): Response {
   });
 }
 
-// Closed early in gracefulShutdown so the port frees before the Hono drain.
-let ingressServers: import("node:net").Server[] = [];
-
 // Sandbox preview reverse-proxy (agent-sandbox only). The base domain is parsed at
 // boot from STUDIO_SANDBOX_PREVIEW_URL_PATTERN; null disables the proxy and
 // preview-host requests fall through to the normal mesh routing (which 404s
@@ -109,71 +158,28 @@ const previewBaseDomain = parsePreviewBaseDomain(
 );
 const previewProxyDeps = {
   baseDomain: previewBaseDomain ?? "",
-  getRunner: async () => {
-    const runner = await getOrInitRunnerForPreview();
-    if (!runner || runner.kind !== "agent-sandbox") return null;
-    // The agent-sandbox runner is the only one that exposes proxyPreviewRequest /
-    // resolvePreviewUpstreamUrl; cast is safe after the kind check.
-    return runner as unknown as import("@decocms/sandbox/runner/agent-sandbox").AgentSandboxRunner;
-  },
+  // getOrInitSharedRunner resolves to the cluster AgentSandboxProvider (the
+  // only env-instantiable provider) or null — exactly what PreviewProxyDeps
+  // wants, so no kind check or cast is needed.
+  getRunner: getOrInitRunnerForPreview,
 };
-
-// Boot/dev wiring for local runners (docker + host). The boot sweep is
-// Docker-only — host runner's rehydrate() probes /health and discards dead
-// state on its own. The local ingress is shared by both runners.
-const { resolveRunnerKindFromEnv } = await import("@decocms/sandbox/runner");
-const sandboxRunnerKind = resolveRunnerKindFromEnv();
-const ingressEligible =
-  sandboxRunnerKind === "docker" || sandboxRunnerKind === "host";
-
-if (ingressEligible) {
-  const { startLocalSandboxIngress } = await import("@decocms/sandbox/runner");
-  const { getSharedRunnerIfInit, getOrInitSharedRunner } = await import(
-    "./sandbox/lifecycle"
-  );
-
-  // Boot sweep (best-effort). Shutdown cleanup can't cover crashes —
-  // SIGTERM races with the parent killing postgres — so the boot sweep is
-  // what actually keeps `docker ps` empty between sessions.
-  // Host runner's rehydrate() probes /health and discards dead state on its own.
-  if (sandboxRunnerKind === "docker") {
-    const { sweepDockerOrphansOnBoot } = await import(
-      "@decocms/sandbox/runner"
-    );
-    await sweepDockerOrphansOnBoot();
-  }
-
-  // Port 7070 default: macOS AirPlay Receiver owns `*:7000` on v4+v6, so a
-  // Chrome Happy-Eyeballs race would hit Apple. The ingress is part of the
-  // host/docker runner contract — those runners only expose user dev servers
-  // through `<handle>.localhost:7070`, so the gate is the runner kind, not
-  // NODE_ENV. Set `SANDBOX_INGRESS_PORT=0` to skip binding entirely.
-  const ingressPort = Number(process.env.SANDBOX_INGRESS_PORT ?? 7070);
-  if (ingressPort > 0) {
-    ingressServers = startLocalSandboxIngress(() => {
-      const r = getSharedRunnerIfInit();
-      if (!r) return null;
-      if (r.kind !== "docker" && r.kind !== "host") return null;
-      // Both DockerSandboxRunner and HostSandboxRunner expose
-      // resolveDaemonPort; the structural cast is safe after the kind check.
-      return r as unknown as {
-        resolveDaemonPort(handle: string): Promise<number | null>;
-      };
-    }, ingressPort);
-
-    // Construct the runner up-front. The first preview-iframe request
-    // typically arrives on a page reload with a warm vmMap, before either
-    // VM_START or `/api/vm-events` has touched the runner — without this
-    // eager init the ingress would 503 with "Sandbox Runner Not Initialized".
-    await getOrInitSharedRunner();
-  }
-}
 
 // Create the Hono app (any DBOS.registerWorkflow calls happen during this
 // import chain). Launch DBOS afterwards so the registry is sealed before
 // the executor starts dequeueing workflows.
 const app = await createApp();
-await DBOS.launch();
+// Conductor opt-in via env (SDK defaults conductorURL to wss://cloud.dbos.dev/...).
+const conductorKey = process.env.DBOS_CONDUCTOR_KEY?.trim();
+const conductorURL = process.env.DBOS_CONDUCTOR_URL?.trim();
+await DBOS.launch({
+  ...(conductorKey ? { conductorKey } : {}),
+  ...(conductorKey && conductorURL ? { conductorURL } : {}),
+});
+// Surface the DBOS application version on every boot so the pin is verifiable
+// from pod logs (`grep "dbos] application version"`). Expect the pinned
+// DBOS_WORKFLOW_VERSION ("1"), never a 32-char hash — a hash means the pin was
+// bypassed (e.g. DBOS__CLOUD / DBOS__APPVERSION env). See dbos/workflow-version.ts.
+console.log(`[dbos] application version: ${DBOS.applicationVersion}`);
 // Post-launch DBOS setup (queue registration, schedule reconciliation).
 // Must run after launch because registerQueue / listSchedules require an
 // initialized executor.
@@ -181,9 +187,9 @@ await app.initDbos();
 
 // When running via CLI, the calling script handles its own banner/config output
 if (!settings.isCli) {
-  const { ASCII_ART } = await import("./fmt");
+  const { bannerLines } = await import("./cli/banner-art");
   console.log("");
-  for (const line of ASCII_ART) {
+  for (const line of bannerLines()) {
     console.log(line);
   }
 }
@@ -220,12 +226,12 @@ const server = Bun.serve({
     if (assetRes) return withSecurityHeaders(assetRes);
     return app.fetch(request, { server });
   },
-  // Multiplexed WebSocket handler. `ws.data.kind` discriminates which
-  // upgrader stashed the payload — preview is the only producer today; new
-  // upgraders should add a tagged `kind` and a branch here.
+  // WebSocket handler — sandbox preview connections only.
   websocket: {
     open(ws) {
-      if (isPreviewWsData(ws.data)) previewWebSocketHandler.open(ws);
+      if (isPreviewWsData(ws.data)) {
+        previewWebSocketHandler.open(ws);
+      }
     },
     message(ws, message) {
       if (isPreviewWsData(ws.data)) {
@@ -233,11 +239,15 @@ const server = Bun.serve({
       }
     },
     close(ws) {
-      if (isPreviewWsData(ws.data)) previewWebSocketHandler.close(ws);
+      if (isPreviewWsData(ws.data)) {
+        previewWebSocketHandler.close(ws);
+      }
     },
   },
   development: false,
 });
+
+const stopProfiling = startProfiling();
 
 // Local mode: seed admin user + organization after server is listening
 // This must run after Bun.serve() so that the org seed can fetch tools
@@ -248,6 +258,33 @@ if (settings.localMode) {
       try {
         const seeded = await seedLocalMode();
         void seeded;
+        // Dev-only: mint an API-key-backed session file for the
+        // auto-spawned `deco link` daemon when the dev CLI asked us to.
+        // Gated on DEV_LINK_SESSION_PATH so production never touches it.
+        if (process.env.DEV_LINK_SESSION_PATH) {
+          try {
+            const { bootstrapDevLinkSession } = await import(
+              "./auth/dev-link-session"
+            );
+            const clusterBaseUrl =
+              settings.baseUrl ?? `http://localhost:${settings.port}`;
+            const result = await bootstrapDevLinkSession(
+              settings.dataDir,
+              clusterBaseUrl,
+            );
+            if (result) {
+              console.log(
+                `[dev-link] session ready at ${result.path} (userSub=${result.userSub})`,
+              );
+            } else {
+              console.warn(
+                "[dev-link] no admin user yet — skipping session bootstrap. The auto-spawned link will refuse to start until an admin exists.",
+              );
+            }
+          } catch (err) {
+            console.error("[dev-link] bootstrap failed:", err);
+          }
+        }
       } catch (error) {
         console.error("Failed to seed local mode:", error);
       } finally {
@@ -278,25 +315,39 @@ async function gracefulShutdown(signal: string) {
   shuttingDown = true;
   console.log(`\n[shutdown] Received ${signal}, shutting down gracefully...`);
 
+  // Single source of truth: the chart's terminationGracePeriodSeconds is
+  // injected as SHUTDOWN_GRACE_SECONDS. Force-exit a few seconds before SIGKILL
+  // so the process always wins the race; drain fills most of the budget.
+  const graceMs = Number(process.env.SHUTDOWN_GRACE_SECONDS ?? 60) * 1_000;
+  const forceExitMs = Math.max(graceMs - 5_000, 10_000);
+
   const forceExitTimer = setTimeout(() => {
-    console.error("[shutdown] Timed out after 55s, forcing exit.");
+    console.error(`[shutdown] Timed out after ${forceExitMs}ms, forcing exit.`);
     process.exit(1);
-  }, 55_000);
+  }, forceExitMs);
   forceExitTimer.unref?.();
 
   let exitCode = 0;
   try {
+    stopProfiling();
+
     // 1. Mark as shutting down — readiness returns 503 immediately
     app.markShuttingDown();
 
-    // 2. Close ingress first so port 7070 frees immediately — next `bun dev`
-    //    shouldn't have to wait out our drain.
-    for (const s of ingressServers) s.close();
+    // 2. Keep serving while the load balancer stops routing to this pod.
+    //    With the AWS NLB in ip-target mode, deregistration is driven by the
+    //    LB controller observing the pod enter Terminating (this SIGTERM), not
+    //    by the K8s Endpoints path — and it takes far longer than the old 2s to
+    //    propagate. Closing the listener early leaves the NLB forwarding new
+    //    connections to a dead socket -> CF 520 during rollout. Stay under the
+    //    force-exit timer (derived from terminationGracePeriodSeconds above) so
+    //    it never trips before drain completes.
+    const drainMs = Number(
+      process.env.SHUTDOWN_DRAIN_MS ?? Math.floor(forceExitMs * 0.6),
+    );
+    await sleep(drainMs);
 
-    // 3. Let K8s notice the 503 before we close connections.
-    await new Promise((r) => setTimeout(r, 2_000));
-
-    // 4. Force-close connections (SSE streams are long-lived and would block
+    // 3. Force-close connections (SSE streams are long-lived and would block
     //    graceful drain indefinitely).
     await server.stop(true);
 
@@ -315,7 +366,7 @@ async function gracefulShutdown(signal: string) {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 // Bun keeps the process alive after terminal close — without SIGHUP we
-// accumulate zombies still holding port 7070.
+// accumulate zombies still holding the listen port.
 process.on("SIGHUP", () => gracefulShutdown("SIGHUP"));
 
 process.on("unhandledRejection", (reason) => {

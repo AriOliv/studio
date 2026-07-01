@@ -1,6 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { useSuspenseQuery } from "@tanstack/react-query";
+import { SELF_MCP_ALIAS_ID } from "../lib/constants";
 import { KEYS } from "../lib/query-keys";
+import { createRestSelfClient } from "../lib/rest-self-client";
 import { StreamableHTTPClientTransport } from "../lib/streamable-http-client-transport";
 
 const DEFAULT_CLIENT_INFO = {
@@ -9,7 +11,7 @@ const DEFAULT_CLIENT_INFO = {
 };
 
 export interface CreateMcpClientOptions {
-  /** Connection ID - use SELF_MCP_ALIAS_ID for the self/management MCP (ALL_TOOLS), or any connectionId for other MCPs */
+  /** Connection ID - use SELF_MCP_ALIAS_ID for the self/management MCP (builtin tools), or any connectionId for other MCPs */
   connectionId: string | null;
   /** Organization ID - required for query-key scoping */
   orgId: string;
@@ -19,6 +21,14 @@ export interface CreateMcpClientOptions {
   token?: string | null;
   /** Mesh server URL - optional, defaults to window.location.origin (for external apps, provide your Mesh server URL) */
   meshUrl?: string;
+  /**
+   * Absolute MCP endpoint URL override. When set, the client connects directly
+   * to this URL instead of the org-scoped `/api/:org/mcp/:connectionId` route.
+   * Used to reach a co-located sandbox dev server straight from the browser
+   * (loopback `http://<handle>.localhost/api/mcp`), bypassing the cloud proxy —
+   * which cannot reach a desktop sandbox's loopback. Never the self/REST client.
+   */
+  mcpUrl?: string;
 }
 
 export type UseMcpClientOptions = CreateMcpClientOptions;
@@ -67,8 +77,29 @@ export async function createMCPClient({
   orgSlug,
   token,
   meshUrl,
+  mcpUrl,
 }: CreateMcpClientOptions): Promise<Client> {
-  const url = buildMcpUrl(connectionId, orgSlug, meshUrl);
+  const queryKey = KEYS.mcpClient(
+    orgId,
+    connectionId ?? "self",
+    token ?? "",
+    mcpUrl ?? meshUrl ?? "",
+  );
+
+  // Self/management connection → REST-backed client. The browser no longer
+  // speaks MCP to the mesh server for builtin tools; they're called over plain
+  // REST (`/api/:org/tools/:name`). The MCP SDK stays for outbound connections.
+  // A direct `mcpUrl` override is never the self client (it targets a dev server).
+  if (!mcpUrl && (!connectionId || connectionId === SELF_MCP_ALIAS_ID)) {
+    return createRestSelfClient({
+      orgSlug,
+      token,
+      meshUrl,
+      toJSONString: `mcp-client:${queryKey.join(":")}`,
+    });
+  }
+
+  const url = mcpUrl ?? buildMcpUrl(connectionId, orgSlug, meshUrl);
 
   const client = new Client(DEFAULT_CLIENT_INFO, {
     capabilities: {
@@ -98,17 +129,35 @@ export async function createMCPClient({
 
   // Add toJSON method for query key serialization
   // This allows the client to be used directly in query keys
-  const queryKey = KEYS.mcpClient(
-    orgId,
-    connectionId ?? "self",
-    token ?? "",
-    meshUrl ?? "",
-  );
-
   (client as Client & { toJSON: () => string }).toJSON = () =>
     `mcp-client:${queryKey.join(":")}`;
 
   return client;
+}
+
+/**
+ * React Query options for an MCP client connection. Single source of truth for
+ * the client query key + connect behavior, so a suspense consumer
+ * (`useMCPClient`) and a non-suspense pre-warm (e.g. the shell starting the self
+ * connection in parallel with the rest of bootstrap) target the EXACT same
+ * cache entry — the key cannot drift between them.
+ */
+export function mcpClientQueryOptions(options: UseMcpClientOptions) {
+  const { connectionId, token, meshUrl, mcpUrl, orgId } = options;
+  return {
+    queryKey: KEYS.mcpClient(
+      orgId,
+      connectionId ?? "self",
+      token ?? "",
+      mcpUrl ?? meshUrl ?? "",
+    ),
+    queryFn: () => createMCPClient(options),
+    staleTime: Infinity, // Keep client alive while query is active
+    // Keep the client cached for a minute after the last subscriber detaches so
+    // brief unmount/remount transitions (sidebar collapse toggle, popover open,
+    // etc.) re-use the same transport instead of re-establishing it.
+    gcTime: 60_000,
+  };
 }
 
 /**
@@ -118,28 +167,8 @@ export async function createMCPClient({
  * @param options - Configuration for the MCP client
  * @returns The MCP client instance (never null - suspends until ready)
  */
-export function useMCPClient({
-  connectionId,
-  orgId,
-  orgSlug,
-  token,
-  meshUrl,
-}: UseMcpClientOptions): Client {
-  const queryKey = KEYS.mcpClient(
-    orgId,
-    connectionId ?? "self",
-    token ?? "",
-    meshUrl ?? "",
-  );
-
-  const { data: client } = useSuspenseQuery({
-    queryKey,
-    queryFn: () =>
-      createMCPClient({ connectionId, orgId, orgSlug, token, meshUrl }),
-    staleTime: Infinity, // Keep client alive while query is active
-    gcTime: 0, // Clean up immediately when query is inactive
-  });
-
+export function useMCPClient(options: UseMcpClientOptions): Client {
+  const { data: client } = useSuspenseQuery(mcpClientQueryOptions(options));
   return client!;
 }
 
@@ -160,6 +189,7 @@ export function useMCPClientOptional({
   orgSlug,
   token,
   meshUrl,
+  mcpUrl,
 }: UseMcpClientOptionalOptions): Client | null {
   const queryKey =
     connectionId !== undefined
@@ -167,7 +197,7 @@ export function useMCPClientOptional({
           orgId,
           connectionId ?? "self",
           token ?? "",
-          meshUrl ?? "",
+          mcpUrl ?? meshUrl ?? "",
         )
       : (["mcp", "client", "skip", orgId] as const);
 
@@ -183,10 +213,12 @@ export function useMCPClientOptional({
         orgSlug,
         token,
         meshUrl,
+        mcpUrl,
       });
     },
     staleTime: Infinity,
-    gcTime: 0,
+    // Match the non-optional variant — see useMCPClient for the rationale.
+    gcTime: 60_000,
   });
 
   return client ?? null;

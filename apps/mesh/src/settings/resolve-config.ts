@@ -5,9 +5,49 @@
  */
 
 import { homedir } from "os";
-import type { CliFlags, Settings } from "./types";
+import type { CliFlags, DispatchRole, Settings } from "./types";
+
+type SandboxProviderKind = Settings["sandboxProviderKind"];
+
+const DISPATCH_ROLES = new Set<DispatchRole>(["all", "worker", "api"]);
+
+/** Normalize `MESH_DISPATCH_ROLE`; anything unknown coerces to the safe "all". */
+function resolveDispatchRole(raw: string | undefined): DispatchRole {
+  const role = (raw ?? "").trim();
+  return DISPATCH_ROLES.has(role as DispatchRole)
+    ? (role as DispatchRole)
+    : "all";
+}
 
 function toBool(value: string | undefined): boolean {
+  return value === "true" || value === "1";
+}
+
+function toBoolOrUndefined(value: string | undefined): boolean | undefined {
+  if (value === undefined || value === "") return undefined;
+  return toBool(value);
+}
+
+function toPositiveIntegerOrDefault(
+  name: string,
+  value: string | undefined,
+  defaultValue: number,
+): number {
+  if (value === undefined || value === "") return defaultValue;
+
+  const numberValue = Number(value);
+  if (!Number.isSafeInteger(numberValue) || numberValue <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return numberValue;
+}
+
+/** Tri-state flag: unset/empty → `fallback`, otherwise parse as boolean. */
+function toBoolWithDefault(
+  value: string | undefined,
+  fallback: boolean,
+): boolean {
+  if (value === undefined || value === "") return fallback;
   return value === "true" || value === "1";
 }
 
@@ -27,6 +67,27 @@ function externalUrlOrNull(url: string | undefined): string | null {
   } catch {
     return null;
   }
+}
+
+const SANDBOX_PROVIDER_KINDS = new Set<SandboxProviderKind>([
+  "agent-sandbox",
+  "user-desktop",
+]);
+type LegacySandboxProviderKind = SandboxProviderKind | "cluster";
+
+function resolveSandboxProviderKind(
+  raw: string | undefined,
+): SandboxProviderKind {
+  const kind = (raw && raw.length > 0 ? raw : "user-desktop") as
+    | LegacySandboxProviderKind
+    | string;
+  if (kind === "cluster") return "agent-sandbox";
+  if (!SANDBOX_PROVIDER_KINDS.has(kind as SandboxProviderKind)) {
+    throw new Error(
+      `Unknown STUDIO_SANDBOX_PROVIDER="${raw}" — expected "agent-sandbox", legacy "cluster", or "user-desktop".`,
+    );
+  }
+  return kind as SandboxProviderKind;
 }
 
 export interface ResolvedConfig {
@@ -51,6 +112,9 @@ export function resolveConfig(
     flags.nodeEnv || (envVars.NODE_ENV as Settings["nodeEnv"]) || "development";
 
   const natsRaw = envVars.NATS_URL || "nats://localhost:4222";
+  const natsTunnelPublicEnabled =
+    toBoolOrUndefined(envVars.NATS_TUNNEL_PUBLIC_ENABLED) ??
+    !!envVars.NATS_PUBLIC_URL;
 
   const settings: Omit<Settings, "databaseUrl" | "natsUrls"> = {
     // Core
@@ -73,18 +137,41 @@ export function resolveConfig(
 
     // Observability
     clickhouseUrl: envVars.CLICKHOUSE_URL,
+    clickhouseMaxMemoryUsage:
+      Number(envVars.CLICKHOUSE_MAX_MEMORY_USAGE) || undefined,
+    monitoringOtlpEndpoint: envVars.MONITORING_OTLP_ENDPOINT,
     otelServiceName: envVars.OTEL_SERVICE_NAME || "studio",
+
+    // Event Bus & Networking
+    natsPublicUrl: envVars.NATS_PUBLIC_URL,
+    natsTunnelPublicEnabled,
+    natsTunnelSessionTtlSeconds: toPositiveIntegerOrDefault(
+      "NATS_TUNNEL_SESSION_TTL_SECONDS",
+      envVars.NATS_TUNNEL_SESSION_TTL_SECONDS,
+      900,
+    ),
+    natsOperatorJwt: envVars.NATS_OPERATOR_JWT,
+    natsAccountJwt: envVars.NATS_ACCOUNT_JWT,
+    natsAccountSigningKey: envVars.NATS_ACCOUNT_SIGNING_KEY,
+    natsCredsPath: envVars.NATS_CREDS,
 
     // Config files
     configPath: envVars.CONFIG_PATH || "./config.json",
 
     // AI Gateway
     aiGatewayEnabled: toBool(envVars.DECO_AI_GATEWAY_ENABLED),
-    aiGatewayUrl:
-      envVars.DECO_AI_GATEWAY_URL || "https://ai-site.decocache.com",
+    aiGatewayUrl: envVars.DECO_AI_GATEWAY_URL || "https://ai-site.deco.site",
 
     // Feature Flags
     enableDecoImport: toBool(envVars.ENABLE_DECO_IMPORT),
+    // MCP caching is on by default in production, off in development. Set
+    // MCP_CACHE_ENABLED=false to disable in prod, =true to enable in dev.
+    mcpCacheEnabled: toBoolWithDefault(
+      envVars.MCP_CACHE_ENABLED,
+      nodeEnv !== "development",
+    ),
+    orgFsPublicSetsJson: envVars.ORGFS_PUBLIC_SETS,
+    orgFsMountsDisabled: toBool(envVars.DISABLE_ORGFS_MOUNTS),
 
     // Object Storage (S3-compatible)
     s3Endpoint: envVars.S3_ENDPOINT,
@@ -98,15 +185,53 @@ export function resolveConfig(
       envVars.S3_FORCE_PATH_STYLE === "true" ||
       envVars.S3_FORCE_PATH_STYLE === "1",
 
+    // Monitoring object storage (OTLP-JSON over GCS). Raw env passthrough;
+    // fallback to s3* is applied at the context-factory consumption point.
+    monitoringS3Bucket: envVars.MONITORING_S3_BUCKET,
+    monitoringS3Endpoint: envVars.MONITORING_S3_ENDPOINT,
+    monitoringS3Region: envVars.MONITORING_S3_REGION,
+    monitoringS3AccessKeyId: envVars.MONITORING_S3_ACCESS_KEY_ID,
+    monitoringS3SecretAccessKey: envVars.MONITORING_S3_SECRET_ACCESS_KEY,
+    monitoringS3Prefix: envVars.MONITORING_S3_PREFIX,
+    duckdbExtensionDirectory:
+      envVars.DUCKDB_EXTENSION_DIRECTORY || "/opt/duckdb/extensions",
+    duckdbMemoryLimit: envVars.DUCKDB_MEMORY_LIMIT || undefined,
+    duckdbThreads: envVars.DUCKDB_THREADS
+      ? Number(envVars.DUCKDB_THREADS)
+      : undefined,
+
     // Runtime flags
     isCli: true,
     noTui: flags.noTui === true,
     podName: envVars.POD_NAME ?? crypto.randomUUID(),
+    dispatchRole: resolveDispatchRole(envVars.MESH_DISPATCH_ROLE),
+    sandboxProviderKind: resolveSandboxProviderKind(
+      envVars.STUDIO_SANDBOX_PROVIDER,
+    ),
 
     // External service credentials
     decoSupabaseUrl: envVars.DECO_SUPABASE_URL,
     decoSupabaseServiceKey: envVars.DECO_SUPABASE_SERVICE_KEY,
     firecrawlApiKey: envVars.FIRECRAWL_API_KEY,
+    commerceDiscoveryInternalApiUrl:
+      envVars.COMMERCE_DISCOVERY_INTERNAL_API_URL,
+    commerceDiscoveryInternalApiKey:
+      envVars.COMMERCE_DISCOVERY_INTERNAL_API_KEY,
+
+    // Managed asset storage (shared deco tenant bucket). Defaults match the
+    // legacy admin platform so an existing deployment works without new env.
+    s3TenantBucket: envVars.S3_TENANT_BUCKET || "new-deco-sites-assets",
+    s3TenantRegion: envVars.S3_TENANT_REGION || "us-west-2",
+    // No default: for real AWS the SDK derives the endpoint from region (so the
+    // two can't drift). Set S3_TENANT_ENDPOINT only for a non-AWS S3 store.
+    s3TenantEndpoint: envVars.S3_TENANT_ENDPOINT,
+    s3TenantPublicUrlBase:
+      envVars.S3_TENANT_PUBLIC_URL_BASE || "https://decoims.com",
+    awsS3TenantRoleArn: envVars.AWS_S3_TENANT_ROLE_ARN,
+    awsS3TenantProvisionerAccessKeyId:
+      envVars.AWS_S3_TENANT_PROVISIONER_ACCESS_KEY_ID,
+    awsS3TenantProvisionerSecretAccessKey:
+      envVars.AWS_S3_TENANT_PROVISIONER_SECRET_ACCESS_KEY,
   };
 
   return {

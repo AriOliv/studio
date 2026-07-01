@@ -6,26 +6,25 @@
  *   ├── Toolbar                            (outside Suspense)
  *   │   • Toolbar.Nav (back/forward)
  *   │   • Toolbar.TabsSlot    (portal target — main-panel tab bar)
- *   │   • Toolbar.TogglesSlot (portal target — tasks/chat)
- *   └── flex-row
- *       ├── TasksPanelColumn               (owned by org-shell-layout)
- *       └── Suspense
- *           └── AgentInsetProvider
- *               • useVirtualMCP (suspends here)
- *               • Toolbar.Toggles → portal into slot
- *               • Toolbar.Tabs → portal into slot
- *               • Chat.Provider
- *                 └── VmEventsBridge
- *                     └── Chat.ActiveTaskProvider
- *                         └── ChatMainPanelGroup
- *                             (the per-thread todo list is rendered
- *                              by TodosHighlight inside ChatHighlight,
- *                              not as a side column)
+ *   │   • Toolbar.TogglesSlot (portal target — chat / new-task)
+ *   └── Suspense
+ *       └── AgentInsetProvider
+ *           • useVirtualMCP (suspends here)
+ *           • Toolbar.Toggles → portal into slot
+ *           • Toolbar.Tabs → portal into slot
+ *           • Chat.Provider
+ *             └── VmEventsBridge
+ *                 └── Chat.ActiveTaskProvider
+ *                     └── ChatMainPanelGroup
+ *                         (the per-thread todo list is rendered
+ *                          by TodosHighlight inside ChatHighlight,
+ *                          not as a side column)
  *
  * Mobile layout:
  *   Chat.Provider
- *   └── Chat.ActiveTaskProvider
- *       └── MainPanelContent OR ActiveTaskBoundary (sheet-based)
+ *   └── VmEventsBridge
+ *       └── Chat.ActiveTaskProvider
+ *           └── MainPanelWithDrawer OR ActiveTaskBoundary (sheet-based)
  */
 
 import {
@@ -38,48 +37,44 @@ import {
   type ReactNode,
 } from "react";
 import { Chat, useChatTask } from "@/web/components/chat/index";
-import { ChatCenterPanel } from "@/web/layouts/chat-center-panel";
-import { TasksPanel } from "@/web/layouts/tasks-panel";
+import { useChatPrefs } from "@/web/components/chat/context";
+import { ChatPanel } from "@/web/components/chat/side-panel-chat";
 import { ErrorBoundary } from "@/web/components/error-boundary";
 import { isModKey } from "@/web/lib/keyboard-shortcuts";
-import { StudioSidebarMobile } from "@/web/components/sidebar";
-import { useSidebar } from "@deco/ui/components/sidebar.tsx";
-import { Sheet, SheetContent, SheetTitle } from "@deco/ui/components/sheet.tsx";
 import { useIsMobile } from "@deco/ui/hooks/use-mobile.ts";
-import {
-  AlertCircle,
-  Edit05,
-  Loading01,
-  Menu01,
-  MessageCircle01,
-} from "@untitledui/icons";
-import { cn } from "@deco/ui/lib/utils.js";
+import { AlertCircle, Loading01 } from "@untitledui/icons";
 import {
   getWellKnownDecopilotVirtualMCP,
-  SELF_MCP_ALIAS_ID,
-  useMCPClient,
   useProjectContext,
   useVirtualMCP,
+  parseBranchMap,
 } from "@decocms/mesh-sdk";
-import type { VirtualMCPEntity } from "@decocms/mesh-sdk/types";
+import type { VirtualMCPEntity, SandboxMap } from "@decocms/mesh-sdk/types";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { useVmStart } from "@/web/components/vm/hooks/use-vm-start";
+import { useIsSandboxStartPending } from "@/web/components/sandbox/hooks/use-sandbox-start";
 import { useStatusSounds } from "../../hooks/use-status-sounds";
 import { authClient } from "@/web/lib/auth-client";
 import { Button } from "@deco/ui/components/button.tsx";
 import { EmptyState } from "@/web/components/empty-state";
 import { useChatMainPanelState } from "@/web/hooks/use-layout-state";
 import { getActiveGithubRepo } from "@/web/lib/github-repo";
-import { useOptionalTasksPanelState } from "@/web/hooks/use-tasks-panel-state";
 import { Toolbar } from "./toolbar";
 import { ChatMainPanelGroup } from "./chat-main-panel-group";
 import { ToggleButtons } from "./toggle-buttons";
-import { MainPanelContent } from "@/web/layouts/main-panel-tabs";
 import { MainPanelTabsBar } from "@/web/layouts/main-panel-tabs/main-panel-tabs-bar";
+import { MobileMainPanelTabSelect } from "@/web/layouts/main-panel-tabs/mobile-main-panel-tab-select";
+import { MainPanelWithDrawer } from "@/web/layouts/main-panel-tabs/main-panel-with-drawer";
 import { VirtualMcpHeaderInfo } from "../../views/virtual-mcp/header-info.tsx";
-import { VmEventsProvider } from "@/web/components/vm/hooks/vm-events-context.tsx";
-import type { VmMapEntry } from "@decocms/mesh-sdk";
+import { SandboxEventsProvider } from "@/web/components/sandbox/hooks/sandbox-events-context.tsx";
+import {
+  SandboxLifecycleProvider,
+  selectVmEntry,
+  type BranchMapEntryLike,
+} from "@/web/components/sandbox/hooks/sandbox-lifecycle-context";
 import { useEnsureTask } from "@/web/hooks/use-ensure-task";
+import { ShellRouteLoading } from "@/web/layouts/shell-route-loading";
+import { OrgFilePreviewMount } from "./org-file-preview";
+import { OrgFileOpenProvider } from "@/web/components/chat/org-file-open-context";
 
 // ---------------------------------------------------------------------------
 // Types & Context
@@ -110,7 +105,7 @@ function ActiveTaskBoundary({ children }: { children?: React.ReactNode }) {
       }
     >
       <Suspense fallback={<Chat.Skeleton />}>
-        {children ?? <ChatCenterPanel />}
+        {children ?? <ChatPanel />}
       </Suspense>
     </ErrorBoundary>
   );
@@ -132,137 +127,76 @@ function NewTaskBridge({
   return null;
 }
 
-function MobileToolbar({
-  onOpenSidebar,
-  virtualMcpId,
-  taskId,
-  mainOpen,
-  onToggleMain,
-  onNewTask,
-}: {
-  onOpenSidebar: () => void;
-  virtualMcpId: string;
-  taskId: string;
-  mainOpen: boolean;
-  onToggleMain: () => void;
-  onNewTask: () => void;
-}) {
-  return (
-    <div className="shrink-0 flex items-center gap-1 px-2 h-12 bg-background border-b border-border">
-      <button
-        type="button"
-        onClick={onOpenSidebar}
-        className="flex size-8 shrink-0 items-center justify-center rounded-md text-foreground/60 hover:bg-accent hover:text-foreground transition-colors"
-        aria-label="Open menu"
-      >
-        <Menu01 size={20} />
-      </button>
-      <div className="flex-1 min-w-0 overflow-x-auto [scrollbar-width:none]">
-        <MainPanelTabsBar virtualMcpId={virtualMcpId} taskId={taskId} />
-      </div>
-      <div className="flex items-center gap-0.5 shrink-0">
-        <button
-          type="button"
-          onClick={onToggleMain}
-          aria-pressed={!mainOpen}
-          className={cn(
-            "flex size-7 shrink-0 items-center justify-center rounded-md transition-colors",
-            !mainOpen
-              ? "bg-accent text-foreground"
-              : "text-foreground/60 hover:bg-accent hover:text-foreground",
-          )}
-          title="Chat"
-        >
-          <MessageCircle01 size={16} />
-        </button>
-        <button
-          type="button"
-          onClick={onNewTask}
-          className="flex size-7 shrink-0 items-center justify-center rounded-md text-foreground/60 hover:bg-accent hover:text-foreground transition-colors"
-          title="New task"
-        >
-          <Edit05 size={16} />
-        </button>
-      </div>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
-// VmEventsBridge — passes (virtualMcpId, branch) to the unified VM events
-// SSE provider and runs auto-start. Lives inside Chat.Provider so it can
-// read useChatTask, which keeps the SSE connection in sync with the active
-// task as the user navigates between tasks (different tasks may pin
-// different branches).
+// VmEventsBridge — thin branch resolver. Derives (branch, shouldConnect) and
+// mounts SandboxEventsProvider + SandboxLifecycleProvider. Lives inside
+// Chat.Provider so it can read useChatTask, which keeps the SSE connection
+// and the lifecycle provider in sync with the active task as the user
+// navigates between tasks (different tasks may pin different branches).
 // ---------------------------------------------------------------------------
 
 function VmEventsBridge({
   virtualMcpId,
   hasActiveGithubRepo,
-  vmMap,
+  sandboxMap,
   children,
 }: {
   virtualMcpId: string;
   hasActiveGithubRepo: boolean;
-  vmMap: Record<string, Record<string, VmMapEntry>> | undefined;
+  sandboxMap: SandboxMap | undefined;
   children: ReactNode;
 }) {
-  const { org } = useProjectContext();
   const { currentBranch } = useChatTask();
+  const { pendingSandboxProviderKind } = useChatPrefs();
   const { data: session } = authClient.useSession();
   const userId = session?.user?.id;
 
-  // Auto-start the VM when the active task points at a branch without a
-  // registered vmMap entry. Routed through useVmStart so concurrent mounts
-  // (preview, env, this bridge) for the same (virtualMcpId, branch) collapse
-  // onto one in-flight upstream call.
-  const autoStartClient = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
-  const { mutate: triggerAutoStart } = useVmStart(autoStartClient);
-  // Attempt at most one auto-start per (branch, mount). A user VM_DELETE
-  // removes the vmMap entry — without a permanent guard the effect would
-  // re-fire and resurrect the VM the user just stopped.
-  const autoStartAttemptedRef = useRef<Set<string>>(new Set());
-  // oxlint-disable-next-line ban-use-effect/ban-use-effect — fires VM_START when vmMap is missing an entry for (user, branch); ref guard dedupes within this mount, module-level map dedupes across components
-  useEffect(() => {
-    if (!hasActiveGithubRepo) return;
-    if (!userId) return;
-    if (!currentBranch) return;
-    if (vmMap?.[userId]?.[currentBranch]) {
-      // VM is already running — record the branch so a user stop won't
-      // re-trigger auto-start within this mount.
-      autoStartAttemptedRef.current.add(currentBranch);
-      return;
-    }
-    if (autoStartAttemptedRef.current.has(currentBranch)) return;
-    autoStartAttemptedRef.current.add(currentBranch);
-    triggerAutoStart(
-      { virtualMcpId, branch: currentBranch },
-      {
-        onError: (err) => {
-          console.error("[auto-start-vm] failed:", err);
-        },
-      },
-    );
-  }, [
-    hasActiveGithubRepo,
-    userId,
-    currentBranch,
-    vmMap,
+  // Open the events stream only when a sandbox actually exists or a start is
+  // in flight — NOT merely because the agent has a GitHub repo configured.
+  // Gate instead on a registered sandboxMap entry, or an in-flight
+  // SANDBOX_START (covers the booting window; SandboxLifecycleProvider's
+  // auto-start shares this mutation key, so `useIsSandboxStartPending`
+  // observes it).
+  const isStartPending = useIsSandboxStartPending(
     virtualMcpId,
-    triggerAutoStart,
-  ]);
+    currentBranch ?? undefined,
+  );
+  const branchMap =
+    userId && currentBranch
+      ? (parseBranchMap(sandboxMap?.[userId]?.[currentBranch]) as Record<
+          string,
+          BranchMapEntryLike
+        >)
+      : {};
+  // Use the resolved provider kind to pick the matching entry — same logic as
+  // SandboxLifecycleProvider so the SSE previewUrl and the lifecycle vmEntry
+  // always agree on which sandbox is active.
+  const vmEntry = pendingSandboxProviderKind
+    ? ((branchMap[pendingSandboxProviderKind] as
+        | BranchMapEntryLike
+        | undefined) ?? null)
+    : selectVmEntry(branchMap);
+  const previewUrl = vmEntry?.previewUrl ?? null;
+  const shouldConnect = Object.keys(branchMap).length > 0 || isStartPending;
 
   return (
-    <VmEventsProvider
+    <SandboxEventsProvider
       virtualMcpId={virtualMcpId}
       branch={currentBranch ?? null}
+      previewUrl={previewUrl}
+      enabled={shouldConnect}
     >
-      {children}
-    </VmEventsProvider>
+      <SandboxLifecycleProvider
+        virtualMcpId={virtualMcpId}
+        branch={currentBranch ?? null}
+        userId={userId ?? null}
+        hasActiveGithubRepo={hasActiveGithubRepo}
+        sandboxMap={sandboxMap}
+        sandboxProviderKind={pendingSandboxProviderKind}
+      >
+        {children}
+      </SandboxLifecycleProvider>
+    </SandboxEventsProvider>
   );
 }
 
@@ -275,7 +209,6 @@ function AgentInsetProvider() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const { org } = useProjectContext();
-  const tasksOpen = useOptionalTasksPanelState()?.tasksOpen ?? false;
 
   useStatusSounds(org.slug);
 
@@ -316,9 +249,6 @@ function AgentInsetProvider() {
     orgSlug,
     isAgentRoute: true,
   });
-
-  const { setOpenMobile, openMobile: mobileSidebarOpen } = useSidebar();
-  const setMobileSidebarOpen = setOpenMobile;
 
   const onNewTask = useRef<(() => void) | null>(null);
 
@@ -399,56 +329,41 @@ function AgentInsetProvider() {
 
   // Mobile layout — unchanged semantics, just inlined here for clarity.
   if (isMobile) {
-    const mobileSidebarSheet = (
-      <Sheet open={mobileSidebarOpen} onOpenChange={setMobileSidebarOpen}>
-        <SheetContent
-          side="left"
-          hideCloseButton
-          className="w-[calc(100vw-3rem)] sm:max-w-md! p-0"
-        >
-          <SheetTitle className="sr-only">Navigation</SheetTitle>
-          <div className="flex h-full">
-            <div
-              className="w-14 shrink-0 bg-sidebar flex flex-col items-center border-r border-border overflow-y-auto group/sidebar"
-              data-state="collapsed"
-            >
-              <StudioSidebarMobile
-                onClose={() => setMobileSidebarOpen(false)}
-              />
-            </div>
-            <div className="flex-1 min-w-0 overflow-hidden">
-              <TasksPanel />
-            </div>
-          </div>
-        </SheetContent>
-      </Sheet>
-    );
-
     return (
       <InsetContext value={insetContextValue}>
-        <div className="flex flex-col flex-1 bg-background min-h-0">
-          <Chat.Provider key={chatVirtualMcpId} virtualMcpId={chatVirtualMcpId}>
+        <div className="flex flex-col flex-1 min-w-0 bg-background min-h-0">
+          <Chat.Provider
+            key={chatVirtualMcpId}
+            virtualMcpId={chatVirtualMcpId}
+            task={ensureState.status === "ready" ? ensureState.task : null}
+          >
             <VmEventsBridge
               virtualMcpId={virtualMcpId}
               hasActiveGithubRepo={hasActiveGithubRepo}
-              vmMap={entity?.metadata?.vmMap}
+              sandboxMap={entity?.metadata?.sandboxMap}
             >
               <NewTaskBridge
                 onNewTaskRef={onNewTask}
                 createNewTask={layout.createNewTask}
               />
-              <MobileToolbar
-                onOpenSidebar={() => setMobileSidebarOpen(true)}
-                virtualMcpId={chatVirtualMcpId}
-                taskId={layout.taskId}
-                mainOpen={layout.mainOpen}
-                onToggleMain={layout.toggleMain}
-                onNewTask={layout.createNewTask}
-              />
               <Chat.ActiveTaskProvider
                 key={layout.taskId}
                 taskId={layout.taskId}
               >
+                <Toolbar.Toggles>
+                  <ToggleButtons
+                    chatOpen={!layout.mainOpen}
+                    toggleChat={layout.toggleMain}
+                    onNewTask={layout.createNewTask}
+                    newTaskFirst
+                  />
+                </Toolbar.Toggles>
+                <Toolbar.Tabs>
+                  <MobileMainPanelTabSelect
+                    virtualMcpId={chatVirtualMcpId}
+                    taskId={layout.taskId}
+                  />
+                </Toolbar.Tabs>
                 <Suspense fallback={<Chat.Skeleton />}>
                   <div className="flex-1 min-h-0 overflow-hidden">
                     {layout.mainOpen ? (
@@ -469,7 +384,7 @@ function AgentInsetProvider() {
                             </div>
                           }
                         >
-                          <MainPanelContent
+                          <MainPanelWithDrawer
                             taskId={layout.taskId}
                             virtualMcpId={chatVirtualMcpId}
                           />
@@ -481,7 +396,6 @@ function AgentInsetProvider() {
                   </div>
                 </Suspense>
               </Chat.ActiveTaskProvider>
-              {mobileSidebarSheet}
             </VmEventsBridge>
           </Chat.Provider>
         </div>
@@ -499,23 +413,28 @@ function AgentInsetProvider() {
           <ToggleButtons
             chatOpen={layout.chatOpen}
             toggleChat={layout.toggleChat}
-            onNewTask={tasksOpen ? undefined : layout.createNewTask}
+            onNewTask={layout.createNewTask}
           />
         </Toolbar.Toggles>
 
-        <Chat.Provider key={chatVirtualMcpId} virtualMcpId={chatVirtualMcpId}>
-          <Toolbar.Tabs>
-            <MainPanelTabsBar
-              virtualMcpId={virtualMcpId}
-              taskId={layout.taskId}
-            />
-          </Toolbar.Tabs>
-
+        <Chat.Provider
+          key={chatVirtualMcpId}
+          virtualMcpId={chatVirtualMcpId}
+          task={ensureState.status === "ready" ? ensureState.task : null}
+        >
           <VmEventsBridge
             virtualMcpId={virtualMcpId}
             hasActiveGithubRepo={hasActiveGithubRepo}
-            vmMap={entity?.metadata?.vmMap}
+            sandboxMap={entity?.metadata?.sandboxMap}
           >
+            {/* Tabs must live under SandboxEventsProvider — useMainPanelTabs
+                gates Content on lifecycle.phase === "running" + decofile. */}
+            <Toolbar.Tabs>
+              <MainPanelTabsBar
+                virtualMcpId={virtualMcpId}
+                taskId={layout.taskId}
+              />
+            </Toolbar.Tabs>
             <NewTaskBridge
               onNewTaskRef={onNewTask}
               createNewTask={layout.createNewTask}
@@ -542,22 +461,18 @@ function AgentInsetProvider() {
 // ---------------------------------------------------------------------------
 // Default export — the per-task content for /$org/$taskId.
 //
-// Sidebar, toolbar shell, org-wide tasks panel, ChatPrefsProvider, and
-// TasksPanelStateProvider all live in `org-shell-layout` (the parent route).
-// This component just renders the per-task chrome inside the flex-row Outlet
-// on desktop, or directly inside SidebarInset on mobile.
+// Sidebar, toolbar shell, and ChatPrefsProvider live in `org-shell-layout`
+// (the parent route). This component just renders the per-task chrome inside
+// the flex-row Outlet on desktop, or directly inside SidebarInset on mobile.
 // ---------------------------------------------------------------------------
 
 export default function AgentShellLayout() {
   return (
-    <Suspense
-      fallback={
-        <div className="flex-1 flex items-center justify-center">
-          <Loading01 size={20} className="animate-spin text-muted-foreground" />
-        </div>
-      }
-    >
-      <AgentInsetProvider />
+    <Suspense fallback={<ShellRouteLoading />}>
+      <OrgFileOpenProvider>
+        <AgentInsetProvider />
+        <OrgFilePreviewMount />
+      </OrgFileOpenProvider>
     </Suspense>
   );
 }

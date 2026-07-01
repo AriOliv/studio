@@ -17,8 +17,9 @@ import {
   createServerFromClient,
 } from "@decocms/mesh-sdk";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { sharedJsonSchemaValidator } from "@decocms/mcp-utils";
 import { MCP_TOOL_CALL_TIMEOUT_MS } from "@/core/constants";
-import type { MeshContext } from "../../core/mesh-context";
+import type { StudioContext } from "../../core/studio-context";
 
 // ============================================================================
 // Types
@@ -53,7 +54,7 @@ export function toServerClient(client: Client): ServerClient {
 
 async function createMCPProxyDoNotUseDirectly(
   connectionIdOrConnection: string | ConnectionEntity,
-  ctx: MeshContext,
+  ctx: StudioContext,
   { superUser }: { superUser: boolean }, // this is basically used for background workers that needs cross-organization access
 ): Promise<MCPProxyClient> {
   // Non-superUser callers (user-facing tools) must have org context;
@@ -131,10 +132,13 @@ async function createMCPProxyDoNotUseDirectly(
   await server.connect(serverTransport);
 
   // Create client and connect to client-side transport
-  const client = new Client({
-    name: "mcp-cms-proxy-client",
-    version: "1.0.0",
-  });
+  const client = new Client(
+    {
+      name: "mcp-cms-proxy-client",
+      version: "1.0.0",
+    },
+    { jsonSchemaValidator: sharedJsonSchemaValidator },
+  );
   await client.connect(clientTransport);
 
   // Return client as MCPProxyClient (backward compatible)
@@ -149,24 +153,9 @@ async function createMCPProxyDoNotUseDirectly(
  */
 export async function createMCPProxy(
   connectionIdOrConnection: string | ConnectionEntity,
-  ctx: MeshContext,
+  ctx: StudioContext,
 ) {
   return createMCPProxyDoNotUseDirectly(connectionIdOrConnection, ctx, {
     superUser: false,
-  });
-}
-
-/**
- * Create a MCP proxy for a downstream connection with super user access
- * @param connectionIdOrConnection - The connection ID or connection entity
- * @param ctx - The mesh context
- * @returns The MCP proxy
- */
-export async function dangerouslyCreateSuperUserMCPProxy(
-  connectionIdOrConnection: string | ConnectionEntity,
-  ctx: MeshContext,
-) {
-  return createMCPProxyDoNotUseDirectly(connectionIdOrConnection, ctx, {
-    superUser: true,
   });
 }

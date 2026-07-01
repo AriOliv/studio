@@ -1,0 +1,85 @@
+import { describe, expect, it } from "bun:test";
+import {
+  embeddedUnionBlockId,
+  isAutoPreviewBlockKey,
+  isEmbeddedUnionResolveType,
+  isManifestSectionResolveType,
+  isSavedBlockResolveType,
+  parseSavedBlockSchemaTitle,
+  unionRefMatchesValue,
+} from "./block-type-utils";
+import type { LiveMeta } from "./resolve-schema";
+
+const meta: LiveMeta = {
+  manifest: {
+    blocks: {
+      sections: {
+        "site/sections/Header/Header.tsx": { $ref: "#/definitions/Header" },
+      },
+      loaders: {
+        "vtex/loaders/legacy/productList.ts": {
+          $ref: "#/definitions/ProductList",
+        },
+      },
+    },
+  },
+  schema: {},
+};
+
+describe("block-type-utils", () => {
+  it("parseSavedBlockSchemaTitle extracts block id and module path", () => {
+    expect(
+      parseSavedBlockSchemaTitle("#site/sections/Header/Header.tsx@Header"),
+    ).toEqual({
+      moduleResolveType: "site/sections/Header/Header.tsx",
+      blockId: "Header",
+    });
+  });
+
+  it("isManifestSectionResolveType distinguishes sections from loaders", () => {
+    expect(
+      isManifestSectionResolveType(meta, "site/sections/Header/Header.tsx"),
+    ).toBe(true);
+    expect(
+      isManifestSectionResolveType(meta, "vtex/loaders/legacy/productList.ts"),
+    ).toBe(false);
+  });
+
+  it("isSavedBlockResolveType detects block id references", () => {
+    expect(isSavedBlockResolveType("Header")).toBe(true);
+    expect(isSavedBlockResolveType("MelhoresMalas/MaisVendidos")).toBe(true);
+    expect(isSavedBlockResolveType("site/sections/Header/Header.tsx")).toBe(
+      false,
+    );
+    expect(isSavedBlockResolveType("__proto__")).toBe(false);
+    expect(isSavedBlockResolveType("constructor")).toBe(false);
+  });
+
+  it("isAutoPreviewBlockKey detects generated preview stubs", () => {
+    expect(isAutoPreviewBlockKey("Preview%20%2Fsections%2FFooter.tsx")).toBe(
+      true,
+    );
+    expect(isAutoPreviewBlockKey("Header")).toBe(false);
+    expect(isAutoPreviewBlockKey("%")).toBe(false);
+  });
+
+  it("isEmbeddedUnionResolveType detects inline module@blockId enums", () => {
+    expect(
+      isEmbeddedUnionResolveType("ZmlsZTovLy9...Carousel.tsx==@ImageBanner"),
+    ).toBe(true);
+    expect(
+      isEmbeddedUnionResolveType("site/sections/Images/Carousel.tsx"),
+    ).toBe(false);
+    expect(isEmbeddedUnionResolveType("Header")).toBe(false);
+  });
+
+  it("unionRefMatchesValue matches embedded union ids by suffix", () => {
+    const ref = "ZmlsZ...Carousel.tsx==@ImageBanner";
+    expect(unionRefMatchesValue(ref, ref)).toBe(true);
+    expect(unionRefMatchesValue(ref, "ImageBanner")).toBe(true);
+    expect(
+      unionRefMatchesValue(ref, "ZmlsZ...Carousel.tsx==@VideoBanner"),
+    ).toBe(false);
+    expect(embeddedUnionBlockId(ref)).toBe("ImageBanner");
+  });
+});

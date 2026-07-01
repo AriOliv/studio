@@ -1,11 +1,18 @@
 import { isModKey } from "@/web/lib/keyboard-shortcuts";
 import { calculateUsageStats } from "@/web/lib/usage-utils.ts";
 import { AUTOSEND_QUERY_VALUE, writeStoredAutosend } from "@/web/lib/autosend";
+import {
+  HOME_DRAFT_KEY,
+  clearChatDraft,
+  readChatDraft,
+  writeChatDraft,
+} from "@/web/lib/chat-draft";
 import { Button } from "@deco/ui/components/button.tsx";
 import { cn } from "@deco/ui/lib/utils.ts";
 import {
   getWellKnownDecopilotVirtualMCP,
   useProjectContext,
+  useVirtualMCP,
 } from "@decocms/mesh-sdk";
 import { useNavigate } from "@tanstack/react-router";
 import {
@@ -17,6 +24,7 @@ import {
   Lock01,
   Microphone01,
   Stop,
+  Telescope,
   Upload01,
   X,
 } from "@untitledui/icons";
@@ -28,10 +36,12 @@ import {
   useOptionalChatStream,
   useOptionalChatTask,
 } from "./context";
+import { useThreadActions } from "./store/hooks";
 import type { VirtualMCPInfo } from "./select-virtual-mcp";
 import { ChatHighlight } from "./highlight";
 import { getSupportedFileTypesLabel, modelSupportsFiles } from "./select-model";
-import { SimpleModeTierDropdown } from "./simple-mode-tier-dropdown";
+import { ChatModeRow } from "./pills/chat-mode-row";
+import { TierTrigger } from "./tier-trigger";
 import type { AiProviderModel } from "@/web/hooks/collections/use-ai-providers";
 import {
   UnsupportedFileDialog,
@@ -56,10 +66,20 @@ import { AddConnectionDialog } from "@/web/views/virtual-mcp/add-connection-dial
 import { ConnectionsBanner } from "./connections-banner";
 import { useVoiceInput } from "@/web/hooks/use-voice-input.ts";
 import { VoiceWaveform } from "./voice-input";
+import { shouldRenderInlineModeRow } from "./input-mode-row";
 
 // ============================================================================
 // useWindowFileDrop - Reusable hook for window-level file drag & drop
 // ============================================================================
+
+function ChatInputDisabledState({ message }: { message: string }) {
+  return (
+    <div className="flex w-full items-center gap-2 px-3 py-2.5 rounded-xl border border-border bg-muted/40 text-muted-foreground">
+      <Lock01 size={14} className="shrink-0" />
+      <span className="text-sm">{message}</span>
+    </div>
+  );
+}
 
 /**
  * Attaches window-level dragenter/dragleave/dragover/drop listeners and
@@ -177,17 +197,21 @@ function FileDropZone({
 // ============================================================================
 
 /**
- * Submit handler for the home composer. No active task exists; we write
- * the tiptap doc to sessionStorage and navigate to a fresh /$org/$taskId.
- * The new task page's useEnsureTask creates the thread (server-side
- * idempotent on id) and ActiveTaskProvider's autosend consumer fires
- * sendMessage on mount.
+ * Submit handler for the home composer. No active task exists; we create
+ * the thread synchronously via ThreadManagerStore so the row is in the
+ * manager's `threads` list BEFORE navigation. The new task page's
+ * `useEnsureTask` then resolves the localHit fast path on first render,
+ * skipping its own CREATE (which would otherwise duplicate against React
+ * 19 Strict Mode's intentional re-mount of the effect). Tiptap doc is
+ * written to sessionStorage and ActiveTaskProvider's autosend consumer
+ * fires sendMessage on mount.
  */
 function useHomeSubmit() {
   const navigate = useNavigate();
   const { org, locator } = useProjectContext();
+  const { create } = useThreadActions();
 
-  return ({
+  return async ({
     tiptapDoc,
     virtualMcp,
   }: {
@@ -198,10 +222,20 @@ function useHomeSubmit() {
     const targetVmcp =
       virtualMcp?.id ?? getWellKnownDecopilotVirtualMCP(org.id).id;
     writeStoredAutosend(sessionStorage, locator, newId, { tiptapDoc });
+    try {
+      await create({ id: newId, virtual_mcp_id: targetVmcp });
+    } catch {
+      // Toast already surfaced by the store; navigate anyway — the route's
+      // ensure-fallback will retry if the row is missing.
+    }
+    const search: Record<string, string> = {
+      virtualmcpid: targetVmcp,
+      autosend: AUTOSEND_QUERY_VALUE,
+    };
     navigate({
       to: "/$org/$taskId",
       params: { org: org.slug, taskId: newId },
-      search: { virtualmcpid: targetVmcp, autosend: AUTOSEND_QUERY_VALUE },
+      search,
     });
   };
 }
@@ -220,7 +254,8 @@ export function ChatInput({
   const isRunInProgress = stream?.isRunInProgress ?? false;
   const stop = stream?.stop ?? (() => {});
   const taskId = taskCtx?.taskId ?? "";
-  const tasks = taskCtx?.tasks ?? [];
+  // Storage key for the per-thread (or home composer) draft.
+  const draftKey = taskId || HOME_DRAFT_KEY;
   const homeSubmit = useHomeSubmit();
   const {
     selectedModel,
@@ -228,17 +263,17 @@ export function ChatInput({
     isModelsLoading,
     tiptapDocRef,
     imageModel,
+    webSearchModel,
     deepResearchModel,
     chatMode,
     setChatMode,
-    simpleModeTier,
-    setSimpleModeTier,
   } = useChatPrefs();
   const { data: session } = authClient.useSession();
   const userId = session?.user?.id;
 
-  const { org } = useProjectContext();
+  const { org, locator } = useProjectContext();
   const decopilotId = getWellKnownDecopilotVirtualMCP(org.id).id;
+  const fullVm = useVirtualMCP(selectedVirtualMcp?.id ?? decopilotId);
   const playSwitchSound = useSound(question004Sound);
   const [connectionsOpen, setConnectionsOpen] = useState(false);
   const { unsupportedFile, onUnsupportedFile, clearUnsupportedFile } =
@@ -289,27 +324,45 @@ export function ChatInput({
     tiptapRef.current?.syncVoiceText(voiceBaselineDocRef.current, voiceText);
   }, [voice.transcript, voice.interimTranscript, voice.status]);
 
-  const task = tasks.find((task) => task.id === taskId);
+  const task = taskCtx?.activeTask ?? null;
 
   // tiptapDoc lives here (not in context) so keystrokes don't re-render
   // the entire context tree. The ref on context lets IceBreakers read it.
-  const [tiptapDoc, setTiptapDocLocal] =
-    useState<Metadata["tiptapDoc"]>(undefined);
+  // The lazy initializer hydrates the draft from sessionStorage on mount.
+  const [tiptapDoc, setTiptapDocLocal] = useState<Metadata["tiptapDoc"]>(
+    () => readChatDraft(sessionStorage, locator, draftKey) ?? undefined,
+  );
 
   const setTiptapDoc = (doc: Metadata["tiptapDoc"]) => {
     setTiptapDocLocal(doc);
     tiptapDocRef.current = doc;
+    writeChatDraft(sessionStorage, locator, draftKey, doc, {
+      onQuotaExceeded: ({ docSizeBytes }) => {
+        track("chat_draft_quota_exceeded", {
+          thread_id: taskId || null,
+          doc_size_bytes: docSizeBytes,
+        });
+        console.warn(
+          "[chat-draft] sessionStorage quota exceeded; draft not saved",
+        );
+      },
+    });
   };
 
-  // Reset input when switching tasks (TiptapProvider also remounts via key)
+  // When switching tasks, rehydrate the new task's draft from storage
+  // (useState's lazy initializer only fires on mount). The previous
+  // task's draft is left in sessionStorage and will be picked up if the
+  // user navigates back.
   const prevTaskRef = useRef(taskId);
   // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- TODO: refactor render-time .current access
   if (prevTaskRef.current !== taskId) {
     // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- TODO: refactor render-time .current access
     prevTaskRef.current = taskId;
-    setTiptapDocLocal(undefined);
+    const restored =
+      readChatDraft(sessionStorage, locator, draftKey) ?? undefined;
+    setTiptapDocLocal(restored);
     // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- TODO: refactor render-time .current access
-    tiptapDocRef.current = undefined;
+    tiptapDocRef.current = restored;
   }
 
   // Prefer per-turn modelLimits (Claude Code reports real window at turn end)
@@ -346,18 +399,20 @@ export function ChatInput({
   const lastUsage = [...messages]
     .reverse()
     .find((m) => m.role === "assistant" && m.metadata?.usage)?.metadata?.usage;
-  // Prefer per-turn context size; fall back to cumulative for legacy messages.
-  const lastTotalTokens =
-    lastUsage?.contextTokens ??
-    (lastUsage?.totalTokens ?? 0) - (lastUsage?.reasoningTokens ?? 0);
-
-  const playClickSound = useSound(question004Sound);
+  // Per-turn context size (size of the prompt the model saw on the LATEST
+  // step). Sibling `inputTokens`/`totalTokens` are cumulative across the
+  // turn's steps — DO NOT fall back to them here; they read as if the
+  // model's context is much fuller than it actually is.
+  const lastTotalTokens = lastUsage?.contextTokens ?? 0;
 
   const canSubmit =
     !isStreaming && !isModelsLoading && !isTiptapDocEmpty(tiptapDoc);
 
   const showStopOrCancel = isStreaming || isRunInProgress;
-
+  const showInlineModeRow = shouldRenderInlineModeRow({
+    messageCount: messages.length,
+    showConnectionsBanner,
+  });
   const handleSubmit = (e?: FormEvent) => {
     e?.preventDefault();
     if (isStreaming) {
@@ -375,24 +430,19 @@ export function ChatInput({
         virtual_mcp_id: selectedVirtualMcp?.id ?? null,
         submission: e ? "button_or_enter" : "programmatic",
       });
-      playClickSound();
       if (stream) {
         void stream.sendMessage(tiptapDoc);
       } else {
         homeSubmit({ tiptapDoc, virtualMcp: selectedVirtualMcp });
       }
+      clearChatDraft(sessionStorage, locator, draftKey);
       setTiptapDoc(undefined);
     }
   };
 
   if (userId && task?.created_by && task.created_by !== userId) {
     return (
-      <div className="flex w-full items-center gap-2 px-3 py-2.5 rounded-xl border border-border bg-muted/40 text-muted-foreground">
-        <Lock01 size={14} className="shrink-0" />
-        <span className="text-sm">
-          Read only — you&apos;re viewing someone else&apos;s thread
-        </span>
-      </div>
+      <ChatInputDisabledState message="Read only - you're viewing someone else's thread" />
     );
   }
 
@@ -421,7 +471,7 @@ export function ChatInput({
             <form
               onSubmit={handleSubmit}
               className={cn(
-                "w-full relative rounded-2xl min-h-[110px] md:min-h-[130px] flex flex-col bg-background dark:bg-muted card-shadow",
+                "w-full relative rounded-2xl min-h-[110px] md:min-h-[130px] flex flex-col bg-card dark:bg-muted card-shadow overflow-hidden",
               )}
             >
               <FileDropZone
@@ -471,7 +521,7 @@ export function ChatInput({
                 ) : (
                   <>
                     {/* Left Actions (+, Tools, active tool pills, stats) */}
-                    <div className="flex items-center gap-1.5 min-w-0 shrink-0">
+                    <div className="flex items-center gap-1.5 min-w-0">
                       <ToolsPopover
                         disabled={isStreaming}
                         onOpenConnections={() => {
@@ -500,10 +550,10 @@ export function ChatInput({
                           }}
                           title="Plan mode"
                           aria-label="Plan mode"
-                          className="flex items-center gap-1.5 h-8 rounded-lg px-2.5 text-sm font-medium text-violet-600 dark:text-violet-400 hover:bg-violet-500/10 group whitespace-nowrap animate-in fade-in duration-200"
+                          className="flex items-center gap-1.5 h-8 rounded-lg px-2.5 text-sm font-medium text-violet-600 dark:text-violet-400 hover:bg-violet-500/10 group min-w-0 shrink animate-in fade-in duration-200"
                         >
                           <BookOpen01 size={14} className="shrink-0" />
-                          <span className="inline-block overflow-hidden whitespace-nowrap max-w-0 opacity-0 transition-[max-width,opacity] duration-200 ease-out @[496px]/chat-bottom:max-w-32 @[496px]/chat-bottom:opacity-100">
+                          <span className="min-w-0 truncate transition-[max-width,opacity] duration-200 ease-out max-w-0 opacity-0 @[320px]/chat-bottom:max-w-32 @[320px]/chat-bottom:opacity-100">
                             Plan mode
                           </span>
                           <X
@@ -527,10 +577,10 @@ export function ChatInput({
                           }}
                           title="Create image"
                           aria-label="Create image"
-                          className="flex items-center gap-1.5 h-8 rounded-lg px-2.5 text-sm font-medium text-pink-600 dark:text-pink-400 hover:bg-pink-500/10 group whitespace-nowrap animate-in fade-in duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                          className="flex items-center gap-1.5 h-8 rounded-lg px-2.5 text-sm font-medium text-pink-600 dark:text-pink-400 hover:bg-pink-500/10 group min-w-0 shrink animate-in fade-in duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                         >
                           <Image01 size={14} className="shrink-0" />
-                          <span className="inline-block overflow-hidden whitespace-nowrap max-w-0 opacity-0 transition-[max-width,opacity] duration-200 ease-out @[496px]/chat-bottom:max-w-[120px] @[496px]/chat-bottom:opacity-100">
+                          <span className="min-w-0 truncate transition-[max-width,opacity] duration-200 ease-out max-w-0 opacity-0 @[320px]/chat-bottom:max-w-[120px] @[320px]/chat-bottom:opacity-100">
                             Create image
                           </span>
                           <X
@@ -539,7 +589,7 @@ export function ChatInput({
                           />
                         </button>
                       )}
-                      {chatMode === "web-search" && deepResearchModel && (
+                      {chatMode === "web-search" && webSearchModel && (
                         <button
                           type="button"
                           disabled={isStreaming}
@@ -554,11 +604,38 @@ export function ChatInput({
                           }}
                           title="Web search"
                           aria-label="Web search"
-                          className="flex items-center gap-1.5 h-8 rounded-lg px-2.5 text-sm font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 group whitespace-nowrap animate-in fade-in duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                          className="flex items-center gap-1.5 h-8 rounded-lg px-2.5 text-sm font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 group min-w-0 shrink animate-in fade-in duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                         >
                           <Globe02 size={14} className="shrink-0" />
-                          <span className="inline-block overflow-hidden whitespace-nowrap max-w-0 opacity-0 transition-[max-width,opacity] duration-200 ease-out @[496px]/chat-bottom:max-w-[120px] @[496px]/chat-bottom:opacity-100">
+                          <span className="min-w-0 truncate transition-[max-width,opacity] duration-200 ease-out max-w-0 opacity-0 @[320px]/chat-bottom:max-w-[120px] @[320px]/chat-bottom:opacity-100">
                             Web search
+                          </span>
+                          <X
+                            size={14}
+                            className="shrink-0 hidden group-hover:block group-disabled:hidden"
+                          />
+                        </button>
+                      )}
+                      {chatMode === "deep-research" && deepResearchModel && (
+                        <button
+                          type="button"
+                          disabled={isStreaming}
+                          onClick={() => {
+                            playSwitchSound();
+                            track("chat_mode_changed", {
+                              from_mode: "deep-research",
+                              to_mode: "default",
+                              source: "pill_dismiss",
+                            });
+                            setChatMode("default");
+                          }}
+                          title="Deep research"
+                          aria-label="Deep research"
+                          className="flex items-center gap-1.5 h-8 rounded-lg px-2.5 text-sm font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 group min-w-0 shrink animate-in fade-in duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                        >
+                          <Telescope size={14} className="shrink-0" />
+                          <span className="min-w-0 truncate transition-[max-width,opacity] duration-200 ease-out max-w-0 opacity-0 @[320px]/chat-bottom:max-w-[120px] @[320px]/chat-bottom:opacity-100">
+                            Deep research
                           </span>
                           <X
                             size={14}
@@ -576,37 +653,41 @@ export function ChatInput({
                       )}
                     </div>
 
-                    {/* Right Actions (mic, model, send) */}
+                    {/* Right Actions (branch/mode, model, mic, send) */}
                     <div className="flex items-center gap-1.5 min-w-0">
-                      <SimpleModeTierDropdown
-                        tier={simpleModeTier}
-                        onSelect={setSimpleModeTier}
-                      />
+                      {showInlineModeRow && (
+                        <ChatModeRow
+                          virtualMcp={fullVm}
+                          currentBranch={taskCtx?.currentBranch ?? null}
+                        />
+                      )}
+                      <TierTrigger />
 
-                      {/* Microphone button — only shown when not streaming and speech is supported */}
-                      {voice.isSupported &&
-                        !isStreaming &&
-                        !isRunInProgress && (
-                          <Button
-                            type="button"
-                            onClick={handleVoiceStart}
-                            variant="ghost"
-                            size="icon"
-                            className={cn(
-                              "size-8 rounded-lg transition-colors",
-                              voice.status === "permission-denied"
-                                ? "text-destructive hover:text-destructive hover:bg-destructive/10"
-                                : "text-muted-foreground hover:text-foreground",
-                            )}
-                            title={
-                              voice.status === "permission-denied"
-                                ? "Microphone access denied — click to try again"
-                                : "Voice input"
-                            }
-                          >
-                            <Microphone01 size={18} />
-                          </Button>
-                        )}
+                      {/* Microphone button — kept mounted (and disabled)
+                          during streaming/run to avoid layout shift when
+                          the send button morphs into stop/cancel. */}
+                      {voice.isSupported && (
+                        <Button
+                          type="button"
+                          onClick={handleVoiceStart}
+                          disabled={isStreaming || isRunInProgress}
+                          variant="ghost"
+                          size="icon"
+                          className={cn(
+                            "size-8 rounded-lg transition-colors",
+                            voice.status === "permission-denied"
+                              ? "text-destructive hover:text-destructive hover:bg-destructive/10"
+                              : "text-muted-foreground hover:text-foreground",
+                          )}
+                          title={
+                            voice.status === "permission-denied"
+                              ? "Microphone access denied — click to try again"
+                              : "Voice input"
+                          }
+                        >
+                          <Microphone01 size={18} />
+                        </Button>
+                      )}
 
                       <Button
                         type={showStopOrCancel ? "button" : "submit"}

@@ -6,15 +6,16 @@
  */
 
 import { createHash } from "node:crypto";
-import type { MeshContext } from "@/core/mesh-context";
-import { TierUnavailableError, resolveTier } from "@/core/resolve-tier";
-import type { SimpleModeTier } from "@/tools/organization/schema";
-import { posthog } from "@/posthog";
+import type { StudioContext } from "@/core/studio-context";
 import {
-  consumeStream,
-  createUIMessageStream,
-  createUIMessageStreamResponse,
-} from "ai";
+  TierUnavailableError,
+  resolveTier,
+  tryResolveTier,
+} from "@/core/resolve-tier";
+import { resolveAgentTier } from "@/ai-providers/agent-tiers";
+import type { ChatTier, SimpleModeTier } from "@/tools/organization/schema";
+import { posthog } from "@/posthog";
+import { consumeStream, createUIMessageStreamResponse } from "ai";
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
@@ -31,13 +32,68 @@ import type { RunRegistry } from "./run-registry";
 import {
   checkModelPermission,
   fetchModelPermissions,
+  filterToolTiersByPermission,
   parseModelsToMap,
 } from "./model-permissions";
 import { StreamRequestSchema } from "./schemas";
 import type { ChatMessage, ModelsConfig } from "./types";
 import type { DispatchRunInput } from "./dispatch-run";
-import { enqueueThreadRun } from "@/dispatch-queue";
+import { buildDurableDispatchInput, resolveHarnessId } from "./dispatch-run";
+import { stringifyError } from "@decocms/harness/stream-error";
+import {
+  cancelHostedHarness,
+  enqueueThreadRun,
+  threadRunExists,
+} from "@/dispatch-queue";
+import {
+  publishRunStatusStage,
+  shouldPublishClusterRunStatus,
+} from "./run-status-stage";
 import { wrapWithSseKeepalive } from "./sse-keepalive";
+import { resolveDispatchTarget } from "../../../links/resolve-dispatch-target";
+import {
+  resolveSandboxProviderKindFromEnv,
+  type SandboxProviderKind,
+} from "@decocms/sandbox/provider";
+import type { HarnessId } from "@/harnesses";
+import type { Thread } from "@/storage/types";
+import { cancelThreadBackgroundJobs } from "@/harnesses/decopilot/background-tool-workflow";
+import { abortBackgroundJobs } from "@/harnesses/decopilot/background-abort-registry";
+import { PartEmitter } from "./part-emitter";
+import { uploadFileParts } from "./file-materializer";
+import { mintRunFenceToken } from "./dispatch-fence";
+
+// Per-connection /stream tail diagnostics. Flip to "1" in an environment where
+// the live stream intermittently delivers no chunks — logs the resolved
+// deliverPolicy, run age, and the delivered chunk count per connection so a
+// "policy=new + 0 chunks delivered, message still persisted" case (the
+// deliverPolicy / cross-run replay race) is visible. The null-tail (204) case
+// is logged unconditionally below since it always means a degraded buffer.
+const STREAM_TAIL_TRACE = process.env.DECOPILOT_STREAM_TRACE === "1";
+
+// ============================================================================
+// Canonical serialization helper
+// ============================================================================
+
+/**
+ * Deterministic JSON serialization with sorted object keys. Arrays keep
+ * their original order; primitives are passed through as-is.
+ *
+ * Used by computeIdempotencyKey so that a re-serialized assistant
+ * continuation message (approval / tool-output round) always hashes to the
+ * same value regardless of the order in which JS inserted object keys at
+ * runtime.
+ */
+function canonicalStringify(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(canonicalStringify).join(",")}]`;
+  const keys = Object.keys(v as object).sort();
+  const pairs = keys.map(
+    (k) =>
+      `${JSON.stringify(k)}:${canonicalStringify((v as Record<string, unknown>)[k])}`,
+  );
+  return `{${pairs.join(",")}}`;
+}
 
 // ============================================================================
 // Idempotency
@@ -58,7 +114,52 @@ export function computeIdempotencyKey(
 ): string | undefined {
   if (!lastMsg) return undefined;
   if (lastMsg.role === "user" && lastMsg.id) return lastMsg.id;
-  return createHash("sha1").update(JSON.stringify(lastMsg)).digest("hex");
+  return createHash("sha1").update(canonicalStringify(lastMsg)).digest("hex");
+}
+
+/**
+ * Decide the run fence token for a POST.
+ *
+ * The fence MUST be fresh per TURN (see `mintRunFenceToken`): it scopes the
+ * JetStream dedup key and the projector accumulator, AND keys the hosted-harness
+ * child workflow id `decopilot-hosted:<runId>:<fenceToken>`. A fresh user
+ * message and an approval/tool-output CONTINUATION are each a new turn, so each
+ * MUST mint a fresh fence. Reusing one — e.g. a continuation inheriting the
+ * proposal's fence — collides the child id with the prior turn's already-
+ * finished child, so DBOS dedupe silently drops the resume and the turn hangs
+ * forever (and the reused fence also merges two turns into one stream/projector
+ * accumulator).
+ *
+ * Only a genuine network REDELIVERY (the gate workflow id already exists) reuses
+ * the in-flight fence — minting there would clobber the live turn's fence and
+ * strand its projection. `isRedelivery` is derived from gate-workflow existence,
+ * NOT from "is the message already persisted" (which is ALSO true for a
+ * continuation re-POSTing the proposal's assistant message — the bug this fixes).
+ */
+export function planSubmitRunFence(input: {
+  isRedelivery: boolean;
+  existingFenceToken: string | null;
+  mintFenceToken: () => string;
+}): { runFenceToken: string; shouldWriteFence: boolean } {
+  if (input.isRedelivery && input.existingFenceToken) {
+    return {
+      runFenceToken: input.existingFenceToken,
+      shouldWriteFence: false,
+    };
+  }
+
+  return {
+    runFenceToken: input.mintFenceToken(),
+    shouldWriteFence: true,
+  };
+}
+
+export function shouldPersistRequestMessage(input: {
+  alreadyPersisted: boolean;
+  role: ChatMessage["role"];
+}): boolean {
+  if (!input.alreadyPersisted) return true;
+  return input.role === "assistant";
 }
 
 // ============================================================================
@@ -66,7 +167,7 @@ export function computeIdempotencyKey(
 // ============================================================================
 
 async function validateRequest(
-  c: Context<{ Variables: { meshContext: MeshContext } }>,
+  c: Context<{ Variables: { meshContext: StudioContext } }>,
 ) {
   const organization = ensureOrganization(c);
   const rawPayload = await c.req.json();
@@ -86,6 +187,29 @@ async function validateRequest(
     requestMessage,
     ...rest,
   };
+}
+
+/**
+ * Look up the providerId for the credential the request would use, so
+ * POST /messages can pick the right harness (and therefore the right
+ * link capability) before enqueuing onto the thread gate. Returns
+ * undefined when the credential row isn't found — the caller falls back
+ * to "decopilot" (matches the existing prepareRun behavior).
+ */
+async function resolveProviderId(
+  ctx: StudioContext,
+  credentialId: string,
+  organizationId: string,
+): Promise<string | undefined> {
+  try {
+    const row = await ctx.storage.aiProviderKeys.findById(
+      credentialId,
+      organizationId,
+    );
+    return row?.providerId;
+  } catch {
+    return undefined;
+  }
 }
 
 // ============================================================================
@@ -118,48 +242,166 @@ function toModelInfo(resolved: Awaited<ReturnType<typeof resolveTier>>) {
 }
 
 /**
- * Try to resolve a tier without failing the whole request. Returns null when
- * the tier is unconfigured + has no curated default — used for optional
- * auxiliary tiers (image, web_research) where missing-credentials should
- * disable the corresponding tool, not 400 the chat request.
- */
-async function tryResolveTier(ctx: MeshContext, tier: SimpleModeTier) {
-  try {
-    return await resolveTier(ctx, tier);
-  } catch (err) {
-    if (err instanceof TierUnavailableError) return null;
-    console.warn(`[decopilot] tier "${tier}" resolution failed:`, err);
-    return null;
-  }
-}
-
-/**
  * Resolves a tier (defaulting to "smart") to a full ModelsConfig via the
  * shared resolveTier(), which falls back to curated provider defaults when
  * the org's tier slot is unset. Also resolves the "image" and "web_research"
  * tiers — when present they enable the generate_image and web_search
  * built-in tools (registration is conditional in built-in-tools/index.ts).
+ *
+ * Exported so server-initiated dispatch paths (e.g. preset-task /start)
+ * can compose a ModelsConfig the same way HTTP chat does, instead of
+ * duplicating the tier-resolution + tryResolve fallback logic.
  */
 async function resolvePerRequestModels(
-  ctx: MeshContext,
+  ctx: StudioContext,
   tier: SimpleModeTier | undefined,
+  harnessId: HarnessId | null | undefined,
 ): Promise<ModelsConfig> {
-  const [chat, image, webResearch] = await Promise.all([
+  if (harnessId === "claude-code" || harnessId === "codex") {
+    const chatTier: ChatTier =
+      tier === "fast" || tier === "smart" || tier === "thinking"
+        ? tier
+        : "smart";
+    const entry = resolveAgentTier(harnessId, chatTier);
+    if (!entry) {
+      // Should be unreachable — resolveAgentTier returns non-null for
+      // both supported CLI harnesses and every ChatTier value.
+      throw new Error(
+        `No model mapping for harness "${harnessId}" tier "${chatTier}"`,
+      );
+    }
+    return {
+      credentialId: `desktop:${harnessId}`,
+      thinking: {
+        id: entry.modelId,
+        title: entry.label,
+        provider: harnessId,
+        capabilities: { vision: true, text: true },
+      },
+    };
+  }
+
+  const [chat, image, webSearch, deepResearch] = await Promise.all([
     resolveTier(ctx, tier ?? "smart"),
     tryResolveTier(ctx, "image"),
-    tryResolveTier(ctx, "web_research"),
+    tryResolveTier(ctx, "web_search"),
+    tryResolveTier(ctx, "deep_research"),
   ]);
   return {
     credentialId: chat.credentialId,
     thinking: toModelInfo(chat),
-    ...(image ? { image: toModelInfo(image) } : {}),
-    ...(webResearch ? { deepResearch: toModelInfo(webResearch) } : {}),
+    ...(image
+      ? { image: { ...toModelInfo(image), credentialId: image.credentialId } }
+      : {}),
+    ...(webSearch
+      ? {
+          webSearch: {
+            ...toModelInfo(webSearch),
+            credentialId: webSearch.credentialId,
+          },
+        }
+      : {}),
+    ...(deepResearch
+      ? {
+          deepResearch: {
+            ...toModelInfo(deepResearch),
+            credentialId: deepResearch.credentialId,
+          },
+        }
+      : {}),
   };
 }
 
 // ============================================================================
 // Shared validate path
 // ============================================================================
+
+/**
+ * Resolve the effective (harnessId, sandboxProviderKind, branch) for a
+ * dispatch, given the values the client supplied and the (possibly
+ * locked) thread row.
+ *
+ * Once a thread row carries a non-null `harness_id`, the thread's
+ * runtime is pinned for life: the row's values win and any
+ * client-provided override is silently dropped. If the row is unlocked
+ * (`harness_id == null`) or there's no thread at all (first message of
+ * a freshly-created thread, or `taskIdInput === undefined`) we fall
+ * back to the client values.
+ *
+ * Exported so the guard can be unit-tested without standing up the rest
+ * of `validate()` (model resolution, permission checks, Hono context).
+ *
+ * See spec:
+ * docs/superpowers/specs/2026-06-03-lock-thread-harness-and-branch-design.md
+ */
+export function applyThreadLock(args: {
+  taskIdInput: string | undefined;
+  thread: Pick<
+    Thread,
+    "harness_id" | "sandbox_provider_kind" | "branch"
+  > | null;
+  requestedHarnessId: HarnessId | null | undefined;
+  requestedSandboxProviderKind: SandboxProviderKind | null | undefined;
+  requestedBranch: string | null | undefined;
+}): {
+  harnessId: HarnessId | null | undefined;
+  sandboxProviderKind: SandboxProviderKind | null | undefined;
+  branch: string | null | undefined;
+  locked: boolean;
+} {
+  const {
+    taskIdInput,
+    thread,
+    requestedHarnessId,
+    requestedSandboxProviderKind,
+    requestedBranch,
+  } = args;
+
+  if (!taskIdInput || !thread?.harness_id) {
+    return {
+      harnessId: requestedHarnessId,
+      sandboxProviderKind: requestedSandboxProviderKind,
+      // Prefer the thread's own branch even while the thread is still
+      // unlocked (harness_id null = this is the first message). The branch is
+      // assigned at COLLECTION_THREADS_CREATE time, so it exists before the
+      // harness/sandbox lock is written. Falling back to `requestedBranch`
+      // here — as we used to — meant the first turn resolved to a null branch
+      // and dispatched against the synthetic "ephemeral" sandbox, while
+      // continuations (by then locked) used the thread's real branch. The
+      // claude-code session created on turn 1 then lived in a different
+      // sandbox than the one `claude --resume` ran in on turn 2, producing
+      // "No conversation found with session ID". Matches the pin-write
+      // resolution in the POST handler (`existingThread?.branch ?? …`).
+      //
+      // Only consult the thread row when there is a real `taskIdInput`;
+      // legacy callers with no thread id must ignore the row entirely (the
+      // `!taskIdInput` half of the guard above), same as harness/sandbox.
+      branch: taskIdInput
+        ? (thread?.branch ?? requestedBranch)
+        : requestedBranch,
+      locked: false,
+    };
+  }
+
+  if (requestedHarnessId && requestedHarnessId !== thread.harness_id) {
+    console.warn(
+      "decopilot.submit: ignored harness override on locked thread",
+      {
+        threadId: taskIdInput,
+        requested: requestedHarnessId,
+        locked: thread.harness_id,
+      },
+    );
+  }
+
+  return {
+    harnessId: thread.harness_id as HarnessId,
+    sandboxProviderKind:
+      (thread.sandbox_provider_kind as SandboxProviderKind | null) ?? undefined,
+    branch: thread.branch ?? null,
+    locked: true,
+  };
+}
 
 /**
  * Parse + permission-check an HTTP request into a `DispatchRunInput`
@@ -175,9 +417,14 @@ async function resolvePerRequestModels(
  * Legacy callers that supply the id in the body alone are unaffected.
  */
 async function validate(
-  c: Context<{ Variables: { meshContext: MeshContext } }>,
+  c: Context<{ Variables: { meshContext: StudioContext } }>,
   threadIdParam: string | undefined,
-): Promise<DispatchRunInput> {
+): Promise<
+  DispatchRunInput & {
+    sandboxProviderKind?: SandboxProviderKind | null;
+    harnessId?: HarnessId | null;
+  }
+> {
   const ctx = c.get("meshContext");
 
   const {
@@ -192,6 +439,8 @@ async function validate(
     branch,
     toolApprovalLevel,
     mode,
+    sandboxProviderKind,
+    harnessId,
   } = await validateRequest(c);
 
   const bodyThreadId = thread_id ?? memoryConfig?.thread_id;
@@ -207,7 +456,34 @@ async function validate(
     throw new HTTPException(401, { message: "User ID is required" });
   }
 
-  const models = await resolvePerRequestModels(ctx, tier);
+  // Lock guard: once a thread row carries a non-null `harness_id`, the
+  // thread's runtime (harness, sandbox provider, branch) is pinned for
+  // life. Any client-provided override is silently dropped, and the
+  // per-request model resolution below uses the locked harness so we
+  // never dispatch with mismatched (harness, models).
+  //
+  // See spec:
+  // docs/superpowers/specs/2026-06-03-lock-thread-harness-and-branch-design.md
+  const lockedThread = taskIdInput
+    ? await ctx.storage.threads.get(taskIdInput)
+    : null;
+  const {
+    harnessId: effectiveHarnessId,
+    sandboxProviderKind: effectiveSandboxProviderKind,
+    branch: effectiveBranch,
+  } = applyThreadLock({
+    taskIdInput,
+    thread: lockedThread,
+    requestedHarnessId: harnessId,
+    requestedSandboxProviderKind: sandboxProviderKind,
+    requestedBranch: branch,
+  });
+
+  const resolvedModels = await resolvePerRequestModels(
+    ctx,
+    tier,
+    effectiveHarnessId,
+  );
 
   const allowedModels = await fetchModelPermissions(
     ctx.db,
@@ -218,14 +494,19 @@ async function validate(
     allowedModels !== undefined &&
     !checkModelPermission(
       allowedModels,
-      models.credentialId,
-      models.thinking.id,
+      resolvedModels.credentialId,
+      resolvedModels.thinking.id,
     )
   ) {
     throw new HTTPException(403, {
       message: "Model not allowed for your role",
     });
   }
+  // Silently drop tool tiers (image, deepResearch) that resolve to a key
+  // the user's role can't access — otherwise an admin-set tier slot would
+  // grant restricted users implicit access to the underlying credential
+  // via generate_image / web_search.
+  const models = filterToolTiersByPermission(allowedModels, resolvedModels);
 
   return {
     messages: [...systemMessages, requestMessage],
@@ -238,7 +519,9 @@ async function validate(
     userId,
     taskId: taskIdInput,
     windowSize: memoryConfig?.windowSize ?? DEFAULT_WINDOW_SIZE,
-    branch: branch ?? null,
+    branch: effectiveBranch ?? null,
+    sandboxProviderKind: effectiveSandboxProviderKind ?? null,
+    harnessId: effectiveHarnessId ?? null,
   };
 }
 
@@ -250,11 +533,18 @@ export interface DecopilotDeps {
   cancelBroadcast: CancelBroadcast;
   streamBuffer: StreamBuffer;
   runRegistry: RunRegistry;
+  /**
+   * Live desktop-link status probe. Threaded onto the StudioContext so the
+   * decopilot dispatch path can consult the daemon directly. POST /messages
+   * uses it to reject early when no link answers instead of silently queueing
+   * a run that would have nowhere to go.
+   */
+  linkStatusProbe?: import("@/links/tunnel-status-probe").LinkStatusProbe;
 }
 
 export function createDecopilotRoutes(deps: DecopilotDeps) {
   const { cancelBroadcast, streamBuffer, runRegistry } = deps;
-  const app = new Hono<{ Variables: { meshContext: MeshContext } }>();
+  const app = new Hono<{ Variables: { meshContext: StudioContext } }>();
 
   // ============================================================================
   // Allowed Models Endpoint
@@ -309,6 +599,7 @@ export function createDecopilotRoutes(deps: DecopilotDeps) {
 
   app.post("/:org/decopilot/threads/:threadId/messages", async (c) => {
     try {
+      const ctx = c.get("meshContext");
       const input = await validate(c, c.req.param("threadId"));
       const taskId = input.taskId;
       if (!taskId) {
@@ -317,16 +608,215 @@ export function createDecopilotRoutes(deps: DecopilotDeps) {
         throw new HTTPException(400, { message: "threadId is required" });
       }
 
-      const { abortSignal: _ignored, ...serializableRequest } = input;
-      const lastMsg = input.messages[input.messages.length - 1];
-      const idempotencyKey = computeIdempotencyKey(lastMsg);
+      // Resolve the dispatch target up-front so we can reject a
+      // request with 409 *before* enqueuing it onto the thread gate.
+      // Holding the link-online decision at POST time also keeps DBOS
+      // replay from rerouting the run if the daemon disconnects between
+      // enqueue and dispatch (the workflow body reads target directly off
+      // the serialized request).
+      //
+      // The thread row's (sandbox_provider_kind, harness_id) are the
+      // single source of truth for routing. Tolerate storage failure when
+      // loading the thread row — a missing/erroring row just means we fall
+      // back to the request body / default helpers (the canonical thread row
+      // is created by COLLECTION_THREADS_CREATE before the first POST, but
+      // legacy callers and tests may skip it).
+      let existingThread: Awaited<
+        ReturnType<typeof ctx.storage.threads.get>
+      > | null = null;
+      try {
+        existingThread = (await ctx.storage.threads?.get?.(taskId)) ?? null;
+      } catch {
+        existingThread = null;
+      }
+
+      // Fall back to the "ephemeral" synthetic branch when neither the
+      // thread row nor the request body pins one. Synthetic branches
+      // (see packages/sandbox/daemon/constants.ts:isSyntheticBranch) are
+      // accepted by the daemon as sandboxMap routing keys but never checked
+      // out — exactly the right semantics for Decopilot threads on
+      // agents with no clonable repo, where the branch is purely an
+      // isolation key.
+      const branch = existingThread?.branch ?? input.branch ?? "ephemeral";
+
+      // Determine the pinned (kind, harness). If the thread row has them,
+      // use those. Otherwise this is the first message — derive defaults and
+      // persist to the thread row.
+      let pinnedKind = (existingThread?.sandbox_provider_kind ??
+        null) as SandboxProviderKind | null;
+
+      const providerId = await resolveProviderId(
+        ctx,
+        input.models.credentialId,
+        input.organizationId,
+      );
+      const credentialHarness = resolveHarnessId(providerId);
+
+      let pinnedHarness = (existingThread?.harness_id ??
+        null) as HarnessId | null;
+      let messageStorageVersion = existingThread?.message_storage_version ?? 2;
+
+      if (!pinnedKind || !pinnedHarness) {
+        pinnedKind =
+          pinnedKind ??
+          input.sandboxProviderKind ??
+          resolveSandboxProviderKindFromEnv();
+        pinnedHarness = pinnedHarness ?? input.harnessId ?? credentialHarness;
+
+        if (existingThread) {
+          // Stream-of-record v2 is the ONLY write path (Phase C cutover). Pin
+          // every NEW thread (no prior messages, not already v2) to v2 so the
+          // ingest → JetStream → durable-projector pipeline persists its parts.
+          // Pre-existing v1 threads WITH history stay v1: deprecated read-only
+          // legacy — their `thread_messages` rows still render via the v1 read
+          // path; no backfill. The message-count probe only runs for not-yet-v2
+          // threads, so already-v2 threads add no DB read.
+          let pinV2 = false;
+          if (existingThread.message_storage_version !== 2) {
+            try {
+              const { total } = await ctx.storage.threads.listMessages(taskId, {
+                limit: 1,
+              });
+              pinV2 = total === 0;
+            } catch {
+              pinV2 = false;
+            }
+          }
+          try {
+            // Persist `branch` unconditionally on the initial pin write so
+            // the thread row is the single source of truth the lock guard
+            // (validate() / applyThreadLock) reads on every follow-up.
+            // Previously we only stored the synthetic "ephemeral" fallback
+            // (`branchWasDefaulted` path); a user who explicitly picked
+            // "main" on the first message would have it dropped here, and
+            // the lock would later resolve to null and dispatch against
+            // "ephemeral" instead. The lock contract (spec
+            // 2026-06-03-lock-thread-harness-and-branch-design.md) says
+            // all three locked fields are pinned together — branch is no
+            // exception.
+            await ctx.storage.threads?.update?.(taskId, {
+              sandbox_provider_kind: pinnedKind,
+              harness_id: pinnedHarness,
+              branch,
+              ...(pinV2 ? { message_storage_version: 2 } : {}),
+            });
+            if (pinV2) messageStorageVersion = 2;
+          } catch (err) {
+            console.warn(
+              "[decopilot:messages] failed to persist thread pins",
+              err,
+            );
+          }
+        }
+      }
+
+      if (messageStorageVersion !== 2) {
+        throw new HTTPException(409, {
+          message:
+            "Thread uses legacy message storage and cannot accept new messages",
+        });
+      }
+
+      // `resolveDispatchTarget` only needs the resolved `sandboxProviderKind`
+      // — we pass it directly instead of provisioning a VM here. VM
+      // provisioning happens lazily inside the built-in tools layer
+      // (`apps/mesh/src/harnesses/decopilot/built-in-tools/index.ts`'s
+      // `ensureHandle`) on the first VM-tool invocation. Eagerly calling
+      // `ensureSandbox` at POST time used to fail in environments without a
+      // link daemon for the user even when the run never touches the
+      // sandbox (e.g. CI multi-pod tests that drive only the mock AI
+      // provider).
+      const target = resolveDispatchTarget({ sandboxProviderKind: pinnedKind });
+
+      const requestMessage = input.messages.find((m) => m.role !== "system");
+      if (!requestMessage) {
+        throw new HTTPException(400, {
+          message: "No user message found in input",
+        });
+      }
+      const materializedRequestMessage = (
+        await uploadFileParts([requestMessage], ctx, {
+          threadId: taskId,
+        })
+      ).find((m) => m.role !== "system");
+      if (!materializedRequestMessage) {
+        throw new HTTPException(400, {
+          message: "No user message found after file materialization",
+        });
+      }
+      const messageId = materializedRequestMessage.id ?? crypto.randomUUID();
+      const persistedRequestMessage = {
+        ...materializedRequestMessage,
+        id: messageId,
+      };
+      const alreadyPersisted = Boolean(
+        await ctx.db
+          .selectFrom("thread_message_parts")
+          .select("id")
+          .where("thread_id", "=", taskId)
+          .where("message_id", "=", messageId)
+          .executeTakeFirst(),
+      );
+      // Idempotency / fence decision. The gate workflow id is keyed by the
+      // turn's idempotency key, so a fresh user message AND an approval/
+      // tool-output continuation (whose re-POSTed assistant message hashes
+      // differently) each map to a NEW workflow id; only a network redelivery of
+      // the same POST collapses onto an existing one. The fence reuse keys off
+      // THIS redelivery — NOT `alreadyPersisted`, which is also true for a
+      // continuation that is nonetheless a new turn needing a fresh fence.
+      const idempotencyKey = computeIdempotencyKey(persistedRequestMessage);
       const workflowID = idempotencyKey
         ? `thread-run:${taskId}:${idempotencyKey}`
         : undefined;
+      const isRedelivery = workflowID
+        ? await threadRunExists(workflowID)
+        : false;
+      const existingFenceToken = isRedelivery
+        ? await ctx.storage.threads.getRunFence(taskId)
+        : null;
+      const { runFenceToken, shouldWriteFence } = planSubmitRunFence({
+        isRedelivery,
+        existingFenceToken,
+        mintFenceToken: mintRunFenceToken,
+      });
+      if (shouldWriteFence) {
+        await ctx.storage.threads.setRunFence(taskId, runFenceToken);
+      }
 
+      const emitter = new PartEmitter({
+        storage: ctx.storage.threads.messageParts(),
+        orgId: input.organizationId,
+        threadId: taskId,
+        runId: taskId,
+      });
+      if (
+        shouldPersistRequestMessage({
+          alreadyPersisted,
+          role: persistedRequestMessage.role,
+        })
+      ) {
+        await emitter.emitRequestMessage(persistedRequestMessage);
+      }
+
+      const serializableRequest = buildDurableDispatchInput(input, {
+        messageId,
+        runFenceToken,
+        branch,
+        sandboxProviderKind: pinnedKind,
+        harnessId: pinnedHarness,
+        target,
+      });
       // The workflow body emits `chat_message_started` inside a DBOS step,
       // so idempotent retries that collapse onto an existing workflowID
       // don't double-count in PostHog. Don't add a duplicate emit here.
+      if (
+        shouldPublishClusterRunStatus({
+          harnessId: pinnedHarness,
+          sandboxProviderKind: target.sandboxProviderKind,
+        })
+      ) {
+        await publishRunStatusStage(streamBuffer, taskId, "waiting-runner");
+      }
       await enqueueThreadRun(
         {
           threadId: taskId,
@@ -357,19 +847,68 @@ export function createDecopilotRoutes(deps: DecopilotDeps) {
   // ============================================================================
 
   app.post("/:org/decopilot/cancel/:threadId", async (c) => {
-    const { taskId, thread, organization } = await validateThreadOwnership(c);
+    const { ctx, taskId, thread, organization, userId } =
+      await validateThreadOwnership(c);
 
-    // Try to cancel locally first
+    // Persist durable cancel flag so the ingest backstop rejects 409.
+    await ctx.storage.threads.setCancelRequested(taskId, organization.id);
+
+    // Tear down any background-tool workflows this thread started (image gen /
+    // backgrounded subtasks). They run on their own DBOS queue, so the
+    // in-memory run cancel below doesn't reach them. Non-fatal: a DBOS hiccup
+    // must not block the user-facing cancel.
+    await cancelThreadBackgroundJobs(taskId).catch((err) => {
+      console.error("[decopilot:cancel] failed to cancel background jobs", {
+        taskId,
+        err,
+      });
+    });
+
+    // Tear down the hosted-harness child workflow (Task 7b). The in-memory cancel
+    // below (cancelBroadcast + run-registry CANCEL → AbortController) already
+    // stops the running harness loop; this additionally tells DBOS to stop
+    // recovering / retrying the child on pod recycles. Keyed by
+    // `decopilot-hosted:<runId>:<fenceToken>` — read the current fence from the
+    // thread row. Best-effort: cancelling an already-finished/unknown workflow
+    // (e.g. desktop runs, which have no hosted child) must not fail the cancel.
+    try {
+      const fenceToken = await ctx.storage.threads.getRunFence(taskId);
+      if (fenceToken) {
+        await cancelHostedHarness(taskId, fenceToken);
+      }
+    } catch (err) {
+      console.error("[decopilot:cancel] failed to cancel hosted harness", {
+        taskId,
+        err,
+      });
+    }
+
+    // Abort in-flight background work on this pod now, and fan the cancel out
+    // to every pod over NATS. Always broadcast: a background job runs on
+    // whichever pod DBOS dequeued it, so a locally-owned turn no longer implies
+    // no other pod is involved. Each pod's onCancel aborts its background
+    // controllers (`abortBackgroundJobs`) and cancels the live turn if it owns
+    // it; both are no-ops where they don't apply.
+    abortBackgroundJobs(taskId);
+    cancelBroadcast.broadcast(taskId);
+
+    // Try to cancel the live turn locally for an immediate response.
     const cancelTransitions = await runRegistry.execute({
       type: "CANCEL",
       taskId,
     });
     if (cancelTransitions.some((t) => t.event.type === "RUN_FAILED")) {
+      cancelBroadcast.publishControlFrame(userId, {
+        type: "cancel",
+        runId: taskId,
+      });
       return c.json({ cancelled: true });
     }
 
-    // Not on this pod — broadcast to all pods
-    cancelBroadcast.broadcast(taskId);
+    cancelBroadcast.publishControlFrame(userId, {
+      type: "cancel",
+      runId: taskId,
+    });
 
     // Ghost run: server restarted while a run was in progress. No pod has this
     // run in memory, so the broadcast will never resolve. Force-fail the thread
@@ -403,10 +942,13 @@ export function createDecopilotRoutes(deps: DecopilotDeps) {
   // Stream Endpoint — tail the per-thread JetStream subject
   // ============================================================================
   //
-  // Pure watch endpoint. The persistent connection stays open across runs —
-  // JetStream-level `{done}` sentinels are skipped on the server, and
-  // clients detect run boundaries from the AI-SDK `{type: "finish"}` chunk
-  // in the stream. One open stream per (tab, thread) covers every run.
+  // Pure live tail. The client owns initial message state via the
+  // `COLLECTION_THREAD_MESSAGES_LIST` MCP tool and re-fetches the latest
+  // page on every reconnect; this endpoint serves only live UI message
+  // chunks from the JetStream subject. The persistent connection stays
+  // open across runs — clients detect run boundaries from the AI-SDK
+  // `{type: "finish"}` chunk. One open stream per (tab, thread) covers
+  // every run.
   //
   // Recovery for in-flight runs whose owning pod died is handled out of
   // band: the thread-gate workflow step is restarted by the DBOS recovery
@@ -423,42 +965,102 @@ export function createDecopilotRoutes(deps: DecopilotDeps) {
       // to a non-owner pod (any multi-pod deployment, including mid-deploy
       // and after a DBOS replay rehome) needs `"all"` to catch chunks the
       // owning pod has already pumped to the shared JetStream subject.
-      // The buffer is purged on terminal events (run-reactor), so `"all"`
-      // only ever replays the current in-flight run.
+      // `"all"` replays the whole per-thread subject (catch-up to the in-flight
+      // run); `"new"` when the thread is idle so a just-completed run's tail
+      // isn't replayed. No fence-filter — the tail forwards EVERY run's chunks
+      // and the client reassembler folds them per run (a continuation's
+      // tool-output reconciles against the proposal it seeds from).
       const deliverPolicy = thread.status === "in_progress" ? "all" : "new";
+      const runStartedAgoMs = thread.run_started_at
+        ? Date.now() - new Date(thread.run_started_at).getTime()
+        : null;
       const tailChunkStream = await streamBuffer.createTailStream(
         taskId,
         c.req.raw.signal,
         { deliverPolicy },
       );
       if (!tailChunkStream) {
+        // A null tail means the JetStream buffer is degraded on this pod
+        // (client gets 204 → no live chunks). High-signal, always logged.
+        console.warn(
+          JSON.stringify({
+            msg: "decopilot-stream-diag",
+            event: "tail-unavailable-204",
+            taskId,
+            threadStatus: thread.status,
+            deliverPolicy,
+            runStartedAgoMs,
+          }),
+        );
         return c.body(null, 204);
       }
 
-      const tailStream = createUIMessageStream({
-        execute: async ({ writer }) => {
-          const reader = tailChunkStream.getReader();
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              writer.write(value);
-            }
-          } finally {
-            reader.releaseLock();
-          }
-        },
-      });
+      if (STREAM_TAIL_TRACE) {
+        console.warn(
+          JSON.stringify({
+            msg: "decopilot-stream-diag",
+            event: "tail-open",
+            taskId,
+            threadStatus: thread.status,
+            deliverPolicy,
+            runStartedAgoMs,
+          }),
+        );
+      }
 
+      // Pure pass-through: `createTailStream` decoded the NATS log into
+      // UIMessageChunks; hand them straight to the SSE serializer. The client
+      // (useChat) is the only reassembler — a server-side `createUIMessageStream`
+      // layer added nothing to the wire and any stateful reassembly here would
+      // choke on a replayed run's chunks.
       return wrapWithSseKeepalive(
         createUIMessageStreamResponse({
-          stream: tailStream,
+          stream: tailChunkStream,
           consumeSseStream: consumeStream,
         }),
       );
     } catch (err) {
       if (err instanceof HTTPException) throw err;
-      console.error("[decopilot:stream] Error", err);
+      console.error("[decopilot:stream] Error", stringifyError(err));
+      return c.body(null, 500);
+    }
+  });
+
+  // ============================================================================
+  // Subtask Stream Endpoint — tail a backgrounded subtask's per-job subject
+  // ============================================================================
+  //
+  // A backgrounded `subtask` runs off the thread and publishes its live run to
+  // `decopilot.stream.<jobId>` (NOT the thread's subject), so the subtask card's
+  // panel can tail it without colliding with the thread's own single-writer
+  // stream. `deliverPolicy: "all"` replays the run from its start, since the
+  // panel typically opens after the subtask was kicked off. The jobId must be a
+  // `bgtool:<threadId>:…` id for THIS thread — that scoping is the authz.
+  app.get("/:org/decopilot/threads/:threadId/jobs/:jobId/stream", async (c) => {
+    try {
+      const { taskId } = await validateThreadAccess(c);
+      const jobId = c.req.param("jobId");
+      if (!jobId || !jobId.startsWith(`bgtool:${taskId}:`)) {
+        return c.body(null, 404);
+      }
+
+      const tailChunkStream = await streamBuffer.createTailStream(
+        jobId,
+        c.req.raw.signal,
+        { deliverPolicy: "all" },
+      );
+      if (!tailChunkStream) return c.body(null, 204);
+
+      // Pure pass-through (the subtask subject is already per-job/single-run).
+      return wrapWithSseKeepalive(
+        createUIMessageStreamResponse({
+          stream: tailChunkStream,
+          consumeSseStream: consumeStream,
+        }),
+      );
+    } catch (err) {
+      if (err instanceof HTTPException) throw err;
+      console.error("[decopilot:subtask-stream] Error", stringifyError(err));
       return c.body(null, 500);
     }
   });

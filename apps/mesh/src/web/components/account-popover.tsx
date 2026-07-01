@@ -22,23 +22,28 @@ import { useIsMobile } from "@deco/ui/hooks/use-mobile.ts";
 import {
   Check,
   Copy01,
+  Download01,
   File06,
   Globe01,
   LogOut01,
   Monitor01,
   Moon01,
   Plus,
+  SearchMd,
   Settings02,
   Shield01,
   Sun,
   Users03,
   VolumeMax,
   VolumeX,
+  XClose,
 } from "@untitledui/icons";
 import { GitHubIcon } from "@daveyplate/better-auth-ui";
 import { SidebarMenuButton } from "@deco/ui/components/sidebar.tsx";
-import { authClient } from "@/web/lib/auth-client";
+import { authClient, useActiveOrganizations } from "@/web/lib/auth-client";
+import { useProjectContext } from "@decocms/mesh-sdk";
 import { track } from "@/web/lib/posthog-client";
+import { clearPersistedQueryCache } from "@/web/lib/query-persist";
 import { CreateOrganizationDialog } from "@/web/components/create-organization-dialog";
 import { usePreferences, type ThemeMode } from "@/web/hooks/use-preferences.ts";
 import { toast } from "@deco/ui/components/sonner.js";
@@ -137,37 +142,80 @@ function MenuItemButton({
 }
 
 function OrganizationsPanel({
-  sortedOrgs,
   orgParam,
   onSelectOrg,
   onCreateOrg,
 }: {
-  sortedOrgs: Array<{
-    id: string;
-    name: string;
-    slug: string;
-    logo?: string | null;
-  }>;
   orgParam?: string;
   onSelectOrg: (slug: string) => void;
   onCreateOrg: () => void;
 }) {
+  // Fetched here, not in the parent: this panel only mounts inside the open
+  // popover/drawer, so the (potentially large) organization.list call is
+  // deferred until the switcher is actually opened — it no longer fires on
+  // every page load.
+  const { data: organizations } = useActiveOrganizations();
+  const sortedOrgs = [...(organizations ?? [])].sort((a, b) => {
+    if (a.slug === orgParam) return -1;
+    if (b.slug === orgParam) return 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [query, setQuery] = useState("");
+
+  const q = query.toLowerCase();
+  const filtered = q
+    ? sortedOrgs.filter(
+        (o) =>
+          o.name.toLowerCase().includes(q) || o.slug.toLowerCase().includes(q),
+      )
+    : sortedOrgs;
+
+  const iconBtnClass =
+    "flex items-center justify-center size-7 rounded-md text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors";
+
+  function toggleSearch() {
+    if (searchOpen) setQuery("");
+    setSearchOpen((prev) => !prev);
+  }
+
   return (
     <>
       <div className="flex items-center justify-between px-4 py-3">
-        <span className="text-sm font-medium text-muted-foreground/60">
-          Your Organizations
-        </span>
-        <button
-          type="button"
-          onClick={onCreateOrg}
-          className="flex items-center justify-center size-7 rounded-md text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors"
-        >
-          <Plus size={16} />
-        </button>
+        {searchOpen ? (
+          <input
+            autoFocus
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Escape" && toggleSearch()}
+            placeholder="Search organizations..."
+            className="flex-1 min-w-0 bg-transparent text-sm outline-none placeholder:text-muted-foreground/60"
+          />
+        ) : (
+          <span className="text-sm font-medium text-muted-foreground/60">
+            Your Organizations
+          </span>
+        )}
+        <div className="flex items-center gap-1 shrink-0">
+          <button type="button" onClick={toggleSearch} className={iconBtnClass}>
+            {searchOpen ? <XClose size={16} /> : <SearchMd size={16} />}
+          </button>
+          <button type="button" onClick={onCreateOrg} className={iconBtnClass}>
+            <Plus size={16} />
+          </button>
+        </div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto p-1.5 flex flex-col gap-1">
-        {sortedOrgs.map((org) => (
+        {filtered.length === 0 && (
+          <p className="px-3 py-4 text-sm text-muted-foreground/60 text-center">
+            {query
+              ? `No organizations match "${query}"`
+              : "No organizations available"}
+          </p>
+        )}
+        {filtered.map((org) => (
           <button
             key={org.id}
             type="button"
@@ -208,12 +256,12 @@ function AccountPopoverContent({
   themeOptions,
   preferences,
   setPreferences,
-  sortedOrgs,
   orgParam,
   onSelectOrg,
   onCreateOrg,
   close,
   isMobile,
+  open,
 }: {
   user: { id?: string; name?: string; email?: string } | undefined;
   userImage?: string;
@@ -222,17 +270,12 @@ function AccountPopoverContent({
   themeOptions: { value: ThemeMode; icon: React.ReactNode; label: string }[];
   preferences: ReturnType<typeof usePreferences>[0];
   setPreferences: ReturnType<typeof usePreferences>[1];
-  sortedOrgs: Array<{
-    id: string;
-    name: string;
-    slug: string;
-    logo?: string | null;
-  }>;
   orgParam?: string;
   onSelectOrg: (slug: string) => void;
   onCreateOrg: () => void;
   close: () => void;
   isMobile: boolean;
+  open: boolean;
 }) {
   if (isMobile) {
     // Mobile: single-column scrollable layout
@@ -284,7 +327,7 @@ function AccountPopoverContent({
           {/* Org switcher */}
           <div className="border-b border-border pb-2">
             <OrganizationsPanel
-              sortedOrgs={sortedOrgs}
+              key={String(open)}
               orgParam={orgParam}
               onSelectOrg={onSelectOrg}
               onCreateOrg={onCreateOrg}
@@ -467,7 +510,7 @@ function AccountPopoverContent({
       {/* Right panel - org selector */}
       <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
         <OrganizationsPanel
-          sortedOrgs={sortedOrgs}
+          key={String(open)}
           orgParam={orgParam}
           onSelectOrg={onSelectOrg}
           onCreateOrg={onCreateOrg}
@@ -479,7 +522,10 @@ function AccountPopoverContent({
 
 export function AccountPopover() {
   const { data: session } = authClient.useSession();
-  const { data: organizations } = authClient.useListOrganizations();
+  // Current org comes from the already-loaded shell context (name + logo) so
+  // the trigger paints without fetching organization.list. The full list is
+  // fetched lazily inside OrganizationsPanel when the switcher opens.
+  const { org: currentOrg } = useProjectContext();
   const navigate = useNavigate();
   const orgMatch = useMatch({ from: "/shell/$org", shouldThrow: false });
   const orgParam = orgMatch?.params.org;
@@ -491,16 +537,6 @@ export function AccountPopover() {
 
   const user = session?.user;
   const userImage = (user as { image?: string } | undefined)?.image;
-
-  const currentOrg = organizations?.find(
-    (o: { slug: string }) => o.slug === orgParam,
-  );
-
-  const sortedOrgs = [...(organizations ?? [])].sort((a, b) => {
-    if (a.slug === orgParam) return -1;
-    if (b.slug === orgParam) return 1;
-    return a.name.localeCompare(b.name);
-  });
 
   const handleSelectOrg = (orgSlug: string) => {
     setOpen(false);
@@ -524,6 +560,25 @@ export function AccountPopover() {
         });
       },
     },
+    // Per-org install: opens the org install page, which swaps to an
+    // org-branded manifest so installing produces a home-screen app for this
+    // org. (Studio itself installs via the browser's native "Add to Home
+    // Screen".) Only shown while inside an org.
+    ...(currentOrg
+      ? [
+          {
+            key: "install-app",
+            label: "Add to Home Screen",
+            icon: <Download01 size={16} />,
+            onClick: () => {
+              navigate({
+                to: "/$org/install",
+                params: { org: currentOrg.slug },
+              });
+            },
+          } satisfies MenuItem,
+        ]
+      : []),
     {
       key: "terms",
       label: "Terms of Use",
@@ -567,6 +622,7 @@ export function AccountPopover() {
     icon: <LogOut01 size={16} />,
     onClick: () => {
       track("signed_out", { source: "account_popover" });
+      clearPersistedQueryCache();
       authClient.signOut();
     },
   };
@@ -589,7 +645,6 @@ export function AccountPopover() {
     themeOptions,
     preferences,
     setPreferences,
-    sortedOrgs,
     orgParam,
     onSelectOrg: handleSelectOrg,
     onCreateOrg: () => {
@@ -598,6 +653,7 @@ export function AccountPopover() {
     },
     close,
     isMobile,
+    open,
   };
 
   return (
@@ -663,6 +719,7 @@ export function AccountPopover() {
                   </span>
                 )}
               </div>
+              <span className="truncate">{currentOrg?.name ?? "Account"}</span>
             </SidebarMenuButton>
           </PopoverTrigger>
 

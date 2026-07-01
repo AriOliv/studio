@@ -1,4 +1,5 @@
 import { isSyntheticBranch } from "./constants";
+import { normalizeCoAuthorIdentity } from "../git-co-author";
 import type { PackageManager, RuntimeName, TenantConfig } from "./types";
 
 const VALID_RUNTIMES: ReadonlySet<RuntimeName> = new Set([
@@ -14,6 +15,8 @@ const VALID_PMS: ReadonlySet<PackageManager> = new Set([
   "deno",
 ]);
 const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ENV_VALUE_MAX = 32 * 1024;
 
 export type ValidationError = { kind: "invalid"; reason: string };
 export type ValidationOk = { kind: "ok" };
@@ -35,6 +38,35 @@ export function validateTenantConfig(config: TenantConfig): ValidationResult {
   if (config.application !== undefined) {
     const v = validateApplication(config.application);
     if (v.kind === "invalid") return v;
+  }
+  if (config.env !== undefined) {
+    const v = validateEnv(config.env);
+    if (v.kind === "invalid") return v;
+  }
+  if (config.operator !== undefined) {
+    const v = validateOperator(config.operator);
+    if (v.kind === "invalid") return v;
+  }
+  return { kind: "ok" };
+}
+
+function validateEnv(env: NonNullable<TenantConfig["env"]>): ValidationResult {
+  for (const [k, v] of Object.entries(env)) {
+    if (!ENV_KEY_RE.test(k)) {
+      return { kind: "invalid", reason: `env key invalid: ${k}` };
+    }
+    if (typeof v !== "string") {
+      return { kind: "invalid", reason: `env value for ${k} must be a string` };
+    }
+    if (v.includes("\0")) {
+      return { kind: "invalid", reason: `env value for ${k} contains NUL` };
+    }
+    if (Buffer.byteLength(v, "utf8") > ENV_VALUE_MAX) {
+      return {
+        kind: "invalid",
+        reason: `env value for ${k} exceeds ${ENV_VALUE_MAX} bytes`,
+      };
+    }
   }
   return { kind: "ok" };
 }
@@ -111,6 +143,30 @@ function validateApplication(
       kind: "invalid",
       reason: `port invalid: ${app.port}`,
     };
+  }
+  return { kind: "ok" };
+}
+
+function validateOperator(
+  operator: NonNullable<TenantConfig["operator"]>,
+): ValidationResult {
+  if (typeof operator.userName !== "string") {
+    return { kind: "invalid", reason: "operator.userName is required" };
+  }
+  const normalized = normalizeCoAuthorIdentity({
+    userName: operator.userName,
+    userEmail: operator.userEmail,
+  });
+  if (!normalized) {
+    return { kind: "invalid", reason: "operator.userName is required" };
+  }
+  if (operator.userEmail !== undefined) {
+    if (typeof operator.userEmail !== "string") {
+      return { kind: "invalid", reason: "operator.userEmail must be a string" };
+    }
+    if (operator.userEmail.trim().length > 0 && !normalized.userEmail) {
+      return { kind: "invalid", reason: "operator.userEmail is invalid" };
+    }
   }
   return { kind: "ok" };
 }

@@ -1,5 +1,9 @@
 import type { PackageManagerConfig, RuntimeName, TenantConfig } from "../types";
 
+export type ConfigPatch = Partial<Omit<TenantConfig, "env">> & {
+  env?: Record<string, string | null>;
+};
+
 /**
  * The single highest-impact transition produced by classifying (before, after).
  * Reducer recipes live in setup/orchestrator.ts.
@@ -18,6 +22,11 @@ export type Transition =
       from: number | undefined;
       to: number | undefined;
     }
+  | {
+      kind: "env-change";
+      changed: { set: string[]; deleted: string[] };
+    }
+  | { kind: "git-credential-refresh"; cloneUrl: string }
   | { kind: "identity-conflict"; field: "cloneUrl" }
   | { kind: "no-op" };
 

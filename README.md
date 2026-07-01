@@ -47,7 +47,7 @@ Everything is tracked — tokens, costs, errors, latency — per connection, per
 ## Quick Start
 
 ```bash
-bunx decocms
+bunx decostudio
 ```
 
 Or clone and run from source:
@@ -58,7 +58,7 @@ bun install
 bun run dev
 ```
 
-> runs at [http://localhost:3000](http://localhost:3000) (client) + API server
+> runs at [http://localhost:4000](http://localhost:4000) (client) with API routes proxied to the Bun server
 
 ---
 
@@ -88,11 +88,11 @@ You can also define outcomes declaratively and let Studio work backward to deriv
 
 Token spend per connection — OpenRouter, Perplexity, Firecrawl, all of it. Latency, errors, bottlenecks. One dashboard.
 
-### From your laptop to your org
+### From your desktop to your org
 
 | | |
 |---|---|
-| **Local** | `bunx decocms` on your laptop. Embedded PostgreSQL. Private. |
+| **Local** | `bunx decostudio` on your desktop. Embedded PostgreSQL. Private. |
 | **Cloud** | Log in to studio.decocms.com. Control local projects from any browser. |
 | **Team** | Invite people. Roles. Shared connections. Cost attribution. |
 | **Enterprise** | Self-hosted. Your infra. Your rules. |
@@ -163,7 +163,7 @@ Every tool call gets input/output validation, access control, audit logging, and
 │   │   ├── src/
 │   │   │   ├── api/         # Hono HTTP + MCP proxy routes
 │   │   │   ├── auth/        # Better Auth (OAuth + API keys)
-│   │   │   ├── core/        # MeshContext, AccessControl, defineTool
+│   │   │   ├── core/        # StudioContext, AccessControl, defineTool
 │   │   │   ├── tools/       # Built-in MCP management tools
 │   │   │   ├── storage/     # Kysely DB adapters
 │   │   │   ├── event-bus/   # Pub/sub event delivery system
@@ -178,8 +178,7 @@ Every tool call gets input/output validation, access control, audit logging, and
     ├── runtime/             # MCP proxy, OAuth, and runtime utilities
     ├── ui/                  # Shared React components (shadcn-based)
     ├── cli/                 # CLI tooling (deco commands)
-    ├── create-deco/         # Project scaffolding (npm create deco)
-    └── vite-plugin-deco/    # Vite plugin for Deco projects
+    └── create-deco/         # Project scaffolding (npm create deco)
 ```
 
 ---

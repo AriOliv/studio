@@ -66,6 +66,10 @@ export const KEYS = {
     ["mcp", "client", client, "prompts"] as const,
   mcpReadResource: (client: unknown, uri: string) =>
     ["mcp", "client", client, "resource", uri] as const,
+  // UI-resource HTML fetched via the cacheable GET endpoint. Keyed by
+  // (org, connection, uri) — NOT the client — so a persister can select it.
+  mcpUiResourceHtml: (orgSlug: string, connectionId: string, uri: string) =>
+    ["mcp", "ui-resource-html", orgSlug, connectionId, uri] as const,
   mcpGetPrompt: (client: unknown, name: string, argsKey: string) =>
     ["mcp", "client", client, "prompt", name, argsKey] as const,
   mcpToolCall: (client: unknown, toolName: string, argsKey: string) =>
@@ -80,6 +84,10 @@ export const KEYS = {
 
   // Models list (scoped by organization)
   modelsList: (orgId: string) => ["models-list", orgId] as const,
+
+  // Virtual MCP last-used info (most recent thread per agent)
+  virtualMcpLastUsed: (orgId: string, ids: string[]) =>
+    ["virtual-mcp", "last-used", orgId, ids] as const,
 
   // Collections (scoped by connection)
   connectionCollections: (connectionId: string) =>

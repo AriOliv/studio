@@ -8,7 +8,7 @@
 import { z } from "zod";
 import { syncAutomationActiveChanged } from "../../automations/dbos-sync";
 import { defineTool } from "../../core/define-tool";
-import { requireAuth, requireOrganization } from "../../core/mesh-context";
+import { requireAuth, requireOrganization } from "../../core/studio-context";
 import { ChatTierSchema } from "../organization/schema";
 import { configureTriggerOnMcp } from "./configure-trigger";
 import { normalizeMessages } from "./normalize-messages";
@@ -44,8 +44,17 @@ export const AUTOMATION_UPDATE = defineTool({
     models: z
       .object({
         tier: ChatTierSchema,
+        modelId: z.string().optional(),
+        credentialId: z.string().optional(),
       })
+      .loose()
       .optional(),
+    // null clears the allowlist (= all tools); an array sets it; omitting
+    // leaves the stored value untouched.
+    tools: z.array(z.string()).nullable().optional(),
+    // Parent agent-loop step cap. null resets to the platform default
+    // (PARENT_STEP_LIMIT); a number sets it; omitting leaves it untouched.
+    maxAgentSteps: z.number().int().min(1).max(100).nullable().optional(),
     temperature: z.number().optional(),
   }),
   outputSchema: z.object({
@@ -78,8 +87,13 @@ export const AUTOMATION_UPDATE = defineTool({
     }
     if (input.models !== undefined)
       updateData.models = JSON.stringify(input.models);
+    if (input.tools !== undefined)
+      updateData.tools =
+        input.tools === null ? null : JSON.stringify(input.tools);
     if (input.temperature !== undefined)
       updateData.temperature = input.temperature;
+    if (input.maxAgentSteps !== undefined)
+      updateData.max_agent_steps = input.maxAgentSteps;
     const automation = await ctx.storage.automations.update(
       input.id,
       organization.id,

@@ -6,7 +6,7 @@
 
 import { z } from "zod";
 import { defineTool } from "../../core/define-tool";
-import { requireAuth, requireOrganization } from "../../core/mesh-context";
+import { requireAuth, requireOrganization } from "../../core/studio-context";
 
 export const AUTOMATION_GET = defineTool({
   name: "AUTOMATION_GET",
@@ -33,16 +33,19 @@ export const AUTOMATION_GET = defineTool({
         virtual_mcp_id: z.string(),
         messages: z.unknown(),
         models: z.unknown(),
+        tools: z.array(z.string()).nullable(),
+        maxAgentSteps: z.number().nullable(),
         temperature: z.number(),
         triggers: z.array(
           z.object({
             id: z.string(),
-            type: z.enum(["cron", "event"]),
+            type: z.enum(["cron", "event", "webhook"]),
             cron_expression: z.string().nullable(),
             connection_id: z.string().nullable(),
             event_type: z.string().nullable(),
             params: z.unknown().nullable(),
             last_run_at: z.string().nullable(),
+            api_key_id: z.string().nullable(),
             created_at: z.string(),
           }),
         ),
@@ -76,6 +79,8 @@ export const AUTOMATION_GET = defineTool({
         virtual_mcp_id: automation.virtual_mcp_id,
         messages: JSON.parse(automation.messages),
         models: JSON.parse(automation.models),
+        tools: automation.tools ? JSON.parse(automation.tools) : null,
+        maxAgentSteps: automation.max_agent_steps,
         temperature: automation.temperature,
         triggers: triggers.map((t) => ({
           id: t.id,
@@ -85,6 +90,7 @@ export const AUTOMATION_GET = defineTool({
           event_type: t.event_type,
           params: t.params ? JSON.parse(t.params) : null,
           last_run_at: t.last_run_at,
+          api_key_id: t.api_key_id,
           created_at: t.created_at,
         })),
       },

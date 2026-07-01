@@ -24,7 +24,7 @@ import {
   ListResourcesRequestSchema,
   ListResourceTemplatesRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { MeshContext } from "../core/mesh-context";
+import type { StudioContext } from "../core/studio-context";
 import { createLazyClient } from "./lazy-client";
 import { getMcpListCache } from "./mcp-list-cache";
 import { fallbackOnMethodNotFoundError } from "./utils";
@@ -64,7 +64,7 @@ const DEFAULT_SERVER_CAPABILITIES = {
  */
 export function serverFromConnection(
   connection: ConnectionEntity,
-  ctx: MeshContext,
+  ctx: StudioContext,
   superUser: boolean,
 ): McpServer {
   // Create lazy client — no MCP connection is established until needed
@@ -117,6 +117,19 @@ export function serverFromConnection(
         .catch(fallbackOnMethodNotFoundError({ prompts: [] }));
     },
   );
+
+  // The bridge created by `createServerFromClient` does NOT close the client it
+  // delegates to (a generic bridge can't assume it owns a possibly-shared
+  // client). This `client` IS owned by this per-request server, so cascade:
+  // closing the server (e.g. via `serveMcpRequest` on stream-done/disconnect)
+  // must close the lazy client too, or it + its real downstream connection +
+  // transport leak. The lazy client's own `close()` is a no-op if it never
+  // connected (list cache hits), so this is cheap on the warm path.
+  const closeServer = server.close.bind(server);
+  server.close = async () => {
+    await closeServer();
+    await client.close().catch(() => {});
+  };
 
   return server;
 }

@@ -1,8 +1,10 @@
 import type { BranchMeta, LifecycleState } from "@decocms/sandbox/shared";
-import type { ClaimPhase } from "@/web/components/vm/hooks/vm-events-context";
-import { CLAIM_PHASE_COPY } from "@/web/components/vm/claim-phase-copy";
+import type { ClaimPhase } from "@/web/components/sandbox/hooks/sandbox-events-context";
+import { CLAIM_PHASE_COPY } from "@/web/components/sandbox/claim-phase-copy";
 import type { CheckRun, PrSummary } from "./use-pr-data.ts";
 import type { PrReviewSignals } from "./use-pr-reviews.ts";
+import { publishToBaseLabel } from "./publish-label.ts";
+import { saveChangesDebug } from "./save-changes-debug.ts";
 
 /**
  * Header copy for claim-phase variants while lifecycle is still `idle`.
@@ -84,6 +86,13 @@ export interface SelectHeaderButtonInput {
   loading?: boolean;
 }
 
+export function isPrStateActivelyLoading(query: {
+  isPending: boolean;
+  fetchStatus: string;
+}): boolean {
+  return query.isPending && query.fetchStatus !== "idle";
+}
+
 export function selectHeaderButton(
   input: SelectHeaderButtonInput,
 ): HeaderButton {
@@ -160,8 +169,7 @@ export function selectHeaderButton(
   }
   const ready = branch;
 
-  const hasLocalWork = ready.workingTreeDirty || ready.unpushed > 0;
-  if (hasLocalWork) {
+  if (ready.workingTreeDirty) {
     return {
       label: "Save changes",
       action: "commit-and-push",
@@ -169,6 +177,43 @@ export function selectHeaderButton(
       tooltip: "Commit and push local changes",
     };
   }
+
+  // `unpushed` can be a false positive when the sandbox hasn't fetched the
+  // remote tracking ref (origin/<branch> missing). If the PR's head SHA
+  // matches the local HEAD, the commits are already on the remote — skip
+  // the push gate and fall through to the PR/merge logic below.
+  const trulyUnpushed =
+    ready.unpushed > 0 &&
+    !(pr && ready.headSha && pr.headSha && ready.headSha === pr.headSha);
+
+  if (trulyUnpushed) {
+    if (!pr) {
+      return {
+        label: "Submit for review",
+        action: "create-pr",
+        variant: "default",
+        tooltip: `Push and open a PR for ${ready.branch} → ${ready.base}`,
+      };
+    }
+    return {
+      label: "Save changes",
+      action: "commit-and-push",
+      variant: "default",
+      tooltip: "Push local commits",
+    };
+  }
+
+  // Fall-through debug: why not Save changes?
+  saveChangesDebug("no local work — checking PR/sync state", {
+    workingTreeDirty: ready.workingTreeDirty,
+    unpushed: ready.unpushed,
+    aheadOfBase: ready.aheadOfBase,
+    behindBase: ready.behindBase,
+    branch: ready.branch,
+    base: ready.base,
+    prMerged: pr?.merged ?? null,
+    prState: pr?.state ?? null,
+  });
 
   // Merged PR is terminal UNLESS the branch has advanced past the PR's
   // head (i.e. new commits were pushed after the merge). Squash-merges
@@ -280,7 +325,7 @@ export function selectHeaderButton(
     }
 
     return {
-      label: "Publish",
+      label: publishToBaseLabel(pr.base),
       action: "merge-split",
       variant: "success",
       tooltip: `Squash-merge PR #${pr.number} into ${pr.base}`,

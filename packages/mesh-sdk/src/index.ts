@@ -35,6 +35,7 @@ export {
   type UseConnectionsOptions,
   // MCP client hook and factory
   createMCPClient,
+  mcpClientQueryOptions,
   useMCPClient,
   useMCPClientOptional,
   type CreateMcpClientOptions,
@@ -57,9 +58,12 @@ export {
   useMCPResourcesList,
   useMCPResourcesListQuery,
   useMCPReadResource,
+  useUiResourceHtml,
+  UI_RESOURCE_HTML_KEY,
   type UseMcpResourcesListOptions,
   type UseMcpResourcesListQueryOptions,
   type UseMcpReadResourceOptions,
+  type UseUiResourceHtmlOptions,
   // MCP prompts hooks and helpers
   listPrompts,
   getPrompt,
@@ -72,9 +76,12 @@ export {
   // Virtual MCP hooks
   useVirtualMCPs,
   useVirtualMCP,
+  virtualMcpItemQueryOptions,
   useVirtualMCPActions,
+  useVirtualMCPsLastUsed,
   type VirtualMCPFilter,
   type UseVirtualMCPsOptions,
+  type VirtualMCPLastUsed,
 } from "./hooks";
 
 // Types
@@ -116,10 +123,21 @@ export {
   type VirtualMCPConnection,
   type VirtualMcpUILayout,
   type VirtualMcpUILayoutTab,
-  VmMapSchema,
-  type VmMap,
-  VmMapEntrySchema,
-  type VmMapEntry,
+  type VirtualMcpHomeTile,
+  getHomeTiles,
+  SandboxMapSchema,
+  type SandboxMap,
+  SandboxRecordSchema,
+  type SandboxRecord,
+  type RuntimeMetadata,
+  type RuntimeEnvEntry,
+  ENV_VAR_KEY_RE,
+  parseSandboxRecord,
+  parseBranchMap,
+  normalizeSandboxMap,
+  normalizeSandboxProviderKind,
+  type SandboxProviderKind,
+  type LegacySandboxProviderKind,
   type GithubRepo,
   // Decopilot event types
   THREAD_STATUSES,
@@ -166,10 +184,15 @@ export {
   SMART_MODEL_PREFERENCES,
   THINKING_MODEL_PREFERENCES,
   IMAGE_MODEL_PREFERENCES,
-  WEB_RESEARCH_MODEL_PREFERENCES,
+  WEB_SEARCH_MODEL_PREFERENCES,
+  DEEP_RESEARCH_MODEL_PREFERENCES,
   selectDefaultModel,
   getFastModel,
   pickSimpleModeDefaults,
+  isDeepResearchModelId,
+  isQuickSearchModelId,
+  isQuickSearchModel,
+  isDeepResearchModel,
   type SimpleModeModelSlot,
   type SimpleModeDefaults,
 } from "./lib/default-model";
@@ -206,25 +229,37 @@ export {
   DEV_ASSETS_MCP_ALIAS_ID,
   // Org-scoped MCP ID generators
   WellKnownOrgMCPId,
+  COMMERCE_DISCOVERY_MCP_URL,
+  COMMERCE_DISCOVERY_REPORT_TOOL_NAME,
+  COMMERCE_DISCOVERY_ICON,
   // Connection factory functions
   getWellKnownRegistryConnection,
   getWellKnownCommunityRegistryConnection,
   getWellKnownSelfConnection,
   getWellKnownDevAssetsConnection,
   getWellKnownMcpStudioConnection,
+  getWellKnownCommerceDiscoveryConnection,
   // Virtual MCP factory functions
   getWellKnownDecopilotVirtualMCP,
   getWellKnownDecopilotConnection,
+  getWellKnownCommerceDiscoveryVirtualMCP,
   // Decopilot utilities
   isDecopilot,
   getDecopilotId,
+  // Dev connection (ephemeral sandbox dev-server) utilities
+  getDevConnectionId,
+  parseDevConnectionId,
   // Site Diagnostics utilities
   isSiteDiagnostics,
   getSiteDiagnosticsId,
+  // Commerce Discovery utilities
+  isCommerceDiscoveryAgentId,
+  getCommerceDiscoveryAgentId,
+  // Brand-Context Setup utilities
+  isBrandContextSetup,
+  getBrandContextSetupId,
+  getWellKnownBrandContextSetupVirtualMCP,
   // Studio Pack utilities
   StudioPackAgentId,
   isStudioPackAgent,
-  // Well-known agent templates (display data + registry appId)
-  WELL_KNOWN_AGENT_TEMPLATES,
-  type WellKnownAgentTemplate,
 } from "./lib/constants";

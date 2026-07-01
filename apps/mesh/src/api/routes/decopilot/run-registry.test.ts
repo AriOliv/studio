@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { RunRegistry } from "./run-registry";
 import type { StreamBuffer } from "./stream-buffer";
 import type { RunReactorDeps } from "./run-reactor";
@@ -7,29 +7,39 @@ import type { RunReactorDeps } from "./run-reactor";
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeNoopDeps(): RunReactorDeps {
+/**
+ * Inert deps for the *pure* state-machine tests below.
+ *
+ * Everything in this file exercises only the in-memory half of RunRegistry —
+ * the `states` Map, the AbortController lifecycle, and the reaper's timing
+ * decision. None of these code paths read from storage, so this object is
+ * unexercised scaffolding required by the constructor, not a faked input that
+ * any assertion depends on. (Per TESTING.md, the forbidden thing is faking a
+ * dependency whose output drives the behavior under test — an unused
+ * collaborator is not that.)
+ *
+ * The storage-orchestrating methods (stopAll and the reaper's terminal DB
+ * write) are tested against real Postgres in run-registry.integration.test.ts.
+ */
+function inertDeps(): RunReactorDeps {
+  const noop = async () => undefined as never;
   return {
     storage: {
-      update: mock(() => Promise.resolve({} as never)),
-      create: mock(() => Promise.resolve({} as never)),
-      get: mock(() => Promise.resolve(null)),
-      delete: mock(() => Promise.resolve()),
-      list: mock(() => Promise.resolve({ threads: [], total: 0 })),
-      saveMessages: mock(() => Promise.resolve()),
-      listMessages: mock(() => Promise.resolve({ messages: [], total: 0 })),
-      listByTriggerIds: mock(() => Promise.resolve({ threads: [], total: 0 })),
-      forceFailIfInProgress: mock(() => Promise.resolve(false)),
-      claimOrphanedRun: mock(() => Promise.resolve(false)),
-      claimRunStart: mock(() => Promise.resolve(true)),
-      listOrphanedRuns: mock(() => Promise.resolve([])),
-      listOrphanedRunsByPod: mock(() => Promise.resolve([])),
-      orphanRunsByPod: mock(() => Promise.resolve([])),
-      addInflightAsyncJob: mock(() => Promise.resolve()),
-      findInflightAsyncJob: mock(() => Promise.resolve(null)),
-      removeInflightAsyncJob: mock(() => Promise.resolve()),
-    },
-    streamBuffer: { purge: mock(() => {}) } as unknown as StreamBuffer,
-    sseHub: { emit: mock(() => {}) },
+      update: noop,
+      create: noop,
+      get: async () => null,
+      delete: noop,
+      list: async () => ({ threads: [], total: 0 }),
+      listMessages: async () => ({ messages: [], total: 0 }),
+      listByTriggerIds: async () => ({ threads: [], total: 0 }),
+      forceFailIfInProgress: async () => false,
+      bumpProgress: noop,
+      // null → reaper falls back to the run's in-memory startedAt baseline,
+      // which is exactly the timing these pure tests exercise.
+      getProgress: async () => null,
+    } as unknown as RunReactorDeps["storage"],
+    streamBuffer: { purge() {} } as unknown as StreamBuffer,
+    sseHub: { emit() {} },
   };
 }
 
@@ -40,15 +50,11 @@ afterEach(() => {
   createdRegistries.length = 0;
 });
 
-/** Create a registry backed by no-op mocks and register it for cleanup. */
-function createRegistry(
-  deps = makeNoopDeps(),
-  clock?: () => Date,
-): RunRegistry {
-  const podId = "test-pod";
+/** Create a registry and register it for reaper-timer cleanup. */
+function createRegistry(clock?: () => Date): RunRegistry {
   const r = clock
-    ? new RunRegistry(deps, podId, clock)
-    : new RunRegistry(deps, podId);
+    ? new RunRegistry(inertDeps(), clock)
+    : new RunRegistry(inertDeps());
   createdRegistries.push(r);
   return r;
 }
@@ -69,16 +75,11 @@ function startThread(
   });
 }
 
-/** Flush all immediately-resolved promise microtasks. */
-async function flushMicrotasks(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
-
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — pure in-memory state machine
 // ---------------------------------------------------------------------------
 
-describe("RunRegistry", () => {
+describe("RunRegistry (in-memory state machine)", () => {
   // -------------------------------------------------------------------------
   // dispatch START
   // -------------------------------------------------------------------------
@@ -325,412 +326,81 @@ describe("RunRegistry", () => {
   });
 
   // -------------------------------------------------------------------------
-  // stopAll
+  // reapStaleRuns — timing decision only (the terminal DB write it triggers is
+  // covered against real Postgres in run-registry.integration.test.ts)
   // -------------------------------------------------------------------------
-  describe("stopAll (orphan semantics)", () => {
-    it("orphans runs in DB, aborts running entries, and clears state", async () => {
-      const deps = makeNoopDeps();
-      const registry = createRegistry(deps);
+  describe("reapStaleRuns (timing)", () => {
+    // Progress-based idle timeout (run-registry.ts RUN_IDLE_TIMEOUT_MS). With
+    // getProgress() → null in inertDeps, the reaper baselines off the run's
+    // in-memory startedAt, so these timing tests reduce to "idle since start".
+    const RUN_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 
-      startThread(registry, "t1", "org1", "u1");
-      startThread(registry, "t2", "org1", "u2");
-
-      const signalT1 = registry.getAbortSignal("t1")!;
-      const signalT2 = registry.getAbortSignal("t2")!;
-
-      // Start a third run and finish it so it is no longer "running"
-      startThread(registry, "t3", "org1", "u3");
-      registry.dispatch({
-        type: "FINISH",
-        taskId: "t3",
-        threadStatus: "completed",
-      });
-
-      await registry.stopAll();
-
-      // DB orphan is called first so runs are resumable if process dies
-      expect(deps.storage.orphanRunsByPod).toHaveBeenCalled();
-
-      // In-memory: abort controllers triggered and state cleared
-      expect(signalT1.aborted).toBe(true);
-      expect(signalT2.aborted).toBe(true);
-      expect(registry.isRunning("t1")).toBe(false);
-      expect(registry.isRunning("t2")).toBe(false);
-    });
-
-    it("calls orphanRunsByPod with correct podId", async () => {
-      const deps = makeNoopDeps();
-      const registry = createRegistry(deps);
-      startThread(registry, "t1", "org1", "u1");
-
-      await registry.stopAll();
-      expect(deps.storage.orphanRunsByPod).toHaveBeenCalledWith("test-pod");
-    });
-
-    it("aborts AbortControllers", async () => {
-      const deps = makeNoopDeps();
-      const registry = createRegistry(deps);
-      startThread(registry, "t1", "org1", "u1");
-      const signal = registry.getAbortSignal("t1")!;
-
-      await registry.stopAll();
-      expect(signal.aborted).toBe(true);
-    });
-
-    it("clears in-memory state", async () => {
-      const deps = makeNoopDeps();
-      const registry = createRegistry(deps);
-      startThread(registry, "t1", "org1", "u1");
-
-      await registry.stopAll();
-      expect(registry.isRunning("t1")).toBe(false);
-    });
-
-    it("handles orphanRunsByPod failure gracefully", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.orphanRunsByPod as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.reject(new Error("DB down")));
-      const registry = createRegistry(deps);
-      startThread(registry, "t1", "org1", "u1");
-      const signal = registry.getAbortSignal("t1")!;
-
-      await registry.stopAll(); // should not throw
-
-      // controllers still aborted, state still cleared
-      expect(signal.aborted).toBe(true);
-      expect(registry.isRunning("t1")).toBe(false);
-    });
-  });
-
-  // -------------------------------------------------------------------------
-  // recoverOrphanedRuns
-  // -------------------------------------------------------------------------
-  describe("recoverOrphanedRuns", () => {
-    it("auto-resumes orphaned runs", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRuns as ReturnType<typeof mock>
-      ).mockImplementation(() =>
-        Promise.resolve([
-          {
-            id: "t1",
-            organization_id: "org1",
-            trigger_id: "trig1",
-            run_config: {},
-            title: "t",
-            description: null,
-            status: "in_progress",
-            created_at: "",
-            updated_at: "",
-            created_by: "u1",
-            updated_by: undefined,
-            hidden: false,
-            context_start_message_id: null,
-            run_owner_pod: null,
-            run_started_at: null,
-          },
-        ]),
-      );
-      (
-        deps.storage.claimOrphanedRun as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve(true));
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.resolve());
-      await registry.recoverOrphanedRuns(resumeFn);
-      expect(resumeFn).toHaveBeenCalled();
-    });
-
-    it("auto-resumes interactive runs (trigger_id null) too", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRuns as ReturnType<typeof mock>
-      ).mockImplementation(() =>
-        Promise.resolve([
-          {
-            id: "t1",
-            organization_id: "org1",
-            trigger_id: null,
-            run_config: {},
-            title: "t",
-            description: null,
-            status: "in_progress",
-            created_at: "",
-            updated_at: "",
-            created_by: "u1",
-            updated_by: undefined,
-            hidden: false,
-            context_start_message_id: null,
-            run_owner_pod: null,
-            run_started_at: null,
-          },
-        ]),
-      );
-      (
-        deps.storage.claimOrphanedRun as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve(true));
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.resolve());
-      await registry.recoverOrphanedRuns(resumeFn);
-      expect(resumeFn).toHaveBeenCalled();
-    });
-
-    it("skips when CAS claim fails", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRuns as ReturnType<typeof mock>
-      ).mockImplementation(() =>
-        Promise.resolve([
-          {
-            id: "t1",
-            organization_id: "org1",
-            trigger_id: "trig1",
-            run_config: {},
-            title: "t",
-            description: null,
-            status: "in_progress",
-            created_at: "",
-            updated_at: "",
-            created_by: "u1",
-            updated_by: undefined,
-            hidden: false,
-            context_start_message_id: null,
-            run_owner_pod: null,
-            run_started_at: null,
-          },
-        ]),
-      );
-      (
-        deps.storage.claimOrphanedRun as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve(false));
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.resolve());
-      await registry.recoverOrphanedRuns(resumeFn);
-      expect(resumeFn).not.toHaveBeenCalled();
-    });
-
-    it("force-fails on resumeFn error", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRuns as ReturnType<typeof mock>
-      ).mockImplementation(() =>
-        Promise.resolve([
-          {
-            id: "t1",
-            organization_id: "org1",
-            trigger_id: "trig1",
-            run_config: {},
-            title: "t",
-            description: null,
-            status: "in_progress",
-            created_at: "",
-            updated_at: "",
-            created_by: "u1",
-            updated_by: undefined,
-            hidden: false,
-            context_start_message_id: null,
-            run_owner_pod: null,
-            run_started_at: null,
-          },
-        ]),
-      );
-      (
-        deps.storage.claimOrphanedRun as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve(true));
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.reject(new Error("boom")));
-      await registry.recoverOrphanedRuns(resumeFn);
-      expect(deps.storage.forceFailIfInProgress).toHaveBeenCalledWith(
-        "t1",
-        "org1",
-      );
-    });
-
-    it("handles empty orphan list", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRuns as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve([]));
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.resolve());
-      await registry.recoverOrphanedRuns(resumeFn);
-      expect(resumeFn).not.toHaveBeenCalled();
-    });
-  });
-
-  // -------------------------------------------------------------------------
-  // reapStaleRuns
-  // -------------------------------------------------------------------------
-  describe("reapStaleRuns", () => {
-    const MAX_RUN_AGE_MS = 30 * 60 * 1000;
-
-    it("reaps a run past MAX_RUN_AGE_MS and triggers reactor side-effects", async () => {
-      const deps = makeNoopDeps();
+    it("does not reap a run just under the idle timeout", async () => {
       let now = new Date("2024-01-01T00:00:00Z");
-      const registry = createRegistry(deps, () => now);
-
-      startThread(registry, "t1", "org1", "u1");
-      const signal = registry.getAbortSignal("t1")!;
-
-      // Advance time past the threshold
-      now = new Date(now.getTime() + MAX_RUN_AGE_MS + 1);
-
-      (registry as any).reapStaleRuns();
-
-      expect(signal.aborted).toBe(true);
-      expect(registry.isRunning("t1")).toBe(false);
-
-      await flushMicrotasks();
-
-      expect(deps.storage.update).toHaveBeenCalledWith("t1", "org1", {
-        status: "failed",
-        run_owner_pod: null,
-        run_config: null,
-        run_started_at: null,
-      });
-      expect(deps.streamBuffer.purge).toHaveBeenCalledWith("t1");
-    });
-
-    it("does not reap a run just under MAX_RUN_AGE_MS", () => {
-      const deps = makeNoopDeps();
-      let now = new Date("2024-01-01T00:00:00Z");
-      const registry = createRegistry(deps, () => now);
+      const registry = createRegistry(() => now);
 
       startThread(registry, "t1", "org1", "u1");
 
       // Advance time to just under the threshold
-      now = new Date(now.getTime() + MAX_RUN_AGE_MS - 1);
+      now = new Date(now.getTime() + RUN_IDLE_TIMEOUT_MS - 1);
 
-      (registry as any).reapStaleRuns();
+      await (
+        registry as unknown as { reapStaleRuns(): Promise<void> }
+      ).reapStaleRuns();
 
       expect(registry.isRunning("t1")).toBe(true);
-      expect(deps.storage.update).not.toHaveBeenCalled();
     });
 
-    it("reaps only stale runs when multiple threads are present", async () => {
-      const deps = makeNoopDeps();
+    it("reaps only stuck runs when multiple threads are present", async () => {
       let now = new Date("2024-01-01T00:00:00Z");
-      const registry = createRegistry(deps, () => now);
+      const registry = createRegistry(() => now);
 
       startThread(registry, "old", "org1", "u1");
 
       // Advance clock, then start a fresh run
-      now = new Date(now.getTime() + MAX_RUN_AGE_MS + 1);
+      now = new Date(now.getTime() + RUN_IDLE_TIMEOUT_MS + 1);
       startThread(registry, "fresh", "org1", "u2");
 
-      (registry as any).reapStaleRuns();
+      await (
+        registry as unknown as { reapStaleRuns(): Promise<void> }
+      ).reapStaleRuns();
 
       expect(registry.isRunning("old")).toBe(false);
       expect(registry.isRunning("fresh")).toBe(true);
     });
-  });
 
-  // -------------------------------------------------------------------------
-  // handlePodDeath
-  // -------------------------------------------------------------------------
-  describe("handlePodDeath", () => {
-    const makeThread = (id: string, orgId = "org1") => ({
-      id,
-      organization_id: orgId,
-      trigger_id: null,
-      run_config: {},
-      title: "t",
-      description: null,
-      status: "in_progress" as const,
-      created_at: "",
-      updated_at: "",
-      created_by: "u1",
-      updated_by: undefined,
-      hidden: false,
-      context_start_message_id: null,
-      run_owner_pod: "dead-pod",
-      run_started_at: null,
-    });
+    it("evicts but never fails a run the DB already shows terminal (projector completed it out-of-band)", async () => {
+      // Desktop/link runs are completed by the durable projector out-of-band;
+      // their in-memory registry entry lingers as "running" with no progress, so
+      // the idle reaper would otherwise FORCE_FAIL and overwrite `completed`.
+      let now = new Date("2024-01-01T00:00:00Z");
+      const failWrites: unknown[] = [];
+      const deps = inertDeps();
+      (deps.storage as unknown as { get: unknown }).get = async () => ({
+        id: "t1",
+        status: "completed",
+      });
+      (deps.storage as unknown as { update: unknown }).update = async (
+        _id: string,
+        _org: string,
+        data: { status?: string },
+      ) => {
+        if (data?.status === "failed") failWrites.push(data);
+        return null;
+      };
+      const registry = new RunRegistry(deps, () => now);
+      createdRegistries.push(registry);
 
-    it("claims and resumes all orphans from dead pod", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRunsByPod as ReturnType<typeof mock>
-      ).mockImplementation(() =>
-        Promise.resolve([makeThread("t1"), makeThread("t2"), makeThread("t3")]),
-      );
-      (
-        deps.storage.claimOrphanedRun as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve(true));
+      startThread(registry, "t1", "org1", "u1");
+      now = new Date(now.getTime() + RUN_IDLE_TIMEOUT_MS + 1);
+      await (
+        registry as unknown as { reapStaleRuns(): Promise<void> }
+      ).reapStaleRuns();
 
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.resolve());
-      await registry.handlePodDeath("dead-pod", resumeFn);
-
-      expect(deps.storage.listOrphanedRunsByPod).toHaveBeenCalledWith(
-        "dead-pod",
-      );
-      expect(resumeFn).toHaveBeenCalledTimes(3);
-    });
-
-    it("skips orphans when CAS claim fails", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRunsByPod as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve([makeThread("t1")]));
-      (
-        deps.storage.claimOrphanedRun as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve(false));
-
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.resolve());
-      await registry.handlePodDeath("dead-pod", resumeFn);
-
-      expect(resumeFn).not.toHaveBeenCalled();
-    });
-
-    it("force-fails on resumeFn error", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRunsByPod as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve([makeThread("t1")]));
-      (
-        deps.storage.claimOrphanedRun as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve(true));
-
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.reject(new Error("boom")));
-      await registry.handlePodDeath("dead-pod", resumeFn);
-
-      expect(deps.storage.forceFailIfInProgress).toHaveBeenCalledWith(
-        "t1",
-        "org1",
-      );
-    });
-
-    it("broadcasts cancel for orphans", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRunsByPod as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve([makeThread("t1")]));
-      (
-        deps.storage.claimOrphanedRun as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve(true));
-
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.resolve());
-      const cancelBroadcast = { broadcast: mock(() => {}) };
-      await registry.handlePodDeath("dead-pod", resumeFn, cancelBroadcast);
-
-      expect(cancelBroadcast.broadcast).toHaveBeenCalledWith("t1");
-    });
-
-    it("no-ops when dead pod has no orphans", async () => {
-      const deps = makeNoopDeps();
-      (
-        deps.storage.listOrphanedRunsByPod as ReturnType<typeof mock>
-      ).mockImplementation(() => Promise.resolve([]));
-
-      const registry = createRegistry(deps);
-      const resumeFn = mock(() => Promise.resolve());
-      await registry.handlePodDeath("dead-pod", resumeFn);
-
-      expect(resumeFn).not.toHaveBeenCalled();
+      // The completed status is never overwritten with "failed" ...
+      expect(failWrites).toEqual([]);
+      // ... and the stale in-memory entry is still evicted.
+      expect(registry.isRunning("t1")).toBe(false);
     });
   });
 });

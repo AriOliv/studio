@@ -8,38 +8,18 @@
 import { sql, type Kysely } from "kysely";
 import { generatePrefixedId } from "@/shared/utils/generate-id";
 import { DEFAULT_THREAD_TITLE } from "@/api/routes/decopilot/constants";
-import type { ThreadStoragePort } from "./ports";
+import type { ThreadStoragePort, ThreadUpdateData } from "./ports";
+import { SqlThreadMessagePartStorage } from "./thread-message-parts";
 import type {
   Database,
-  InflightAsyncJob,
   Thread,
   ThreadMessage,
   ThreadMetadata,
   ThreadStatus,
 } from "./types";
 
-/**
- * After this much time, a persisted async-job handle is considered too old
- * to safely resume against the provider. Gemini Deep Research worst-case is
- * ~20min; 1h leaves plenty of margin for slow runs while keeping abandoned
- * rows from being silently re-attached to.
- */
-const INFLIGHT_ASYNC_JOB_MAX_AGE_MS = 60 * 60 * 1000;
-
 function toIsoString(v: Date | string): string {
   return typeof v === "string" ? v : v.toISOString();
-}
-
-function parseInflightJobs(
-  raw: InflightAsyncJob[] | string | null | undefined,
-): InflightAsyncJob[] | null {
-  if (raw == null) return null;
-  if (typeof raw !== "string") return raw;
-  try {
-    return JSON.parse(raw) as InflightAsyncJob[];
-  } catch {
-    return null;
-  }
 }
 
 // ============================================================================
@@ -99,8 +79,24 @@ export class OrgScopedThreadStorage {
     return this.inner.get(id, this.requireOrg());
   }
 
-  update(id: string, data: Partial<Thread>): Promise<Thread> {
+  update(id: string, data: ThreadUpdateData): Promise<Thread> {
     return this.inner.update(id, this.requireOrg(), data);
+  }
+
+  completeRunIfNotCompleted(id: string): Promise<Thread | null> {
+    return this.inner.completeRunIfNotCompleted(id, this.requireOrg());
+  }
+
+  markRunFailed(
+    id: string,
+    reason: string,
+    kind: string,
+  ): Promise<Thread | null> {
+    return this.inner.markRunFailed(id, this.requireOrg(), reason, kind);
+  }
+
+  requiresActionIfInProgress(id: string): Promise<Thread | null> {
+    return this.inner.requiresActionIfInProgress(id, this.requireOrg());
   }
 
   forceFailIfInProgress(id: string): Promise<boolean> {
@@ -136,42 +132,26 @@ export class OrgScopedThreadStorage {
     return this.inner.listByTriggerIds(this.requireOrg(), triggerIds, options);
   }
 
-  addInflightAsyncJob(taskId: string, entry: InflightAsyncJob): Promise<void> {
-    return this.inner.addInflightAsyncJob(taskId, this.requireOrg(), entry);
-  }
-
-  findInflightAsyncJob(
-    taskId: string,
-    provider: string,
-    modelId: string,
-    query: string,
-  ): Promise<InflightAsyncJob | null> {
-    return this.inner.findInflightAsyncJob(
-      taskId,
+  findLastUsedByVirtualMcpIds(
+    virtualMcpIds: string[],
+  ): Promise<Map<string, { last_used_at: string; last_used_by: string }>> {
+    return this.inner.findLastUsedByVirtualMcpIds(
       this.requireOrg(),
-      provider,
-      modelId,
-      query,
+      virtualMcpIds,
     );
   }
 
-  removeInflightAsyncJob(
-    taskId: string,
-    provider: string,
-    modelId: string,
-    query: string,
-  ): Promise<void> {
-    return this.inner.removeInflightAsyncJob(
-      taskId,
-      this.requireOrg(),
-      provider,
-      modelId,
-      query,
-    );
+  /** Stamp `last_progress_at = now()` (progress-liveness heartbeat). */
+  bumpProgress(taskId: string): Promise<void> {
+    return this.inner.bumpProgress(taskId, this.requireOrg());
   }
 
-  saveMessages(data: ThreadMessage[]): Promise<void> {
-    return this.inner.saveMessages(data, this.requireOrg());
+  /** Read progress-liveness columns (epoch-ms). */
+  getProgress(taskId: string): Promise<{
+    lastProgressAt: number | null;
+    runStartedAt: number | null;
+  } | null> {
+    return this.inner.getProgress(taskId, this.requireOrg());
   }
 
   listMessages(
@@ -184,6 +164,80 @@ export class OrgScopedThreadStorage {
   ): Promise<{ messages: ThreadMessage[]; total: number }> {
     return this.inner.listMessages(taskId, this.requireOrg(), options);
   }
+
+  listWithLastMessage(options: {
+    limit: number;
+    createdBy?: string;
+    lastMessageRole: "assistant" | "user";
+  }): Promise<Array<{ thread: Thread; lastMessage: ThreadMessage }>> {
+    return this.inner.listWithLastMessage(this.requireOrg(), options);
+  }
+
+  /**
+   * Stream-of-record part storage on the same connection. The v2 read path
+   * folds these into history. Access is org-guarded by the caller's prior
+   * org-scoped thread fetch (R23) — the part storage itself is not org-bound.
+   */
+  messageParts(): SqlThreadMessagePartStorage {
+    return this.inner.messageParts();
+  }
+
+  /**
+   * Current fence token for a run (thread id == run id today). Returns null
+   * if no fence has been minted, which means any token (including null) is
+   * accepted by `fenceMatches`.
+   */
+  getRunFence(threadId: string): Promise<string | null> {
+    return this.inner.getRunFence(threadId);
+  }
+
+  /**
+   * Set (or clear) the fence token for a run. Minted by `prepareRun` after
+   * the run is claimed (Phase B). Cleared by the ingest finish handler so
+   * late-arriving duplicate appends are rejected with 409.
+   */
+  setRunFence(threadId: string, token: string | null): Promise<void> {
+    return this.inner.setRunFence(threadId, token);
+  }
+
+  /**
+   * Stamp `cancel_requested_at = now()` for the given thread (Phase C).
+   * Org-scoped: only updates rows matching both id AND organization_id.
+   */
+  setCancelRequested(threadId: string, organizationId: string): Promise<void> {
+    return this.inner.setCancelRequested(threadId, organizationId);
+  }
+
+  /**
+   * Read `cancel_requested_at` for a thread by id (not org-scoped, mirrors
+   * `getRunFence` which is also unscoped — callers guard via ownership check).
+   */
+  getCancelRequestedAt(threadId: string): Promise<Date | null> {
+    return this.inner.getCancelRequestedAt(threadId);
+  }
+
+  /** Clear `cancel_requested_at` (set to NULL) for a thread by id. */
+  clearCancelRequested(threadId: string): Promise<void> {
+    return this.inner.clearCancelRequested(threadId);
+  }
+
+  /**
+   * Monotonically advance `run_acked_seq` for a run.
+   * Only writes when the new value is strictly greater than the stored floor.
+   * `fenceToken` is accepted for interface parity; the floor is fence-agnostic
+   * at the storage level — a new fence epoch resets the floor at the call site.
+   */
+  bumpAckedSeq(id: string, fenceToken: string, ackSeq: number): Promise<void> {
+    return this.inner.bumpAckedSeq(id, this.requireOrg(), fenceToken, ackSeq);
+  }
+
+  /**
+   * Read the current `run_acked_seq` floor for a run.
+   * Returns 0 when the column is null (no chunks published yet).
+   */
+  getAckedSeq(id: string): Promise<number> {
+    return this.inner.getAckedSeq(id, this.requireOrg());
+  }
 }
 
 // ============================================================================
@@ -192,6 +246,16 @@ export class OrgScopedThreadStorage {
 
 export class SqlThreadStorage implements ThreadStoragePort {
   constructor(private db: Kysely<Database>) {}
+
+  /**
+   * Stream-of-record part storage backed by the same connection. Used by the
+   * v2 read path (`Memory.loadHistory`) to fold `thread_message_parts`.
+   * Part rows are not org-scoped here — callers MUST guard access with an
+   * org-scoped thread fetch first (the R23 predicate).
+   */
+  messageParts(): SqlThreadMessagePartStorage {
+    return new SqlThreadMessagePartStorage(this.db);
+  }
 
   // ==========================================================================
   // Thread Operations
@@ -220,6 +284,8 @@ export class SqlThreadStorage implements ThreadStoragePort {
       trigger_id: data.trigger_id ?? null,
       virtual_mcp_id: data.virtual_mcp_id ?? "",
       branch: data.branch ?? null,
+      sandbox_provider_kind: null,
+      harness_id: null,
       created_at: now,
       updated_at: now,
       created_by: data.created_by,
@@ -265,7 +331,7 @@ export class SqlThreadStorage implements ThreadStoragePort {
   async update(
     id: string,
     organizationId: string,
-    data: Partial<Thread>,
+    data: ThreadUpdateData,
   ): Promise<Thread> {
     const now = new Date().toISOString();
 
@@ -302,13 +368,24 @@ export class SqlThreadStorage implements ThreadStoragePort {
     if (data.run_started_at !== undefined) {
       updateData.run_started_at = data.run_started_at;
     }
+    if (data.last_progress_at !== undefined) {
+      updateData.last_progress_at = data.last_progress_at;
+    }
     if (data.metadata !== undefined) {
       updateData.metadata = JSON.stringify(data.metadata);
     }
     if (data.branch !== undefined) {
       updateData.branch = data.branch;
     }
-
+    if (data.sandbox_provider_kind !== undefined) {
+      updateData.sandbox_provider_kind = data.sandbox_provider_kind;
+    }
+    if (data.harness_id !== undefined) {
+      updateData.harness_id = data.harness_id;
+    }
+    if (data.message_storage_version !== undefined) {
+      updateData.message_storage_version = data.message_storage_version;
+    }
     await this.db
       .updateTable("threads")
       .set(updateData)
@@ -322,6 +399,79 @@ export class SqlThreadStorage implements ThreadStoragePort {
     }
 
     return thread;
+  }
+
+  async completeRunIfNotCompleted(
+    id: string,
+    organizationId: string,
+  ): Promise<Thread | null> {
+    const rows = await this.db
+      .updateTable("threads")
+      .set({
+        status: "completed",
+        run_owner_pod: null,
+        run_config: null,
+        run_started_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .where("id", "=", id)
+      .where("organization_id", "=", organizationId)
+      .where("status", "=", "in_progress")
+      .returningAll()
+      .execute();
+
+    const row = rows[0];
+    return row ? this.threadFromDbRow(row) : null;
+  }
+
+  async markRunFailed(
+    id: string,
+    organizationId: string,
+    reason: string,
+    kind: string,
+  ): Promise<Thread | null> {
+    const rows = await this.db
+      .updateTable("threads")
+      .set({
+        status: "failed",
+        failure_reason: reason,
+        failure_kind: kind,
+        run_owner_pod: null,
+        run_config: null,
+        run_started_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .where("id", "=", id)
+      .where("organization_id", "=", organizationId)
+      .where("status", "=", "in_progress")
+      .returningAll()
+      .execute();
+
+    const row = rows[0];
+    return row ? this.threadFromDbRow(row) : null;
+  }
+
+  async requiresActionIfInProgress(
+    id: string,
+    organizationId: string,
+  ): Promise<Thread | null> {
+    const rows = await this.db
+      .updateTable("threads")
+      .set({
+        status: "requires_action",
+        // run_owner_pod kept set: requires_action is a pause, not terminal state — run resumes after tool approval
+        run_config: null,
+        run_started_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .where("id", "=", id)
+      .where("organization_id", "=", organizationId)
+      .where("status", "=", "in_progress")
+      .returningAll()
+      .execute();
+
+    const row = rows[0];
+    return row ? this.threadFromDbRow(row) : null;
   }
 
   async forceFailIfInProgress(
@@ -508,75 +658,107 @@ export class SqlThreadStorage implements ThreadStoragePort {
     };
   }
 
-  /**
-   * Upserts thread messages by id.
-   * Inserts new messages; updates existing rows (by id) with parts, metadata, role, updated_at.
-   * PostgreSQL only.
-   */
-  async saveMessages(
-    data: ThreadMessage[],
+  async findLastUsedByVirtualMcpIds(
     organizationId: string,
-  ): Promise<void> {
-    const now = new Date().toISOString();
-    const taskId = data[0]?.thread_id;
-    if (!taskId) {
-      throw new Error("thread_id is required when creating multiple messages");
+    virtualMcpIds: string[],
+  ): Promise<Map<string, { last_used_at: string; last_used_by: string }>> {
+    const result = new Map<
+      string,
+      { last_used_at: string; last_used_by: string }
+    >();
+    if (virtualMcpIds.length === 0) return result;
+
+    const rows = await this.db
+      .selectFrom("threads")
+      .distinctOn("virtual_mcp_id")
+      .select(["virtual_mcp_id", "created_by", "created_at"])
+      .where("organization_id", "=", organizationId)
+      .where("virtual_mcp_id", "in", virtualMcpIds)
+      .orderBy("virtual_mcp_id")
+      .orderBy("created_at", "desc")
+      .execute();
+
+    for (const row of rows) {
+      result.set(row.virtual_mcp_id, {
+        last_used_at: toIsoString(row.created_at),
+        last_used_by: row.created_by,
+      });
     }
-    const thread = await this.get(taskId, organizationId);
-    if (!thread) {
-      throw new Error("Thread not found or access denied");
+    return result;
+  }
+
+  /**
+   * Last N threads whose most recent `thread_messages` row has the given
+   * `lastMessageRole`. Backs the "Suggested actions" cards on the Tasks
+   * panel — `assistant` for the primary set (AI is waiting on the user),
+   * `user` for the fallback set (user wrote last) used to fill the panel
+   * when the primary set is short.
+   *
+   * One round-trip: a LATERAL subquery picks each thread's last message
+   * (created_at DESC, id DESC for stable tiebreak), then the outer query
+   * keeps only the rows whose last message matches the requested role.
+   * Ordered by the last-message timestamp.
+   */
+  async listWithLastMessage(
+    organizationId: string,
+    options: {
+      limit: number;
+      createdBy?: string;
+      lastMessageRole: "assistant" | "user";
+    },
+  ): Promise<Array<{ thread: Thread; lastMessage: ThreadMessage }>> {
+    let query = this.db
+      .selectFrom("threads as t")
+      .innerJoinLateral(
+        (eb) =>
+          eb
+            .selectFrom("thread_messages as m")
+            .selectAll()
+            .whereRef("m.thread_id", "=", "t.id")
+            .orderBy("m.created_at", "desc")
+            .orderBy("m.id", "desc")
+            .limit(1)
+            .as("lm"),
+        (join) => join.onTrue(),
+      )
+      .selectAll("t")
+      .select([
+        "lm.id as lm_id",
+        "lm.thread_id as lm_thread_id",
+        "lm.metadata as lm_metadata",
+        "lm.parts as lm_parts",
+        "lm.role as lm_role",
+        "lm.created_at as lm_created_at",
+        "lm.updated_at as lm_updated_at",
+      ])
+      .where("t.organization_id", "=", organizationId)
+      .where("t.hidden", "=", false)
+      .where("lm.role", "=", options.lastMessageRole)
+      .orderBy("lm.created_at", "desc")
+      .limit(options.limit);
+
+    if (options.createdBy) {
+      query = query.where("t.created_by", "=", options.createdBy);
     }
-    // Deduplicate by id - PostgreSQL ON CONFLICT cannot affect same row twice in one INSERT.
-    // Also detect duplicate ids with conflicting thread_ids to reject corrupt batches early.
-    const byId = new Map<string, ThreadMessage>();
-    for (const m of data) {
-      const existing = byId.get(m.id);
-      if (existing && existing.thread_id !== m.thread_id) {
-        throw new Error(
-          `Duplicate message id "${m.id}" with conflicting thread_ids: "${existing.thread_id}" vs "${m.thread_id}"`,
-        );
-      }
-      byId.set(m.id, m);
-    }
-    const unique = [...byId.values()];
-    // Validate all messages target the same thread to prevent data corruption.
-    const mismatchedMessage = unique.find((m) => m.thread_id !== taskId);
-    if (mismatchedMessage) {
-      throw new Error(
-        `All messages must target the same thread. Expected thread_id "${taskId}", but message "${mismatchedMessage.id}" has thread_id "${mismatchedMessage.thread_id}"`,
-      );
-    }
-    const rows = unique.map((message) => ({
-      id: message.id,
-      thread_id: taskId,
-      metadata: message.metadata ? JSON.stringify(message.metadata) : null,
-      parts: JSON.stringify(message.parts),
-      role: message.role,
-      created_at: message.created_at ?? now,
-      updated_at: now,
+
+    const rows = await query.execute();
+
+    return rows.map((row) => ({
+      thread: this.threadFromDbRow(row),
+      lastMessage: this.messageFromDbRow({
+        id: row.lm_id,
+        thread_id: row.lm_thread_id,
+        // `thread_messages.metadata` is `string | null`. Kysely's inference
+        // unions it with `threads.metadata` (ThreadMetadata) because both
+        // tables expose a `metadata` column under the same join row — the
+        // values are unrelated, so we narrow back to the messages shape.
+        metadata: row.lm_metadata as string | null,
+        parts: row.lm_parts as string | Record<string, unknown>[],
+        role: row.lm_role,
+        created_at: row.lm_created_at,
+        updated_at: row.lm_updated_at,
+      }),
     }));
-
-    await this.db.transaction().execute(async (trx) => {
-      await trx
-        .insertInto("thread_messages")
-        .values(rows)
-        .onConflict((oc) =>
-          oc.column("id").doUpdateSet((eb) => ({
-            metadata: eb.ref("excluded.metadata"),
-            parts: eb.ref("excluded.parts"),
-            role: eb.ref("excluded.role"),
-            updated_at: eb.ref("excluded.updated_at"),
-          })),
-        )
-        .execute();
-
-      await trx
-        .updateTable("threads")
-        .set({ updated_at: now })
-        .where("id", "=", taskId)
-        .where("organization_id", "=", organizationId)
-        .execute();
-    });
   }
 
   async listMessages(
@@ -625,206 +807,171 @@ export class SqlThreadStorage implements ThreadStoragePort {
     };
   }
 
-  // ==========================================================================
-  // Cross-Org System Operations (not exposed via OrgScopedThreadStorage)
-  // ==========================================================================
-
-  async claimOrphanedRun(
-    taskId: string,
-    organizationId: string,
-    podId: string,
-  ): Promise<boolean> {
-    // Claim any in-progress run, regardless of which pod is recorded as the
-    // current owner. Callers MUST verify that this pod's RunRegistry has no
-    // live entry for `taskId` before invoking this — that's the orphan
-    // precondition. Same-pod claims are intentionally allowed because:
-    //
-    //   1. K8s rolling restarts re-use the StatefulSet pod name, so a
-    //      previous incarnation may have left `run_owner_pod = currentPodId`
-    //      while the new process has an empty registry.
-    //   2. If the run was projected out of memory (e.g. a transient DB
-    //      failure in the reactor between in-memory projection and the
-    //      `run_owner_pod = NULL` write on terminal status), the same pod is
-    //      the only authority that can recover it without restarting.
-    //
-    // Excluding same-pod claims here used to lock those threads in
-    // `in_progress` indefinitely on single-pod self-hosted deploys.
-    const result = await this.db
-      .updateTable("threads")
-      .set({ run_owner_pod: podId, updated_at: new Date().toISOString() })
-      .where("id", "=", taskId)
-      .where("organization_id", "=", organizationId)
-      .where("status", "=", "in_progress")
-      .executeTakeFirst();
-    return (result?.numUpdatedRows ?? 0n) > 0n;
-  }
-
-  async listOrphanedRuns(_currentPodId: string): Promise<Thread[]> {
-    // Lists every in_progress thread with a persisted run_config, regardless
-    // of which pod is recorded as the current owner. Intended for the
-    // startup recovery sweep, which runs against a registry that is empty
-    // by construction — anything in the DB is recoverable from this
-    // process's perspective.
-    //
-    // Filtering out same-pod owners (the previous behavior) was a bug for
-    // K8s StatefulSet rolling restarts, where the new pod re-uses the
-    // previous incarnation's POD_NAME. Those runs were silently skipped
-    // until something else (a user revisit hitting /stream) recovered them.
-    //
-    // The `_currentPodId` parameter is retained for interface compatibility.
-    const rows = await this.db
-      .selectFrom("threads")
-      .selectAll()
-      .where("status", "=", "in_progress")
-      .where("run_config", "is not", null)
-      .orderBy("run_started_at", "asc")
-      .limit(100)
-      .execute();
-    return rows.map((row) => this.threadFromDbRow(row));
-  }
-
-  async listOrphanedRunsByPod(deadPodId: string): Promise<Thread[]> {
-    const rows = await this.db
-      .selectFrom("threads")
-      .selectAll()
-      .where("status", "=", "in_progress")
-      .where("run_config", "is not", null)
-      .where("run_owner_pod", "=", deadPodId)
-      .orderBy("run_started_at", "asc")
-      .limit(100)
-      .execute();
-    return rows.map((row) => this.threadFromDbRow(row));
-  }
-
-  async claimRunStart(
-    taskId: string,
-    organizationId: string,
-    data: Partial<Thread>,
-    podId: string | null,
-  ): Promise<boolean> {
-    const now = new Date().toISOString();
-
-    const updateData: Record<string, unknown> = { updated_at: now };
-    if (data.status !== undefined) updateData.status = data.status;
-    if (data.run_owner_pod !== undefined)
-      updateData.run_owner_pod = data.run_owner_pod;
-    if (data.run_config !== undefined) {
-      updateData.run_config = data.run_config
-        ? JSON.stringify(data.run_config)
-        : null;
-    }
-    if (data.run_started_at !== undefined)
-      updateData.run_started_at = data.run_started_at;
-
-    // CAS: only claim if not already running on a different pod
-    const result = await this.db
-      .updateTable("threads")
-      .set(updateData)
-      .where("id", "=", taskId)
-      .where("organization_id", "=", organizationId)
-      .where(({ eb, or }) =>
-        or([
-          // Not currently in_progress → fresh start
-          eb("status", "!=", "in_progress"),
-          // Orphan → null pod
-          eb("run_owner_pod", "is", null),
-          // Same pod restart
-          ...(podId ? [eb("run_owner_pod", "=", podId)] : []),
-        ]),
-      )
-      .executeTakeFirst();
-
-    return (result?.numUpdatedRows ?? 0n) > 0n;
-  }
-
-  async orphanRunsByPod(podId: string): Promise<string[]> {
-    const rows = await this.db
-      .updateTable("threads")
-      .set({ run_owner_pod: null, updated_at: new Date().toISOString() })
-      .where("run_owner_pod", "=", podId)
-      .where("status", "=", "in_progress")
-      .returning("id")
-      .execute();
-    return rows.map((r) => r.id);
-  }
-
-  async addInflightAsyncJob(
-    taskId: string,
-    organizationId: string,
-    entry: InflightAsyncJob,
-  ): Promise<void> {
-    // jsonb concat: append the entry to whatever's there (or to []).
+  async bumpProgress(taskId: string, organizationId: string): Promise<void> {
+    // Single-column heartbeat write — intentionally does NOT touch
+    // `updated_at` (that's the user-facing "last activity" timestamp; a
+    // per-chunk bump would churn the thread list ordering). `now()` is
+    // evaluated server-side so it's monotonic with the DB clock the reaper
+    // reads against.
     await this.db
       .updateTable("threads")
-      .set({
-        inflight_async_jobs: sql`COALESCE(inflight_async_jobs, '[]'::jsonb) || ${JSON.stringify([entry])}::jsonb`,
-        updated_at: new Date().toISOString(),
-      })
+      .set({ last_progress_at: sql`now()` })
       .where("id", "=", taskId)
       .where("organization_id", "=", organizationId)
       .execute();
   }
 
-  async findInflightAsyncJob(
+  async getProgress(
     taskId: string,
     organizationId: string,
-    provider: string,
-    modelId: string,
-    query: string,
-  ): Promise<InflightAsyncJob | null> {
+  ): Promise<{
+    lastProgressAt: number | null;
+    runStartedAt: number | null;
+  } | null> {
     const row = await this.db
       .selectFrom("threads")
-      .select("inflight_async_jobs")
+      .select(["last_progress_at", "run_started_at"])
       .where("id", "=", taskId)
       .where("organization_id", "=", organizationId)
       .executeTakeFirst();
-    const list = parseInflightJobs(row?.inflight_async_jobs);
-    if (!list) return null;
-    // Stale entries are ignored at read time — protects callers from
-    // reconnecting to a long-dead provider job. Storage rows still need a
-    // separate sweep to be GC'd, but read-side filtering is enough to keep
-    // them from causing visible misbehaviour.
-    const cutoff = Date.now() - INFLIGHT_ASYNC_JOB_MAX_AGE_MS;
-    // Most recently submitted first → reverse so we prefer the freshest match.
-    for (let i = list.length - 1; i >= 0; i--) {
-      const e = list[i];
-      if (
-        e &&
-        e.provider === provider &&
-        e.modelId === modelId &&
-        e.query === query &&
-        new Date(e.startedAt).getTime() >= cutoff
-      ) {
-        return e;
-      }
-    }
-    return null;
+    if (!row) return null;
+    const toMs = (v: Date | string | null | undefined): number | null => {
+      if (v == null) return null;
+      const ms = (v instanceof Date ? v : new Date(v)).getTime();
+      return Number.isNaN(ms) ? null : ms;
+    };
+    return {
+      lastProgressAt: toMs(row.last_progress_at),
+      runStartedAt: toMs(row.run_started_at),
+    };
   }
 
-  async removeInflightAsyncJob(
-    taskId: string,
+  /** Current fence token for a run (thread id == run id today). */
+  async getRunFence(threadId: string): Promise<string | null> {
+    const row = await this.db
+      .selectFrom("threads")
+      .select("run_fence_token")
+      .where("id", "=", threadId)
+      .executeTakeFirst();
+    return row?.run_fence_token ?? null;
+  }
+
+  /**
+   * Set (or clear) the fence token. Called exactly once per turn-start, before
+   * any chunks are ingested. Atomically resets `run_acked_seq` to NULL so the
+   * new fence epoch always starts with a clean floor — preventing a prior
+   * turn's ack high-water mark from causing `RelaySessionImpl.push()` to drop
+   * the new turn's early chunks (cross-turn chunk loss bug).
+   *
+   * When CLAIMING a turn (token non-null), also resets `status` to
+   * `in_progress`. `runId === threadId`, so the run row is shared across every
+   * turn of a thread, and the consume step is the SOLE terminal-status writer
+   * whose entry guard returns early on a terminal status. Without this reset a
+   * second turn inherits the PRIOR turn's terminal status (`completed` /
+   * `requires_action`), so its consume step short-circuits and the turn renders
+   * "No response was generated". Resetting here — atomically with the new fence
+   * — re-arms the run for this turn (mirrors the per-turn `(runId,fenceToken)`
+   * message-id namespacing: turn-stable runId needs an explicit per-turn reset).
+   * Clearing the fence (token null, teardown) leaves status untouched.
+   */
+  async setRunFence(threadId: string, token: string | null): Promise<void> {
+    await this.db
+      .updateTable("threads")
+      .set(
+        token === null
+          ? { run_fence_token: null, run_acked_seq: null }
+          : {
+              run_fence_token: token,
+              run_acked_seq: null,
+              status: "in_progress",
+            },
+      )
+      .where("id", "=", threadId)
+      .execute();
+  }
+
+  /**
+   * Stamp `cancel_requested_at = now()` for the given thread (Phase C).
+   * Org-scoped: only updates rows matching both id AND organization_id.
+   */
+  async setCancelRequested(
+    threadId: string,
     organizationId: string,
-    provider: string,
-    modelId: string,
-    query: string,
   ): Promise<void> {
     await this.db
       .updateTable("threads")
-      .set({
-        inflight_async_jobs: sql`(
-          SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)
-          FROM jsonb_array_elements(COALESCE(inflight_async_jobs, '[]'::jsonb)) elem
-          WHERE NOT (
-            elem->>'provider' = ${provider}
-            AND elem->>'modelId' = ${modelId}
-            AND elem->>'query' = ${query}
-          )
-        )`,
-        updated_at: new Date().toISOString(),
-      })
-      .where("id", "=", taskId)
+      .set({ cancel_requested_at: sql`now()` })
+      .where("id", "=", threadId)
       .where("organization_id", "=", organizationId)
       .execute();
+  }
+
+  /**
+   * Read `cancel_requested_at` for a thread by id.
+   * Not org-scoped — mirrors `getRunFence` (callers guard via ownership check).
+   */
+  async getCancelRequestedAt(threadId: string): Promise<Date | null> {
+    const row = await this.db
+      .selectFrom("threads")
+      .select("cancel_requested_at")
+      .where("id", "=", threadId)
+      .executeTakeFirst();
+    const v = row?.cancel_requested_at;
+    if (v == null) return null;
+    return v instanceof Date ? v : new Date(v);
+  }
+
+  /** Clear `cancel_requested_at` (set to NULL) for a thread by id. */
+  async clearCancelRequested(threadId: string): Promise<void> {
+    await this.db
+      .updateTable("threads")
+      .set({ cancel_requested_at: null })
+      .where("id", "=", threadId)
+      .execute();
+  }
+
+  /**
+   * Monotonically advance `run_acked_seq` for a run.
+   *
+   * Uses a conditional UPDATE so the value only ever increases — concurrent
+   * calls from multiple replays are safe. `fenceToken` is accepted for
+   * interface parity; the fence-epoch reset is performed atomically by
+   * `setRunFence` at turn-start (which also nulls `run_acked_seq`), so any
+   * subsequent `bumpAckedSeq` call within the same fence epoch is always
+   * advancing from the correct (zero) baseline.
+   */
+  async bumpAckedSeq(
+    id: string,
+    organizationId: string,
+    _fenceToken: string,
+    ackSeq: number,
+  ): Promise<void> {
+    await this.db
+      .updateTable("threads")
+      .set({ run_acked_seq: ackSeq })
+      .where("id", "=", id)
+      .where("organization_id", "=", organizationId)
+      .where((eb) =>
+        eb.or([
+          eb("run_acked_seq", "is", null),
+          eb("run_acked_seq", "<", ackSeq),
+        ]),
+      )
+      .execute();
+  }
+
+  /**
+   * Read the current `run_acked_seq` floor for a run.
+   * Returns 0 when the column is null (no chunks published yet).
+   */
+  async getAckedSeq(id: string, organizationId: string): Promise<number> {
+    const row = await this.db
+      .selectFrom("threads")
+      .select("run_acked_seq")
+      .where("id", "=", id)
+      .where("organization_id", "=", organizationId)
+      .executeTakeFirst();
+    return row?.run_acked_seq ?? 0;
   }
 
   // ==========================================================================
@@ -842,15 +989,18 @@ export class SqlThreadStorage implements ThreadStoragePort {
     run_owner_pod?: string | null;
     run_config?: Record<string, unknown> | null;
     run_started_at?: Date | string | null;
-    inflight_async_jobs?: InflightAsyncJob[] | string | null;
     virtual_mcp_id?: string | null;
     branch?: string | null;
+    sandbox_provider_kind?: string | null;
+    harness_id?: string | null;
     metadata?: ThreadMetadata | string | null;
     created_at: Date | string;
     updated_at: Date | string;
     created_by: string;
     updated_by: string | null;
     hidden: boolean | number | null;
+    message_storage_version?: number | null;
+    link_transport?: string | null;
   }): Thread {
     let metadata: ThreadMetadata = {};
     if (row.metadata != null) {
@@ -882,15 +1032,20 @@ export class SqlThreadStorage implements ThreadStoragePort {
       run_started_at: row.run_started_at
         ? toIsoString(row.run_started_at)
         : null,
-      inflight_async_jobs: parseInflightJobs(row.inflight_async_jobs),
       virtual_mcp_id: row.virtual_mcp_id ?? "",
       branch: row.branch ?? null,
+      sandbox_provider_kind: row.sandbox_provider_kind ?? null,
+      harness_id: row.harness_id ?? null,
       metadata,
       created_at: toIsoString(row.created_at),
       updated_at: toIsoString(row.updated_at),
       created_by: row.created_by,
       updated_by: row.updated_by ?? undefined,
       hidden: !!row.hidden,
+      // Defaults to 1 (legacy) when the column is absent/null so existing
+      // threads keep reading from `thread_messages`.
+      message_storage_version: row.message_storage_version ?? 1,
+      link_transport: row.link_transport ?? null,
     };
   }
 

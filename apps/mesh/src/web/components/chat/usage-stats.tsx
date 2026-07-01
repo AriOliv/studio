@@ -215,7 +215,7 @@ export function SessionStats({
               )}
             />
           </svg>
-          <span className="inline-block overflow-hidden whitespace-nowrap max-w-0 opacity-0 transition-[max-width,opacity] duration-200 ease-out @[496px]/chat-bottom:max-w-32 @[496px]/chat-bottom:opacity-100 text-[11px] font-mono tabular-nums">
+          <span className="inline-block overflow-hidden whitespace-nowrap max-w-0 opacity-0 transition-[max-width,opacity] duration-200 ease-out @[320px]/chat-bottom:max-w-32 @[320px]/chat-bottom:opacity-100 text-[11px] font-mono tabular-nums">
             {pct.toFixed(0)}%{cost > 0 ? ` · $${cost.toFixed(2)}` : ""}
           </span>
         </button>
@@ -223,10 +223,9 @@ export function SessionStats({
       <TooltipContent side="top" className="font-mono text-[11px]">
         <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5">
           <span className="text-muted">context</span>
-          <span className="text-right tabular-nums">{pct.toFixed(1)}%</span>
-          <span className="text-muted">tokens</span>
           <span className="text-right tabular-nums">
-            {totalTokens.toLocaleString()}
+            {totalTokens.toLocaleString()} / {contextWindow.toLocaleString()} (
+            {pct.toFixed(1)}%)
           </span>
           {cost > 0 && (
             <>

@@ -10,16 +10,16 @@ import { Page } from "@/web/components/page";
 import type { RegistryItem } from "@/web/components/store/types";
 import { DeleteConnectionDialogs } from "@/web/components/delete-connection-dialogs";
 import { useDeleteConnection } from "@/web/hooks/use-delete-connection";
+import { useCapability } from "@/web/hooks/use-capability";
 import { useInfiniteScroll } from "@/web/hooks/use-infinite-scroll";
 import { useLocalStorage } from "@/web/hooks/use-local-storage";
 import { LOCALSTORAGE_KEYS } from "@/web/lib/localstorage-keys";
 import { useEnabledRegistries } from "@/web/hooks/use-enabled-registries";
-import { useCurrentMemberRole } from "@/web/hooks/use-current-member-role";
 import { useListState } from "@/web/hooks/use-list-state";
 import { authClient } from "@/web/lib/auth-client";
 import { useAuthConfig } from "@/web/providers/auth-config-provider";
 import { useMergedStoreDiscovery } from "@/web/hooks/use-merged-store-discovery";
-import { getGitHubAvatarUrl } from "@/web/utils/github";
+import { getGitHubAvatarUrl } from "@deco/ui/lib/github.ts";
 import { getConnectionSlug } from "@/shared/utils/connection-slug";
 import {
   AlertDialog,
@@ -76,15 +76,14 @@ import {
 import { Textarea } from "@deco/ui/components/textarea.tsx";
 import { cn } from "@deco/ui/lib/utils.ts";
 import {
-  SELF_MCP_ALIAS_ID,
   useConnectionActions,
   useConnections,
-  useMCPClient,
   useProjectContext,
   type ConnectionEntity,
   useVirtualMCPs,
   type VirtualMCPEntity,
 } from "@decocms/mesh-sdk";
+import { useStudioTools } from "@/web/lib/studio-tools";
 import { toast } from "sonner";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQueryClient } from "@tanstack/react-query";
@@ -97,6 +96,8 @@ import {
   Globe02,
   Loading01,
   Plus,
+  Power01,
+  SlashCircle01,
   Terminal,
   Trash01,
   XClose,
@@ -118,10 +119,7 @@ import {
   extractConnectionData,
   getRegistryItemAppName,
 } from "@/web/utils/extract-connection-data";
-import {
-  isConnectionAuthenticated,
-  authenticateMcp,
-} from "@/web/lib/mcp-oauth";
+import { authenticateAndPersistOAuth } from "@/web/lib/authenticate-and-persist-oauth";
 import { KEYS } from "@/web/lib/query-keys";
 import {
   type ConnectionProviderHint,
@@ -275,6 +273,8 @@ function ConnectionGroupCard({
 function BulkActionBar({
   count,
   total,
+  canManage,
+  canManageAgents,
   onSelectAll,
   onDeselectAll,
   onDelete,
@@ -284,6 +284,8 @@ function BulkActionBar({
 }: {
   count: number;
   total: number;
+  canManage: boolean;
+  canManageAgents: boolean;
   onSelectAll: () => void;
   onDeselectAll: () => void;
   onDelete: () => void;
@@ -318,40 +320,46 @@ function BulkActionBar({
             Clear selection
           </Button>
         )}
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-7 text-xs px-2"
-          onClick={onAddToAgent}
-        >
-          <Plus size={13} />
-          Add to Agent
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-7 text-xs px-2"
-          onClick={() => onToggleStatus("active")}
-        >
-          Enable
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-7 text-xs px-2"
-          onClick={() => onToggleStatus("inactive")}
-        >
-          Disable
-        </Button>
-        <Button
-          variant="destructive"
-          size="sm"
-          className="h-7 text-xs px-2"
-          onClick={onDelete}
-        >
-          <Trash01 size={13} />
-          Delete
-        </Button>
+        {canManageAgents && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs px-2"
+            onClick={onAddToAgent}
+          >
+            <Plus size={13} />
+            Add to Agent
+          </Button>
+        )}
+        {canManage && (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs px-2"
+              onClick={() => onToggleStatus("active")}
+            >
+              Enable
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs px-2"
+              onClick={() => onToggleStatus("inactive")}
+            >
+              Disable
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              className="h-7 text-xs px-2"
+              onClick={onDelete}
+            >
+              <Trash01 size={13} />
+              Delete
+            </Button>
+          </>
+        )}
         <Button
           variant="ghost"
           size="sm"
@@ -520,20 +528,20 @@ function isCommunityItem(item: RegistryItem): boolean {
 
 function CatalogItemCard({
   item,
+  canManage,
   allConnections,
   connectedAppNames,
   connectingItemId,
   onNavigateConnected,
   onConnect,
-  canConnect,
 }: {
   item: RegistryItem;
+  canManage: boolean;
   allConnections: ConnectionEntity[];
   connectedAppNames: Set<string>;
   connectingItemId: string | null;
   onNavigateConnected: (conn: ConnectionEntity) => void;
   onConnect: (item: RegistryItem) => void;
-  canConnect: boolean;
 }) {
   const [communityWarningOpen, setCommunityWarningOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<"connect" | null>(null);
@@ -571,7 +579,9 @@ function CatalogItemCard({
       }
       return;
     }
-    if (canConnect) {
+    // Connecting installs a connection (connections:manage). Members without it
+    // can browse the catalog but not connect.
+    if (canManage) {
       handleConnect();
     }
   };
@@ -616,24 +626,26 @@ function CatalogItemCard({
               <span className="text-xs text-muted-foreground font-normal">
                 Connected
               </span>
-            ) : canConnect ? (
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-7 px-3 rounded-lg text-sm font-medium"
-                disabled={connectingItemId !== null}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleConnect();
-                }}
-              >
-                {connectingItemId === item.id ? (
-                  <Loading01 size={14} className="animate-spin" />
-                ) : (
-                  "Connect"
-                )}
-              </Button>
-            ) : null}
+            ) : (
+              canManage && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-3 rounded-lg text-sm font-medium"
+                  disabled={connectingItemId !== null}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleConnect();
+                  }}
+                >
+                  {connectingItemId === item.id ? (
+                    <Loading01 size={14} className="animate-spin" />
+                  ) : (
+                    "Connect"
+                  )}
+                </Button>
+              )
+            )}
           </div>
         }
       />
@@ -682,9 +694,10 @@ function ConnectionResults({
 
   const actions = useConnectionActions();
   const connections = useConnections(listState);
-  const { canManageConnections, canManageVirtualMcps } = useCurrentMemberRole();
 
   const deleteConnection = useDeleteConnection();
+  const { granted: canManage } = useCapability("connections:manage");
+  const { granted: canManageAgents } = useCapability("agents:manage");
 
   // Selection / bulk-action state
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -772,7 +785,6 @@ function ConnectionResults({
     activeTab === "connected" || isSearching ? grouped : [];
 
   const handleInlineConnect = async (item: RegistryItem) => {
-    if (!canManageConnections) return;
     if (!org || !session?.user?.id) return;
     track("connection_add_clicked", {
       action: "connect_new",
@@ -808,82 +820,43 @@ function ConnectionResults({
 
       const { id } = await actions.create.mutateAsync(connectionData);
 
-      // Handle OAuth flow
-      const mcpProxyUrl = new URL(
-        `/api/${org.slug}/mcp/${id}`,
-        window.location.origin,
-      );
-      const authStatus = await isConnectionAuthenticated({
-        url: mcpProxyUrl.href,
-        token: null,
+      // Handle OAuth flow (if needed) + persist, via the shared helper.
+      const auth = await authenticateAndPersistOAuth({
+        connectionId: id,
         orgId: org.id,
+        orgSlug: org.slug,
+        persistFallback: (token) =>
+          actions.update
+            .mutateAsync({ id, data: { connection_token: token } })
+            .then(() => undefined),
       });
 
-      if (authStatus.supportsOAuth && !authStatus.isAuthenticated) {
-        const { token, tokenInfo, error } = await authenticateMcp({
-          connectionId: id,
-          orgSlug: org.slug,
-          scope: "offline_access",
+      if (auth.ran && !auth.ok) {
+        track("connection_oauth_failed", {
+          connection_id: id,
+          flow: "connections_page_connect",
+          error: auth.error ?? "no_token",
         });
-        if (error || !token) {
-          track("connection_oauth_failed", {
-            connection_id: id,
-            flow: "connections_page_connect",
-            error: error ?? "no_token",
-          });
-          toast.error(`Authentication failed: ${error ?? "no token received"}`);
-          return;
-        } else {
-          track("connection_oauth_succeeded", {
-            connection_id: id,
-            flow: "connections_page_connect",
-          });
-          if (tokenInfo) {
-            try {
-              const response = await fetch(
-                `/api/${org.slug}/connections/${id}/oauth-token`,
-                {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                  },
-                  credentials: "include",
-                  body: JSON.stringify({
-                    accessToken: tokenInfo.accessToken,
-                    refreshToken: tokenInfo.refreshToken,
-                    expiresIn: tokenInfo.expiresIn,
-                    scope: tokenInfo.scope,
-                    clientId: tokenInfo.clientId,
-                    clientSecret: tokenInfo.clientSecret,
-                    tokenEndpoint: tokenInfo.tokenEndpoint,
-                  }),
-                },
-              );
-              if (!response.ok) {
-                await actions.update.mutateAsync({
-                  id,
-                  data: { connection_token: token },
-                });
-              } else {
-                await actions.update.mutateAsync({ id, data: {} });
-              }
-            } catch {
-              await actions.update.mutateAsync({
-                id,
-                data: { connection_token: token },
-              });
-            }
-          } else {
-            await actions.update.mutateAsync({
-              id,
-              data: { connection_token: token },
-            });
-          }
-          await queryClient.invalidateQueries({
-            queryKey: KEYS.isMCPAuthenticated(mcpProxyUrl.href, null),
-          });
-          toast.success("Authentication successful");
-        }
+        toast.error(
+          `Authentication failed: ${auth.error ?? "no token received"}`,
+        );
+        return;
+      }
+
+      if (auth.ran) {
+        track("connection_oauth_succeeded", {
+          connection_id: id,
+          flow: "connections_page_connect",
+        });
+        const mcpProxyUrl = new URL(
+          `/api/${org.slug}/mcp/${id}`,
+          window.location.origin,
+        );
+        await queryClient.invalidateQueries({
+          queryKey: KEYS.isMCPAuthenticated(mcpProxyUrl.href, null),
+        });
+        invalidateConnections();
+        toast.success("Authentication successful");
       }
 
       toast.success("Connected successfully");
@@ -896,11 +869,7 @@ function ConnectionResults({
     }
   };
 
-  const selfClient = useMCPClient({
-    connectionId: SELF_MCP_ALIAS_ID,
-    orgId: org.id,
-    orgSlug: org.slug,
-  });
+  const studio = useStudioTools();
 
   const invalidateConnections = () => {
     queryClient.invalidateQueries({
@@ -924,11 +893,8 @@ function ConnectionResults({
 
     for (const id of ids) {
       try {
-        const result = await selfClient!.callTool({
-          name: "COLLECTION_CONNECTIONS_DELETE",
-          arguments: { id, force: true },
-        });
-        if (!result.isError) deleted++;
+        await studio.call("COLLECTION_CONNECTIONS_DELETE", { id, force: true });
+        deleted++;
       } catch {
         // continue with next
       }
@@ -937,6 +903,21 @@ function ConnectionResults({
     invalidateConnections();
     toast.success(`Deleted ${deleted} connection${deleted !== 1 ? "s" : ""}`);
     exitSelectionMode();
+  };
+
+  const handleToggleStatus = async (
+    id: string,
+    status: "active" | "inactive",
+  ) => {
+    try {
+      await actions.update.mutateAsync({ id, data: { status } });
+      invalidateConnections();
+      toast.success(
+        status === "active" ? "Connection enabled" : "Connection disabled",
+      );
+    } catch {
+      toast.error("Failed to update connection");
+    }
   };
 
   const handleBulkToggleStatus = async (status: "active" | "inactive") => {
@@ -965,7 +946,7 @@ function ConnectionResults({
 
   const handleAddToAgent = async (agentId: string) => {
     const agent = agents.find((a) => a.id === agentId);
-    if (!agent || !selfClient) return;
+    if (!agent) return;
     track("connections_bulk_add_to_agent", {
       agent_id: agentId,
       count: selectedIds.size,
@@ -989,13 +970,10 @@ function ConnectionResults({
     }
 
     try {
-      await selfClient.callTool({
-        name: "COLLECTION_VIRTUAL_MCP_UPDATE",
-        arguments: {
-          id: agentId,
-          data: {
-            connections: [...agent.connections, ...newConns],
-          },
+      await studio.call("COLLECTION_VIRTUAL_MCP_UPDATE", {
+        id: agentId,
+        data: {
+          connections: [...agent.connections, ...newConns],
         },
       });
 
@@ -1024,22 +1002,18 @@ function ConnectionResults({
       <DeleteConnectionDialogs {...deleteConnection} />
 
       {/* Bulk action dialogs */}
-      {canManageConnections && (
-        <BulkDeleteDialog
-          open={bulkDeleteOpen}
-          onOpenChange={setBulkDeleteOpen}
-          count={selectedIds.size}
-          onConfirm={handleBulkDelete}
-        />
-      )}
-      {canManageConnections && canManageVirtualMcps && (
-        <AddToAgentDialog
-          open={addToAgentOpen}
-          onOpenChange={setAddToAgentOpen}
-          agents={agents}
-          onConfirm={handleAddToAgent}
-        />
-      )}
+      <BulkDeleteDialog
+        open={bulkDeleteOpen}
+        onOpenChange={setBulkDeleteOpen}
+        count={selectedIds.size}
+        onConfirm={handleBulkDelete}
+      />
+      <AddToAgentDialog
+        open={addToAgentOpen}
+        onOpenChange={setAddToAgentOpen}
+        agents={agents}
+        onConfirm={handleAddToAgent}
+      />
 
       {/* Cards */}
       {mergedDiscovery.isInitialLoading && activeTab === "all" ? (
@@ -1069,9 +1043,9 @@ function ConnectionResults({
               description={
                 listState.search
                   ? `No Connections match "${listState.search}"`
-                  : canManageConnections
+                  : canManage
                     ? "Create a connection to get started."
-                    : "No connections found."
+                    : "Ask an organization admin to add one."
               }
             />
           ) : (
@@ -1122,7 +1096,7 @@ function ConnectionResults({
                     headerActionsAlwaysVisible
                     headerActions={
                       <div className="flex items-center gap-1">
-                        {canManageConnections && selectionMode ? (
+                        {selectionMode ? (
                           <Checkbox
                             checked={isSelected}
                             onCheckedChange={() => toggleSelect(connection.id)}
@@ -1171,7 +1145,7 @@ function ConnectionResults({
                                 <Eye size={16} />
                                 Open
                               </DropdownMenuItem>
-                              {canManageConnections && (
+                              {(canManage || canManageAgents) && (
                                 <DropdownMenuItem
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1182,7 +1156,35 @@ function ConnectionResults({
                                   Select
                                 </DropdownMenuItem>
                               )}
-                              {canManageConnections && (
+                              {canManage &&
+                                (connection.status === "active" ? (
+                                  <DropdownMenuItem
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleToggleStatus(
+                                        connection.id,
+                                        "inactive",
+                                      );
+                                    }}
+                                  >
+                                    <SlashCircle01 size={16} />
+                                    Disable
+                                  </DropdownMenuItem>
+                                ) : (
+                                  <DropdownMenuItem
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleToggleStatus(
+                                        connection.id,
+                                        "active",
+                                      );
+                                    }}
+                                  >
+                                    <Power01 size={16} />
+                                    Enable
+                                  </DropdownMenuItem>
+                                ))}
+                              {canManage && (
                                 <DropdownMenuItem
                                   variant="destructive"
                                   onClick={(e) => {
@@ -1207,6 +1209,7 @@ function ConnectionResults({
                 <CatalogItemCard
                   key={`catalog-${item._registryId}:${item.id}`}
                   item={item}
+                  canManage={canManage}
                   allConnections={connections}
                   connectedAppNames={connectedAppNames}
                   connectingItemId={connectingItemId}
@@ -1220,7 +1223,6 @@ function ConnectionResults({
                     })
                   }
                   onConnect={handleInlineConnect}
-                  canConnect={canManageConnections}
                 />
               ))}
               {(activeTab === "all" || isSearching) &&
@@ -1242,18 +1244,18 @@ function ConnectionResults({
       )}
 
       {/* Floating bulk action bar */}
-      {canManageConnections && selectionMode && (
+      {selectionMode && (
         <BulkActionBar
           count={selectedIds.size}
           total={filteredConnections.length}
+          canManage={canManage}
+          canManageAgents={canManageAgents}
           onSelectAll={() => {
             setSelectedIds(new Set(filteredConnections.map((c) => c.id)));
           }}
           onDeselectAll={() => setSelectedIds(new Set())}
           onDelete={() => setBulkDeleteOpen(true)}
-          onAddToAgent={() => {
-            if (canManageVirtualMcps) setAddToAgentOpen(true);
-          }}
+          onAddToAgent={() => setAddToAgentOpen(true)}
           onToggleStatus={handleBulkToggleStatus}
           onCancel={exitSelectionMode}
         />
@@ -1272,6 +1274,7 @@ function OrgMcpsContent() {
   const { data: session } = authClient.useSession();
   const { stdioEnabled } = useAuthConfig();
   const isMobile = useIsMobile();
+  const { granted: canManage } = useCapability("connections:manage");
 
   // Consolidated list UI state (search, filters, sorting, view mode)
   const listState = useListState<ConnectionEntity>({
@@ -1280,7 +1283,6 @@ function OrgMcpsContent() {
   });
 
   const actions = useConnectionActions();
-  const { canManageConnections } = useCurrentMemberRole();
 
   // Tab state
   type ConnectionTab = "connected" | "all";
@@ -1323,7 +1325,6 @@ function OrgMcpsContent() {
       stdio_args: "",
       stdio_cwd: "",
       env_vars: [],
-      auth_mode: "shared",
     },
   });
 
@@ -1344,11 +1345,12 @@ function OrgMcpsContent() {
       registryItems,
     });
 
-  // Create dialog state is derived from search params
-  const isCreating = canManageConnections && search.action === "create";
+  // Create dialog state is derived from search params, but gated on capability
+  // so it can't be opened by deep-linking to ?action=create without
+  // connections:manage (the write would fail server-side regardless).
+  const isCreating = canManage && search.action === "create";
 
   const openCreateDialog = () => {
-    if (!canManageConnections) return;
     track("connections_custom_dialog_opened", {
       source: "connections_page",
     });
@@ -1368,7 +1370,6 @@ function OrgMcpsContent() {
   };
 
   const onSubmit = async (data: ConnectionFormData) => {
-    if (!canManageConnections) return;
     // Determine actual connection_type, connection_url, and connection_headers based on ui_type
     let connectionType: "HTTP" | "SSE" | "Websocket" | "STDIO";
     let connectionUrl: string | null = null;
@@ -1543,7 +1544,7 @@ function OrgMcpsContent() {
     }
   };
 
-  const ctaButton = canManageConnections ? (
+  const ctaButton = canManage ? (
     <div className="flex items-center gap-2">
       <Button variant="outline" onClick={openCreateDialog}>
         <Plus size={14} className="sm:hidden" />

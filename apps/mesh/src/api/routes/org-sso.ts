@@ -11,11 +11,11 @@ import { Hono } from "hono";
 import { setCookie, getCookie } from "hono/cookie";
 import * as jose from "jose";
 import { getSettings } from "../../settings";
-import type { MeshContext } from "../../core/mesh-context";
+import type { StudioContext } from "../../core/studio-context";
 import { ADMIN_ROLES } from "../../auth/roles";
 
 type Variables = {
-  meshContext: MeshContext;
+  meshContext: StudioContext;
 };
 
 export const createSsoRoutes = () => {
@@ -37,7 +37,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: GET /api/org-sso/status?orgId=<id>
    */
   app.get("/status", async (c) => {
-    const ctx = c.get("meshContext") as MeshContext;
+    const ctx = c.get("meshContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -81,7 +81,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: GET /api/org-sso/authorize?orgId=<id>
    */
   app.get("/authorize", async (c) => {
-    const ctx = c.get("meshContext") as MeshContext;
+    const ctx = c.get("meshContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -152,7 +152,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: GET /api/org-sso/callback
    */
   app.get("/callback", async (c) => {
-    const ctx = c.get("meshContext") as MeshContext;
+    const ctx = c.get("meshContext") as StudioContext;
 
     const code = c.req.query("code");
     const state = c.req.query("state");
@@ -269,17 +269,21 @@ function registerSsoRoutes(app: SsoApp) {
       return c.redirect("/?sso_error=token_verification_failed");
     }
 
-    // Create SSO session
-    await ctx.storage.orgSsoSessions.upsert(ctx.auth.user.id, stateData.orgId);
-
-    // Look up org slug via membership to redirect to the org
+    // Re-verify membership before creating the session. The user may have been
+    // removed from the org between /authorize and this callback (TOCTOU).
     const membership = await getOrgMembership(
       ctx,
       ctx.auth.user.id,
       stateData.orgId,
     );
+    if (!membership) {
+      return c.redirect("/?sso_error=not_a_member");
+    }
 
-    const redirectPath = membership?.orgSlug ? `/${membership.orgSlug}` : "/";
+    // Create SSO session
+    await ctx.storage.orgSsoSessions.upsert(ctx.auth.user.id, stateData.orgId);
+
+    const redirectPath = membership.orgSlug ? `/${membership.orgSlug}` : "/";
     return c.redirect(redirectPath);
   });
 
@@ -293,7 +297,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: GET /api/org-sso/config
    */
   app.get("/config", async (c) => {
-    const ctx = c.get("meshContext") as MeshContext;
+    const ctx = c.get("meshContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -325,7 +329,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: POST /api/org-sso/config
    */
   app.post("/config", async (c) => {
-    const ctx = c.get("meshContext") as MeshContext;
+    const ctx = c.get("meshContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -404,7 +408,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: POST /api/org-sso/config/enforce
    */
   app.post("/config/enforce", async (c) => {
-    const ctx = c.get("meshContext") as MeshContext;
+    const ctx = c.get("meshContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -437,7 +441,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: DELETE /api/org-sso/config
    */
   app.delete("/config", async (c) => {
-    const ctx = c.get("meshContext") as MeshContext;
+    const ctx = c.get("meshContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -588,7 +592,7 @@ async function generateCodeChallenge(verifier: string): Promise<string> {
 }
 
 async function getOrgMembership(
-  ctx: MeshContext,
+  ctx: StudioContext,
   userId: string,
   orgId: string,
 ): Promise<{ orgSlug: string; role: string } | null> {
@@ -602,12 +606,12 @@ async function getOrgMembership(
   return row ?? null;
 }
 
-function isOrgAdmin(ctx: MeshContext): boolean {
+function isOrgAdmin(ctx: StudioContext): boolean {
   const role = ctx.auth.user?.role;
   if (!role) return false;
   return (ADMIN_ROLES as readonly string[]).includes(role);
 }
 
-function isOrgOwner(ctx: MeshContext): boolean {
+function isOrgOwner(ctx: StudioContext): boolean {
   return ctx.auth.user?.role === "owner";
 }

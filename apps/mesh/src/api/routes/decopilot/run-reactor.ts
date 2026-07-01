@@ -24,15 +24,6 @@ import type { RunEvent, RunTransition } from "./run-state";
 // Errors
 // ============================================================================
 
-export class RunClaimError extends Error {
-  constructor(taskId: string) {
-    super(
-      `Failed to claim run for thread ${taskId} — already running on another pod`,
-    );
-    this.name = "RunClaimError";
-  }
-}
-
 // ============================================================================
 // Deps
 // ============================================================================
@@ -53,22 +44,23 @@ async function handleTerminalStatus(
   status: "completed" | "requires_action",
   deps: RunReactorDeps,
 ): Promise<void> {
-  const { storage, streamBuffer, sseHub } = deps;
+  const { storage, sseHub } = deps;
   const thread = await storage.get(taskId, orgId);
 
-  await storage.update(taskId, orgId, {
-    status,
-    run_owner_pod: null,
-    run_config: null,
-    run_started_at: null,
-  });
-  streamBuffer.purge(taskId);
+  // DB status write intentionally removed: the consume step (consume-run-projection.ts)
+  // is now the sole writer for completed/requires_action. The live reactor only emits
+  // SSE for instant UX — the durable projector workflow owns the terminal DB transition.
+  // (RUN_FAILED is exempt: failed runs skip the projector path and keep their write below.)
   sseHub.emit(
     orgId,
     createDecopilotThreadStatusEvent(taskId, status, {
       virtualMcpId: thread?.virtual_mcp_id ?? undefined,
       createdBy: thread?.created_by,
       triggerId: thread?.trigger_id,
+      title: thread?.title,
+      branch: thread?.branch ?? null,
+      createdAt: thread?.created_at,
+      updatedAt: thread?.updated_at,
     }),
   );
   sseHub.emit(orgId, createDecopilotFinishEvent(taskId, status));
@@ -83,20 +75,15 @@ async function react(event: RunEvent, deps: RunReactorDeps): Promise<void> {
 
   switch (event.type) {
     case "RUN_STARTED": {
-      const claimed = await storage.claimRunStart(
-        event.taskId,
-        event.orgId,
-        {
-          status: "in_progress",
-          run_owner_pod: event.podId ?? null,
-          run_config: event.runConfig ?? null,
-          run_started_at: event.podId ? new Date().toISOString() : null,
-        },
-        event.podId ?? null,
-      );
-      if (!claimed) {
-        throw new RunClaimError(event.taskId);
-      }
+      // Single-execution is guaranteed by the DBOS thread-gate queue
+      // (concurrency=1 per threadId partition), so there is no mesh-level
+      // run-owner claim to win/lose here — just record the run as active.
+      await storage.update(event.taskId, event.orgId, {
+        status: "in_progress",
+        run_config: event.runConfig ?? null,
+        run_started_at: new Date().toISOString(),
+        last_progress_at: null,
+      });
       const startedThread = await storage.get(event.taskId, event.orgId);
       sseHub.emit(
         event.orgId,
@@ -104,6 +91,10 @@ async function react(event: RunEvent, deps: RunReactorDeps): Promise<void> {
           virtualMcpId: startedThread?.virtual_mcp_id ?? undefined,
           createdBy: startedThread?.created_by,
           triggerId: startedThread?.trigger_id,
+          title: startedThread?.title,
+          branch: startedThread?.branch ?? null,
+          createdAt: startedThread?.created_at,
+          updatedAt: startedThread?.updated_at,
         }),
       );
       return;
@@ -111,7 +102,6 @@ async function react(event: RunEvent, deps: RunReactorDeps): Promise<void> {
 
     case "RUN_RESUMED": {
       await storage.update(event.taskId, event.orgId, {
-        run_owner_pod: event.podId,
         run_started_at: new Date().toISOString(),
       });
       const resumedThread = await storage.get(event.taskId, event.orgId);
@@ -121,6 +111,10 @@ async function react(event: RunEvent, deps: RunReactorDeps): Promise<void> {
           virtualMcpId: resumedThread?.virtual_mcp_id ?? undefined,
           createdBy: resumedThread?.created_by,
           triggerId: resumedThread?.trigger_id,
+          title: resumedThread?.title,
+          branch: resumedThread?.branch ?? null,
+          createdAt: resumedThread?.created_at,
+          updatedAt: resumedThread?.updated_at,
         }),
       );
       return;
@@ -156,14 +150,12 @@ async function react(event: RunEvent, deps: RunReactorDeps): Promise<void> {
         if (!transitioned) return;
         // Clear run columns for ghost failures too
         await storage.update(event.taskId, event.orgId, {
-          run_owner_pod: null,
           run_config: null,
           run_started_at: null,
         });
       } else {
         await storage.update(event.taskId, event.orgId, {
           status: "failed",
-          run_owner_pod: null,
           run_config: null,
           run_started_at: null,
         });
@@ -176,6 +168,10 @@ async function react(event: RunEvent, deps: RunReactorDeps): Promise<void> {
           virtualMcpId: failedThread?.virtual_mcp_id ?? undefined,
           createdBy: failedThread?.created_by,
           triggerId: failedThread?.trigger_id,
+          title: failedThread?.title,
+          branch: failedThread?.branch ?? null,
+          createdAt: failedThread?.created_at,
+          updatedAt: failedThread?.updated_at,
         }),
       );
       sseHub.emit(

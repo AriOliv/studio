@@ -1,0 +1,1343 @@
+/**
+ * ThreadConnection — self-contained per-thread data + transport.
+ *
+ * Owns:
+ *   • one persistent SSE GET /stream loop (reconnect+backoff)
+ *   • one-shot POST /messages for sends + continuations
+ *   • a single `messages` Store that's the only source of truth
+ *   • `status`, `finishReason`, `hasMoreOlder`, `isFetchingOlder` Stores
+ *     read by the React layer
+ *
+ * Lifecycle:
+ *   constructor → bootstrap() opens the SSE and calls
+ *   COLLECTION_THREAD_MESSAGES_LIST in parallel to seed the initial page
+ *   (latest 5 messages). The SSE delivers UIMessageChunk events that fold
+ *   into the messages list via mergeAndSort. Chunks arriving before the
+ *   initial page resolves are buffered and drained afterwards.
+ *   dispose() aborts everything.
+ *
+ * Mutation:
+ *   Exactly one entry point: submit(action). Three action kinds:
+ *     • { kind: "message",    message }              — new user turn
+ *     • { kind: "toolOutput", toolCallId, output }   — tool call response
+ *     • { kind: "approval",   approvalId, approved } — approval response
+ *   Each one patches `messages` synchronously and POSTs the last message
+ *   to /messages. finishReason is cleared synchronously on every submit
+ *   so prior-turn "Response incomplete" banners don't flash through.
+ *
+ *   No silent no-ops: if a toolOutput / approval target isn't found in
+ *   the current `messages`, submit() throws.
+ *
+ * Server reconciliation:
+ *   On every SSE reconnect the connection re-fetches the latest page via
+ *   COLLECTION_THREAD_MESSAGES_LIST and merges via mergeAndSort. The
+ *   merge is upsert-by-id then sort by (created_at, id), so optimistic
+ *   local rows and in-flight streaming rows are preserved correctly.
+ */
+
+import {
+  lastAssistantMessageIsCompleteWithApprovalResponses,
+  lastAssistantMessageIsCompleteWithToolCalls,
+  readUIMessageStream,
+  uiMessageChunkSchema,
+  type UIMessage,
+  type UIMessageChunk,
+} from "ai";
+import { exponentialBackoffWithJitter, sleep } from "@decocms/std";
+import type { Client as MCPClient } from "@modelcontextprotocol/sdk/client/index.js";
+import type { ToolApprovalLevel } from "@/web/hooks/use-preferences";
+import type { SimpleModeTier } from "@/tools/organization/schema";
+import { Store } from "./store-primitive";
+import { extractToolErrorMessage } from "./mcp-utils";
+import type { ChatMode } from "../types";
+import { toast } from "sonner";
+import type { SandboxProviderKind } from "@decocms/sandbox/provider";
+import type { HarnessId } from "@/harnesses";
+import {
+  advanceRunStatusStage,
+  isRunStatusControlChunk,
+  parseRunStatusStageChunk,
+  type RunStatusStage,
+} from "../run-status";
+
+export { Store };
+
+// ─── Request options (wire payload alongside `messages`) ─────────────────────
+
+export interface RequestOptions {
+  tier: SimpleModeTier;
+  mode: ChatMode;
+  toolApprovalLevel: ToolApprovalLevel;
+  /** Synthesized into a `role: "system"` message at POST time. */
+  system?: string;
+  agent?: { id: string };
+  branch?: string | null;
+  thread_id?: string;
+  /**
+   * Optional pins sent on first message. The server persists them onto the
+   * thread row and ignores them on subsequent messages.
+   */
+  sandboxProviderKind?: SandboxProviderKind;
+  harnessId?: HarnessId;
+}
+
+// ─── Status ──────────────────────────────────────────────────────────────────
+
+export type ConnStatus =
+  | { kind: "loading" }
+  | { kind: "ready" }
+  | { kind: "submitted" }
+  | { kind: "streaming" }
+  | { kind: "error"; error: Error };
+
+// ─── Submit actions ──────────────────────────────────────────────────────────
+
+export type SubmitAction =
+  | { kind: "message"; message: UIMessage }
+  | {
+      kind: "toolOutput";
+      toolCallId: string;
+      output: unknown;
+      state?: "output-available" | "output-error";
+      errorText?: string;
+    }
+  | {
+      kind: "approval";
+      approvalId: string;
+      approved: boolean;
+      reason?: string;
+    };
+
+// ─── Hand-rolled emitter ─────────────────────────────────────────────────────
+// `Store<T>` lives in ../store/store-primitive; re-exported above for callers
+// that import it from this module.
+
+// ─── Observer ────────────────────────────────────────────────────────────────
+
+export interface ThreadObserver {
+  onData?: (chunk: Extract<UIMessageChunk, { type: `data-${string}` }>) => void;
+  onToolCall?: (event: {
+    toolCall: { toolCallId: string; toolName: string; input: unknown };
+  }) => void;
+  onFinish?: (
+    msg: UIMessage,
+    messages: UIMessage[],
+    finishReason?: string,
+  ) => void;
+  onError?: (err: Error) => void;
+}
+
+// ─── Internal helpers ────────────────────────────────────────────────────────
+
+const BASE_DELAY_MS = 1_000;
+const MAX_DELAY_MS = 30_000;
+const CLEAN_RECONNECT_DELAY_MS = 50;
+/** G1: Maximum time (ms) to wait for the POST /messages response. The POST is
+ *  idempotency-keyed (workflowID), so a timeout-then-retry is safe. */
+const POST_TIMEOUT_MS = 60_000;
+
+// Browser uses rAF for chunk-coalescing; tests run under Bun where rAF is absent.
+const scheduleFrame: (cb: () => void) => number =
+  typeof requestAnimationFrame === "function"
+    ? requestAnimationFrame
+    : (cb) => setTimeout(cb, 0) as unknown as number;
+const cancelFrame: (id: number) => void =
+  typeof cancelAnimationFrame === "function"
+    ? cancelAnimationFrame
+    : (id) => clearTimeout(id);
+
+/**
+ * Apply a SubmitAction to a messages list. Returns the next list, or null
+ * if the action's target (toolCallId / approvalId) wasn't found. Callers
+ * surface null as an error — no silent no-ops.
+ */
+function applyLocally(
+  prev: UIMessage[],
+  action: SubmitAction,
+): UIMessage[] | null {
+  if (action.kind === "message") {
+    // Stamp a top-level `created_at` the moment the user submits. Without it the
+    // optimistic user row reads as +Infinity in `readTimestamp`/`mergeAndSort`,
+    // while the assistant reply gets a finite timestamp (run-start
+    // `metadata.created_at`, or its finish anchor) — so the reply sorts AHEAD of
+    // the user row that triggered it. The turn then renders empty ("No response
+    // was generated") with its answer detached under the next turn, until a
+    // refetch brings the DB `created_at`.
+    //
+    // The just-submitted message is the newest in the thread, so stamp it
+    // strictly after every existing finite timestamp — not a bare `now`, which
+    // can tie (to the millisecond) with a frozen assistant just anchored by
+    // stop(); the role tiebreak would then wrongly sort the new user ahead of
+    // that earlier assistant. A persisted refetch (incoming carries the DB
+    // `created_at`) overwrites this via `preserveCreatedAt`. No-op if a
+    // `created_at` is already present.
+    const msg = action.message as UIMessage & { created_at?: string };
+    if (msg.created_at != null) return [...prev, msg];
+    let maxMs = 0;
+    for (const m of prev) {
+      const ts = (m as { created_at?: string | number | Date }).created_at;
+      if (ts == null) continue;
+      const t = new Date(ts).getTime();
+      if (Number.isFinite(t) && t > maxMs) maxMs = t;
+    }
+    const ms = Math.max(Date.now(), maxMs + 1);
+    return [
+      ...prev,
+      { ...msg, created_at: new Date(ms).toISOString() } as UIMessage,
+    ];
+  }
+  // toolOutput / approval — locate the part by id on any assistant message.
+  // The newest occurrence wins (the same toolCallId shouldn't appear twice
+  // but we scan right-to-left so the freshest match is hit).
+  for (let i = prev.length - 1; i >= 0; i--) {
+    const msg = prev[i];
+    if (!msg || msg.role !== "assistant") continue;
+    const partIdx = findTargetPartIndex(msg.parts, action);
+    if (partIdx === -1) continue;
+    const part = msg.parts[partIdx];
+    if (!part) continue;
+    const nextPart = patchPart(part, action);
+    if (!nextPart) continue;
+    const nextParts = [...msg.parts];
+    nextParts[partIdx] = nextPart;
+    const nextMsgs = [...prev];
+    nextMsgs[i] = { ...msg, parts: nextParts };
+    return nextMsgs;
+  }
+  return null;
+}
+
+function findTargetPartIndex(
+  parts: UIMessage["parts"],
+  action: Exclude<SubmitAction, { kind: "message" }>,
+): number {
+  if (action.kind === "toolOutput") {
+    return parts.findIndex(
+      // biome-ignore lint/suspicious/noExplicitAny: heterogeneous AI SDK part union
+      (p) => (p as any)?.toolCallId === action.toolCallId,
+    );
+  }
+  return parts.findIndex((p) => {
+    // biome-ignore lint/suspicious/noExplicitAny: heterogeneous AI SDK part union
+    const x = p as any;
+    return (
+      x?.state === "approval-requested" && x?.approval?.id === action.approvalId
+    );
+  });
+}
+
+function patchPart(
+  part: UIMessage["parts"][number],
+  action: Exclude<SubmitAction, { kind: "message" }>,
+): UIMessage["parts"][number] | null {
+  if (action.kind === "toolOutput") {
+    return {
+      ...part,
+      state: action.state ?? "output-available",
+      output: action.output,
+      errorText: action.errorText,
+      // biome-ignore lint/suspicious/noExplicitAny: heterogeneous AI SDK part union
+    } as any;
+  }
+  return {
+    ...part,
+    state: "approval-responded",
+    approval: {
+      id: action.approvalId,
+      approved: action.approved,
+      ...(action.reason ? { reason: action.reason } : {}),
+    },
+    // biome-ignore lint/suspicious/noExplicitAny: heterogeneous AI SDK part union
+  } as any;
+}
+
+function describe(action: SubmitAction): string {
+  if (action.kind === "message") return `message id=${action.message.id}`;
+  if (action.kind === "toolOutput")
+    return `toolOutput toolCallId=${action.toolCallId}`;
+  return `approval approvalId=${action.approvalId}`;
+}
+
+// ─── ThreadConnection ────────────────────────────────────────────────────────
+
+interface ThreadConnectionOptions {
+  client?: MCPClient | null;
+}
+
+export class ThreadConnection {
+  readonly key: string;
+
+  /** Single source of truth. Seeded from COLLECTION_THREAD_MESSAGES_LIST on
+   *  load, mutated locally on submit, mutated chunk-by-chunk during SSE
+   *  streaming. */
+  readonly messages = new Store<UIMessage[]>([]);
+  readonly status = new Store<ConnStatus>({ kind: "loading" });
+  readonly finishReason = new Store<string | null>(null);
+  readonly runStatusStage = new Store<RunStatusStage | null>(null);
+  readonly hasMoreOlder = new Store<boolean>(false);
+  readonly isFetchingOlder = new Store<boolean>(false);
+
+  observer: ThreadObserver | null = null;
+
+  /** Test-only escape hatch. Don't call from production. */
+  readonly abort = new AbortController();
+
+  // Demuxer state for the persistent SSE.
+  private subController: ReadableStreamDefaultController<UIMessageChunk> | null =
+    null;
+  private pendingFinishReason: string | undefined = undefined;
+  private discardOnClose = false;
+  private inflightPost: AbortController | null = null;
+  /**
+   * After a manual stop(), drop chunks until the next `start` chunk so late
+   * text-deltas / finish events from the cancelled run don't open a fresh
+   * substream and land on a new assistant message after any user turn the
+   * user has queued in the meantime.
+   */
+  private waitingForNewRun = false;
+  private acceptPreStartRunStatus = true;
+  /** `start` chunk opened a new assistant turn — don't seed the prior one. */
+  private freshRunSubstream = false;
+  private client: MCPClient | null;
+  private serverFetchedCount = 0;
+  private readonly pageSize = 5;
+  /**
+   * Chunk buffer: `[]` means "boot, buffering"; `null` means "ready, fold
+   * chunks live". Chunks arriving before loadInitialPage resolves are queued
+   * here and replayed through `handleChunk` after the page lands.
+   */
+  private chunkBuffer: UIMessageChunk[] | null = [];
+
+  /**
+   * Resolves once the initial page load settles (success, error, or
+   * null-client fallback). Consumers `use()` this to suspend the chat tree
+   * via the `<Suspense fallback={<Chat.Skeleton />}>` boundary in
+   * side-panel-chat.tsx so the first paint isn't an empty message list.
+   * Resolves only — never rejects; error states are surfaced through
+   * `status` so the UI can render an inline error instead of an
+   * ErrorBoundary fallback.
+   */
+  readonly ready: Promise<void>;
+  private resolveReady!: () => void;
+
+  constructor(
+    readonly orgSlug: string,
+    readonly threadId: string,
+    opts: ThreadConnectionOptions = {},
+  ) {
+    this.key = `${orgSlug}::${threadId}`;
+    this.client = opts.client ?? null;
+    this.ready = new Promise<void>((res) => {
+      this.resolveReady = res;
+    });
+    void this.bootstrap();
+  }
+
+  dispose(): void {
+    this.abort.abort();
+  }
+
+  // ── Public mutator (single entry point) ─────────────────────────────────
+
+  async submit(action: SubmitAction, opts: RequestOptions): Promise<void> {
+    // Always clear stale finishReason synchronously so the prior-turn
+    // "Response incomplete" warning doesn't flash through during the
+    // POST → first-chunk round trip.
+    this.finishReason.set(null);
+
+    const next = applyLocally(this.messages.get(), action);
+    if (!next) {
+      throw new Error(`submit: target not found for ${describe(action)}`);
+    }
+    // Same sort pass refresh uses (mergeAndSort + DB `created_at`). Without
+    // it, an in-flight SSE assistant row can sit above the user we just
+    // appended because foldSubStream only upserts by id.
+    this.messages.set(mergeAndSort(next, []));
+    this.acceptPreStartRunStatus = true;
+
+    // A new user turn always POSTs. For approval / toolOutput actions, only
+    // POST once the assistant turn has no remaining client-side resolutions
+    // (other pending approvals or unresolved local tool inputs). The two
+    // AI SDK predicates together cover both shapes.
+    const shouldPost =
+      action.kind === "message" ||
+      lastAssistantMessageIsCompleteWithApprovalResponses({ messages: next }) ||
+      lastAssistantMessageIsCompleteWithToolCalls({ messages: next });
+
+    if (!shouldPost) return;
+
+    const last = next.at(-1);
+    if (!last) {
+      // Can't happen — applyLocally returned non-null so the list has ≥1 item.
+      this.status.set({ kind: "ready" });
+      return;
+    }
+
+    this.runStatusStage.set("sending");
+    this.status.set({ kind: "submitted" });
+
+    const abort = new AbortController();
+    this.inflightPost = abort;
+    try {
+      await this.post(last, opts, abort.signal);
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err));
+      this.clearRunStatusStage();
+      this.failTo(e);
+    } finally {
+      if (this.inflightPost === abort) this.inflightPost = null;
+    }
+  }
+
+  stop(): void {
+    this.inflightPost?.abort();
+    const s = this.status.get();
+    if (s.kind === "submitted" || s.kind === "streaming") {
+      this.status.set({ kind: "ready" });
+    }
+    this.clearRunStatusStage();
+    this.acceptPreStartRunStatus = false;
+    // Freeze the in-flight assistant message at its current state and gate
+    // every subsequent chunk on a fresh `start` boundary. Without this, the
+    // cancel's racing tail chunks (or a server-side replay across an SSE
+    // reconnect) would create a new assistant message that lands after any
+    // user turn the user queues between Stop and the next run.
+    if (this.subController) {
+      this.forceCloseSubStream(true);
+    }
+    // Anchor the frozen assistant so mergeAndSort on the next submit doesn't
+    // pull a timestamp-less user row ahead of it (role tiebreak or +Infinity).
+    this.messages.update((msgs) => {
+      const last = msgs.at(-1);
+      if (last?.role !== "assistant") return msgs;
+      const row = last as UIMessage & { created_at?: string };
+      if (row.created_at != null) return msgs;
+      const anchored = {
+        ...last,
+        created_at: new Date().toISOString(),
+      } as UIMessage;
+      return [...msgs.slice(0, -1), anchored];
+    });
+    this.waitingForNewRun = true;
+  }
+
+  clearError(): void {
+    const s = this.status.get();
+    if (s.kind === "error") this.status.set({ kind: "ready" });
+  }
+
+  // ── Internal: bootstrap ─────────────────────────────────────────────────
+
+  private async bootstrap(): Promise<void> {
+    // Initial-page fetch and SSE loop run concurrently. Chunks arriving
+    // before the page resolves are queued via `chunkBuffer` and drained
+    // through `handleChunk` after the page lands.
+    void this.loadInitialPage();
+    await this.runSseLoop();
+  }
+
+  private async loadInitialPage(): Promise<void> {
+    // Yield one microtask so the constructor finishes and callers can
+    // observe the initial { kind: "loading" } status synchronously.
+    await Promise.resolve();
+    if (!this.client) {
+      // Test harness / no MCP — flip to ready immediately and dispatch
+      // chunks live. The chat UI is usable with chunks alone.
+      if (this.status.get().kind === "loading") {
+        this.status.set({ kind: "ready" });
+      }
+      this.drainChunkBuffer();
+      this.resolveReady();
+      return;
+    }
+    try {
+      const result = await this.client.callTool({
+        name: "COLLECTION_THREAD_MESSAGES_LIST",
+        arguments: {
+          thread_id: this.threadId,
+          limit: this.pageSize,
+          offset: 0,
+          orderBy: [{ field: ["created_at"], direction: "desc" }],
+        },
+      });
+      if (this.abort.signal.aborted) {
+        this.resolveReady();
+        return;
+      }
+      if ((result as { isError?: boolean }).isError) {
+        throw new Error(
+          extractToolErrorMessage(
+            result,
+            "COLLECTION_THREAD_MESSAGES_LIST failed",
+          ),
+        );
+      }
+      const payload = ((result as { structuredContent?: unknown })
+        .structuredContent ?? result) as {
+        items?: UIMessage[];
+        hasMore?: boolean;
+      };
+      const items = payload.items ?? [];
+      this.messages.update((curr) => mergeAndSort(curr, items));
+      // Re-surface a settled turn's finish reason (e.g. the step-limit
+      // "tool-calls" pause) so the "Response incomplete" banner persists
+      // across reloads. Live runs set this from the stream's finish chunk;
+      // here we seed it from the persisted finish anchor when none is set.
+      if (this.finishReason.get() === null) {
+        const last = this.messages.get().at(-1);
+        const fr =
+          last?.role === "assistant"
+            ? (last.metadata as { finishReason?: string } | undefined)
+                ?.finishReason
+            : undefined;
+        if (fr) this.finishReason.set(fr);
+      }
+      this.serverFetchedCount = items.length;
+      this.hasMoreOlder.set(payload.hasMore ?? false);
+      if (this.status.get().kind === "loading") {
+        this.status.set({ kind: "ready" });
+      }
+      this.drainChunkBuffer();
+    } catch (err) {
+      this.failTo(err instanceof Error ? err : new Error(String(err)));
+      // G3: drain the chunk buffer even on failure so live SSE chunks that
+      // arrived while the initial page was in-flight aren't stuck forever.
+      // Without this, chunkBuffer stays non-null after the catch branch and
+      // handleChunk keeps buffering indefinitely — the thread is stuck.
+      // Subsequent successful SSE chunks fold live; dedupe-by-id handles
+      // any overlap with rows from a later successful loadInitialPage.
+      this.drainChunkBuffer();
+    } finally {
+      this.resolveReady();
+    }
+  }
+
+  /**
+   * Refresh the latest page after an SSE reconnect. Same args as the initial
+   * load; the merge (upsert-by-id + sort by created_at) absorbs any overlap
+   * with rows already in `messages` and preserves any optimistic-local rows
+   * the server hasn't seen yet.
+   *
+   * Errors are logged but not surfaced — the next reconnect retries.
+   */
+  private async refetchLatestPage(): Promise<void> {
+    if (!this.client) return;
+    try {
+      const result = await this.client.callTool({
+        name: "COLLECTION_THREAD_MESSAGES_LIST",
+        arguments: {
+          thread_id: this.threadId,
+          limit: this.pageSize,
+          offset: 0,
+          orderBy: [{ field: ["created_at"], direction: "desc" }],
+        },
+      });
+      if (this.abort.signal.aborted) return;
+      if ((result as { isError?: boolean }).isError) {
+        console.warn(
+          "[chat-store] refetchLatestPage:",
+          extractToolErrorMessage(result, "tool error"),
+        );
+        return;
+      }
+      const payload = ((result as { structuredContent?: unknown })
+        .structuredContent ?? result) as {
+        items?: UIMessage[];
+        hasMore?: boolean;
+      };
+      const items = payload.items ?? [];
+      this.messages.update((curr) => mergeAndSort(curr, items));
+      if (payload.hasMore !== undefined) {
+        this.hasMoreOlder.set(payload.hasMore);
+      }
+    } catch (err) {
+      console.warn("[chat-store] refetchLatestPage failed:", err);
+    }
+  }
+
+  /**
+   * Fetch the next older page of messages. Triggered by the top-of-list
+   * sentinel + IntersectionObserver in the chat UI.
+   *
+   * Uses `serverFetchedCount` as the offset cursor. With orderBy
+   * created_at desc and append-only thread messages (server inserts only
+   * at the head), offset pagination produces overlap on concurrent
+   * inserts but never gaps — overlap is absorbed by mergeAndSort's
+   * upsert-by-id.
+   *
+   * Guards: noop if no client, no more older pages, or another fetch is
+   * already in flight (the sentinel can re-trigger rapidly on small pages).
+   */
+  async fetchOlderMessages(): Promise<void> {
+    if (!this.client) return;
+    if (!this.hasMoreOlder.get()) return;
+    if (this.isFetchingOlder.get()) return;
+    this.isFetchingOlder.set(true);
+    try {
+      const result = await this.client.callTool({
+        name: "COLLECTION_THREAD_MESSAGES_LIST",
+        arguments: {
+          thread_id: this.threadId,
+          limit: this.pageSize,
+          offset: this.serverFetchedCount,
+          orderBy: [{ field: ["created_at"], direction: "desc" }],
+        },
+      });
+      if (this.abort.signal.aborted) return;
+      if ((result as { isError?: boolean }).isError) {
+        throw new Error(
+          extractToolErrorMessage(
+            result,
+            "COLLECTION_THREAD_MESSAGES_LIST failed",
+          ),
+        );
+      }
+      const payload = ((result as { structuredContent?: unknown })
+        .structuredContent ?? result) as {
+        items?: UIMessage[];
+        hasMore?: boolean;
+      };
+      const items = payload.items ?? [];
+      this.messages.update((curr) => mergeAndSort(curr, items));
+      this.serverFetchedCount += items.length;
+      this.hasMoreOlder.set(payload.hasMore ?? false);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[chat-store] fetchOlderMessages failed:", msg);
+      toast.error(`Could not load older messages: ${msg}`);
+    } finally {
+      this.isFetchingOlder.set(false);
+    }
+  }
+
+  // ── Internal: POST /messages ────────────────────────────────────────────
+
+  private async post(
+    message: UIMessage,
+    opts: RequestOptions,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const { system, ...rest } = opts;
+    // Attach the system prompt only on a user turn. Tool-output / approval
+    // continuations re-POST the assistant message; the server already has
+    // the system context for the run.
+    const systemMessage: UIMessage | null =
+      system && message.role === "user"
+        ? {
+            id: crypto.randomUUID(),
+            role: "system",
+            parts: [{ type: "text", text: system }],
+          }
+        : null;
+    const messages = systemMessage ? [systemMessage, message] : [message];
+    const body = { messages, ...rest };
+    const url = `/api/${encodeURIComponent(this.orgSlug)}/decopilot/threads/${encodeURIComponent(this.threadId)}/messages`;
+    // G1: combine the caller's stop() abort signal with a generous timeout so
+    // a stalled server never hangs the chat indefinitely. The POST is
+    // idempotency-keyed (workflowID), so a timeout-then-retry is safe.
+    const timeoutSignal = AbortSignal.timeout(POST_TIMEOUT_MS);
+    const combinedSignal = signal
+      ? AbortSignal.any([signal, timeoutSignal])
+      : timeoutSignal;
+    let resp: Response;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: combinedSignal,
+      });
+    } catch (err) {
+      // Surface timeout as a clear, user-actionable error message.
+      if (timeoutSignal.aborted && !signal?.aborted) {
+        throw new Error("request timed out — retry");
+      }
+      throw err;
+    }
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(text || `POST /messages failed (${resp.status})`);
+    }
+    if (this.runStatusStage.get() !== null) {
+      this.setRunStatusStage("received");
+    }
+  }
+
+  // ── Internal: SSE loop ──────────────────────────────────────────────────
+
+  /**
+   * Persistent stream loop with reconnect/backoff. Terminal on HTTP error,
+   * schema mismatch, or signal abort. Transient on TypeError / mid-byte
+   * truncation / clean reader done — backoff and retry.
+   */
+  private async runSseLoop(): Promise<void> {
+    const url = `/api/${encodeURIComponent(this.orgSlug)}/decopilot/threads/${encodeURIComponent(this.threadId)}/stream`;
+    let attempt = 0;
+    let firstConnect = true;
+
+    while (!this.abort.signal.aborted) {
+      if (!firstConnect) {
+        // Drop the in-flight fold before the upcoming refetch so duplicate
+        // deltas don't accumulate.
+        this.forceCloseSubStream(true);
+      }
+
+      let cleanExit = false;
+      try {
+        const resp = await fetch(url, {
+          method: "GET",
+          credentials: "include",
+          headers: { accept: "text/event-stream" },
+          signal: this.abort.signal,
+        });
+        if (resp.status === 204 || !resp.body) return;
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => "");
+          this.failTo(new Error(text || `GET /stream failed (${resp.status})`));
+          return;
+        }
+        attempt = 0;
+        if (!firstConnect) {
+          // On reconnect, refresh the latest page so any messages persisted
+          // while disconnected become visible. Merge is upsert-by-id + sort
+          // by created_at; optimistic local rows survive (their id isn't on
+          // the server yet).
+          await this.refetchLatestPage();
+        }
+        firstConnect = false;
+        cleanExit = await this.consumeStreamSse(resp.body);
+        if (!cleanExit && this.status.get().kind === "error") {
+          // Schema mismatch / parser failure routed through failTo — terminal.
+          return;
+        }
+      } catch (err) {
+        if (this.abort.signal.aborted) return;
+        // Transient — fall through to backoff.
+        void err;
+      }
+
+      if (this.abort.signal.aborted) return;
+      // G2: use @decocms/std exponential backoff with jitter (CLAUDE.md bans
+      // hand-rolled backoff). Clean exits use the fast-path const; error
+      // exits get jittered backoff so thundering-herd on server restarts is
+      // spread out.
+      const delay = cleanExit
+        ? CLEAN_RECONNECT_DELAY_MS
+        : exponentialBackoffWithJitter(
+            MAX_DELAY_MS,
+            BASE_DELAY_MS,
+            attempt,
+            2,
+            0.5,
+          );
+      attempt++;
+      if (delay > 0) {
+        // G2: use @decocms/std sleep (CLAUDE.md bans hand-rolled setTimeout
+        // promises). sleep() resolves (not rejects) on abort by default, which
+        // matches the previous "resolve on abort" semantics.
+        await sleep(delay, { signal: this.abort.signal }).catch(() => {});
+      }
+    }
+  }
+
+  /** Parse the body as SSE frames. Returns true on clean EOF, false if a
+   *  frame routed through `failTo()` (schema mismatch / parser error). */
+  private async consumeStreamSse(
+    body: ReadableStream<Uint8Array>,
+  ): Promise<boolean> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return true;
+      buffer += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        await this.handleStreamFrame(frame);
+        if (this.status.get().kind === "error") return false;
+      }
+    }
+  }
+
+  private async handleStreamFrame(frame: string): Promise<void> {
+    const lines = frame.split("\n");
+    let event = "message";
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+    }
+    if (dataLines.length === 0) return;
+    const data = dataLines.join("\n");
+
+    // The server no longer emits `event: snapshot` (initial state comes
+    // from COLLECTION_THREAD_MESSAGES_LIST). Any non-"message" SSE event
+    // received from a stale server is silently ignored.
+    if (event !== "message") return;
+
+    // Default: a UIMessageChunk JSON payload.
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data);
+    } catch (err) {
+      this.failTo(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+    await this.validateAndHandleChunk(payload);
+  }
+
+  private async validateAndHandleChunk(payload: unknown): Promise<void> {
+    // `uiMessageChunkSchema` is an AI SDK LazySchema — call it to get the
+    // underlying Schema and use its `validate` method. Behaviour matches the
+    // prior `parseJsonEventStream` path: schema mismatch routes through
+    // `failTo` (terminal); structural validation passes through to
+    // `handleChunk`.
+    try {
+      const schema = uiMessageChunkSchema();
+      const result = schema.validate
+        ? await schema.validate(payload)
+        : { success: true as const, value: payload as UIMessageChunk };
+      if (!result.success) {
+        this.failTo(
+          result.error instanceof Error
+            ? result.error
+            : new Error(String(result.error)),
+        );
+        return;
+      }
+      this.handleChunk(result.value as UIMessageChunk);
+    } catch (err) {
+      this.failTo(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  private drainChunkBuffer(): void {
+    const buffered = this.chunkBuffer ?? [];
+    this.chunkBuffer = null;
+    for (const chunk of buffered) this.handleChunk(chunk);
+  }
+
+  private setRunStatusStage(stage: RunStatusStage): void {
+    this.runStatusStage.update((current) =>
+      advanceRunStatusStage(current, stage),
+    );
+  }
+
+  private clearRunStatusStage(): void {
+    if (this.runStatusStage.get() !== null) {
+      this.runStatusStage.set(null);
+    }
+  }
+
+  private handleChunk(chunk: UIMessageChunk): void {
+    if (this.chunkBuffer !== null) {
+      this.chunkBuffer.push(chunk);
+      return;
+    }
+    const isRunStatusControl = isRunStatusControlChunk(chunk);
+    const runStatusStage = parseRunStatusStageChunk(chunk);
+    if (this.waitingForNewRun) {
+      if (isRunStatusControl) {
+        if (this.acceptPreStartRunStatus && runStatusStage) {
+          this.setRunStatusStage(runStatusStage);
+          this.observer?.onData?.(
+            chunk as Extract<UIMessageChunk, { type: `data-${string}` }>,
+          );
+        }
+        return;
+      }
+      if (chunk.type !== "start") return;
+      this.waitingForNewRun = false;
+      this.acceptPreStartRunStatus = true;
+    }
+    if (isRunStatusControl) {
+      if (runStatusStage) {
+        this.setRunStatusStage(runStatusStage);
+        this.observer?.onData?.(
+          chunk as Extract<UIMessageChunk, { type: `data-${string}` }>,
+        );
+      }
+      return;
+    }
+    if (
+      chunk.type !== "start" &&
+      chunk.type !== "finish" &&
+      !chunk.type.startsWith("data-") &&
+      chunk.type !== "start-step"
+    ) {
+      this.clearRunStatusStage();
+    }
+    if (chunk.type.startsWith("data-")) {
+      this.observer?.onData?.(
+        chunk as Extract<UIMessageChunk, { type: `data-${string}` }>,
+      );
+    }
+    if (chunk.type === "tool-input-available") {
+      const c = chunk as {
+        type: "tool-input-available";
+        toolCallId: string;
+        toolName: string;
+        input: unknown;
+      };
+      this.observer?.onToolCall?.({
+        toolCall: {
+          toolCallId: c.toolCallId,
+          toolName: c.toolName,
+          input: c.input,
+        },
+      });
+    }
+    if (chunk.type === "start") {
+      this.freshRunSubstream = true;
+    }
+    const sub = this.ensureSubStream();
+    sub.enqueue(chunk);
+    if (chunk.type === "finish") {
+      const f = chunk as { type: "finish"; finishReason?: string };
+      this.pendingFinishReason = f.finishReason;
+      this.clearRunStatusStage();
+      // Null subController BEFORE close() so a synchronous reconnect
+      // (which fires before the async fold loop resumes) can't mark a
+      // cleanly-completed run as discardable.
+      this.subController = null;
+      sub.close();
+    }
+  }
+
+  private forceCloseSubStream(discard = false): void {
+    const ctrl = this.subController;
+    if (!ctrl) return;
+    this.discardOnClose = discard;
+    this.subController = null;
+    try {
+      ctrl.close();
+    } catch {
+      // already closed
+    }
+  }
+
+  private ensureSubStream(): ReadableStreamDefaultController<UIMessageChunk> {
+    if (this.subController) return this.subController;
+    this.pendingFinishReason = undefined;
+    let controllerOut: ReadableStreamDefaultController<UIMessageChunk>;
+    const sub = new ReadableStream<UIMessageChunk>({
+      start(c) {
+        controllerOut = c;
+      },
+    });
+    // biome-ignore lint/style/noNonNullAssertion: set synchronously in start()
+    this.subController = controllerOut!;
+    void this.foldSubStream(sub);
+    // biome-ignore lint/style/noNonNullAssertion: set synchronously above
+    return controllerOut!;
+  }
+
+  /**
+   * Fold the sub-stream into the unified `messages` store. The in-progress
+   * assistant message lives as the last item in `messages` — chunks update
+   * it in place rather than living in a separate `streaming` slot.
+   *
+   * Seed: if `messages.at(-1)` is an assistant whose id matches the
+   * upcoming first chunk, the AI SDK's reader will resolve patches against
+   * its parts (tool outputs, approvals). Otherwise the reader emits a
+   * fresh assistant message and we append.
+   */
+  private async foldSubStream(
+    sub: ReadableStream<UIMessageChunk>,
+  ): Promise<void> {
+    const prev = this.messages.get();
+    const lastMsg = prev.at(-1);
+    // A tool-approval CONTINUATION run streams the approved/denied tool's
+    // output (+ the assistant's follow-up) under a FRESH harness message id,
+    // while the pending tool part still lives on the trailing assistant
+    // "proposal". Seed the reassembler with that proposal so the `tool-output`
+    // chunk reconciles (no "No tool invocation found" throw) and PIN the folded
+    // id back to the proposal id so the run merges onto the proposal instead of
+    // creating a duplicate — mirroring the projector's `continuationMessageId`.
+    // We clone the seed because `readUIMessageStream` mutates `message` in place.
+    const isApprovalContinuation =
+      this.freshRunSubstream &&
+      lastMsg?.role === "assistant" &&
+      (lastMsg.parts ?? []).some(
+        (p) =>
+          "state" in p &&
+          (p.state === "approval-requested" ||
+            p.state === "approval-responded"),
+      );
+    const seed = isApprovalContinuation
+      ? (structuredClone(lastMsg) as UIMessage)
+      : !this.freshRunSubstream &&
+          prev.length > 0 &&
+          lastMsg?.role === "assistant"
+        ? lastMsg
+        : undefined;
+    const pinnedMessageId = isApprovalContinuation ? lastMsg?.id : undefined;
+    this.freshRunSubstream = false;
+    const iter = readUIMessageStream({
+      message: seed,
+      stream: sub,
+      onError: (e) => {
+        const err = e instanceof Error ? e : new Error(String(e));
+        this.failTo(err);
+      },
+    });
+
+    // Coalesce store updates to at most one per animation frame. A long
+    // tool-args burst (e.g. claude-sonnet emitting hundreds of
+    // `tool-input-delta` chunks in a few seconds) used to call
+    // `messages.update` per chunk and trigger one React re-render each —
+    // the resulting forced-reflow storm froze the chat. `readUIMessageStream`
+    // yields cumulative messages, so dropping intermediate frames is safe:
+    // each commit always carries the latest state.
+    let last: UIMessage | null = null;
+    let pending: UIMessage | null = null;
+    let rafHandle: number | null = null;
+    const commit = () => {
+      rafHandle = null;
+      if (!pending) return;
+      // Pin a continuation's folded id back to the proposal id so it upserts
+      // onto the proposal row rather than appending a duplicate (the fresh
+      // harness `start.messageId` would otherwise become a second message).
+      const msg =
+        pinnedMessageId && pending.id !== pinnedMessageId
+          ? ({ ...pending, id: pinnedMessageId } as UIMessage)
+          : pending;
+      pending = null;
+      this.messages.update((curr) =>
+        mergeAndSort(dropRedundantStubs(upsertById(curr, msg)), []),
+      );
+    };
+    for await (const msg of iter) {
+      last = msg;
+      pending = msg;
+      if (rafHandle === null) {
+        rafHandle = scheduleFrame(commit);
+      }
+      if (this.status.get().kind !== "streaming") {
+        this.status.set({ kind: "streaming" });
+      }
+    }
+    if (rafHandle !== null) {
+      cancelFrame(rafHandle);
+      rafHandle = null;
+    }
+    if (pending) commit();
+
+    const finishReason = this.pendingFinishReason;
+    const discard = this.discardOnClose;
+    this.subController = null;
+    this.pendingFinishReason = undefined;
+    this.discardOnClose = false;
+
+    if (!discard) {
+      this.finishReason.set(finishReason ?? null);
+      this.status.set({ kind: "ready" });
+    }
+    if (last && !discard) {
+      // Anchor the finished assistant with a top-level `created_at`. A streamed
+      // message that never received one reads as +Infinity in `mergeAndSort`;
+      // on the NEXT submit the role tiebreak (user before assistant) then sorts
+      // the new user row ahead of this reply — the prior turn renders empty and
+      // its answer lands under the new turn. Prefer the run-start metadata
+      // timestamp when present, else stamp finish time. Mirrors the cancel-path
+      // anchor; a later persisted refetch (which carries the DB `created_at`)
+      // overwrites this via upsert. No-op once a top-level `created_at` exists.
+      // A pinned continuation commits under the proposal id, not `last.id`.
+      const anchorId = pinnedMessageId ?? last.id;
+      this.messages.update((msgs) => {
+        const i = msgs.findIndex((m) => m.id === anchorId);
+        if (i === -1) return msgs;
+        const row = msgs[i] as UIMessage & { created_at?: string };
+        if (row.created_at != null) return msgs;
+        const metaTs = (
+          row.metadata as { created_at?: string | number | Date } | undefined
+        )?.created_at;
+        const created_at =
+          metaTs != null
+            ? new Date(metaTs).toISOString()
+            : new Date().toISOString();
+        const next = [...msgs];
+        next[i] = { ...row, created_at } as UIMessage;
+        return next;
+      });
+      this.observer?.onFinish?.(last, this.messages.get(), finishReason);
+
+      // A turn auto-resumed after a backgrounded tool (image / subtask) delivers
+      // that tool's result as a SEPARATE assistant message, appended directly to
+      // the DB by the background workflow — it never rides this live stream. Pull
+      // the latest page now so the delivered result shows without a manual
+      // refresh. Runs after the reaction folded, so it can't clobber in-flight
+      // streaming; the merge is upsert-by-id.
+      const meta = last.metadata as
+        | { resumedFromBackground?: boolean }
+        | undefined;
+      if (meta?.resumedFromBackground) {
+        void this.refetchLatestPage();
+      }
+    }
+  }
+
+  // ── Internal: error helper ──────────────────────────────────────────────
+
+  private failTo(err: Error): void {
+    if (this.abort.signal.aborted) return;
+    this.clearRunStatusStage();
+    this.status.set({ kind: "error", error: err });
+    this.observer?.onError?.(err);
+  }
+}
+
+/**
+ * Keep the prior row's authoritative `created_at` when its replacement lacks
+ * one. A `deliverPolicy: "all"` replay on reconnect re-delivers an
+ * already-persisted run as timestamp-less streamed UIMessages; upserting one
+ * over its DB-seeded row would otherwise strip the `created_at`, so
+ * `readTimestamp` returns +Infinity and the message jumps to the end of the
+ * sort — it renders under the NEXT turn's user message and leaves its own slot
+ * empty ("No response was generated"). Only fills a missing timestamp; a
+ * genuine persisted update (incoming has `created_at`) overwrites as before.
+ */
+/**
+ * Carry each tool call part's persisted `created_at` forward across a merge.
+ * The durable (DB-loaded) copy of an in-flight message has a per-part
+ * `created_at` (stamped by `foldParts`); the streamed/replayed copy that
+ * upserts over it does not. Without this, a late-attaching or reconnecting
+ * client loses the fire time of a still-running call (e.g. the `bash` `sleep`
+ * countdown anchor) and restarts the timer. Matched by `toolCallId`; only fills
+ * a missing timestamp, so a genuine durable update still wins.
+ */
+function preservePartCreatedAt(
+  prev: UIMessage,
+  next: UIMessage,
+): UIMessage["parts"] {
+  const prevByToolCall = new Map<string, unknown>();
+  for (const p of prev.parts) {
+    if (
+      p &&
+      typeof p === "object" &&
+      "toolCallId" in p &&
+      "created_at" in p &&
+      typeof (p as { toolCallId?: unknown }).toolCallId === "string"
+    ) {
+      prevByToolCall.set(
+        (p as { toolCallId: string }).toolCallId,
+        (p as { created_at: unknown }).created_at,
+      );
+    }
+  }
+  if (prevByToolCall.size === 0) return next.parts;
+  return next.parts.map((p) => {
+    if (
+      p &&
+      typeof p === "object" &&
+      "toolCallId" in p &&
+      !("created_at" in p) &&
+      typeof (p as { toolCallId?: unknown }).toolCallId === "string"
+    ) {
+      const carried = prevByToolCall.get(
+        (p as { toolCallId: string }).toolCallId,
+      );
+      if (carried != null) return { ...p, created_at: carried };
+    }
+    return p;
+  });
+}
+
+function preserveCreatedAt(
+  prev: UIMessage | undefined,
+  next: UIMessage,
+): UIMessage {
+  if (!prev) return next;
+  const prevTs = (prev as { created_at?: unknown }).created_at;
+  const nextTs = (next as { created_at?: unknown }).created_at;
+  const parts = preservePartCreatedAt(prev, next);
+  let result = parts === next.parts ? next : ({ ...next, parts } as UIMessage);
+  if (nextTs == null && prevTs != null) {
+    result = { ...result, created_at: prevTs } as UIMessage;
+  }
+  return result;
+}
+
+export function upsertById(list: UIMessage[], msg: UIMessage): UIMessage[] {
+  const idx = list.findIndex((m) => m.id === msg.id);
+  if (idx === -1) return [...list, msg];
+  const next = [...list];
+  next[idx] = preserveCreatedAt(next[idx], msg);
+  return next;
+}
+
+const ASYNC_STUB_ID_PREFIX = "msg_async_stub_";
+
+/**
+ * Drop `msg_async_stub_<toolCallId>` rows when another assistant message
+ * already carries the matching `tool-web_search` part.
+ *
+ * The stub is inserted by the server at `markPolling` time (see
+ * `apps/mesh/src/storage/async-research-jobs.ts`) so a browser refresh
+ * during the long polling window has something to seed
+ * `readUIMessageStream` against — without it, the SDK throws
+ * "No tool invocation found" when the eventual `tool-output-available`
+ * chunk arrives.
+ *
+ * The collateral was that on a proxy-driven SSE reattach (customer's
+ * infra cuts every ~2 min), the client ends up with TWO assistant
+ * messages for the same turn: the persisted stub (refetched from the
+ * DB after the cut) and the in-memory AI-SDK message built from the
+ * first connection's chunks. The fold writes to the in-memory one,
+ * the stub stays frozen on its `input-available` state, and the UI
+ * shows what looks like a stuck loading skeleton next to the actual
+ * (correct) content. Refreshing the page hides this because
+ * `markCompleted` has already deleted the stub by then.
+ *
+ * Once the live assistant row carries the same `tool-web_search`
+ * part, the stub is redundant. Filtering it out at the
+ * write-to-`messages` boundary keeps it from ever rendering as a
+ * phantom turn.
+ */
+export function dropRedundantStubs(messages: UIMessage[]): UIMessage[] {
+  let hasStub = false;
+  for (const m of messages) {
+    if (m.id.startsWith(ASYNC_STUB_ID_PREFIX)) {
+      hasStub = true;
+      break;
+    }
+  }
+  if (!hasStub) return messages;
+
+  // Tool-call ids covered by NON-stub assistant messages. A stub whose
+  // suffix matches one of these is redundant.
+  const covered = new Set<string>();
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    if (m.id.startsWith(ASYNC_STUB_ID_PREFIX)) continue;
+    for (const p of m.parts) {
+      if (
+        p &&
+        typeof p === "object" &&
+        "type" in p &&
+        (p as { type: string }).type === "tool-web_search" &&
+        "toolCallId" in p
+      ) {
+        covered.add((p as { toolCallId: string }).toolCallId);
+      }
+    }
+  }
+  if (covered.size === 0) return messages;
+
+  return messages.filter((m) => {
+    if (!m.id.startsWith(ASYNC_STUB_ID_PREFIX)) return true;
+    // Match by the stub's own tool-web_search part id — robust to any id shape.
+    // (The id suffix is only a fallback for a malformed stub with no part.)
+    const toolCallId =
+      webSearchToolCallId(m) ?? m.id.slice(ASYNC_STUB_ID_PREFIX.length);
+    return !covered.has(toolCallId);
+  });
+}
+
+/** First `tool-web_search` part's `toolCallId` on a message, if any. */
+function webSearchToolCallId(m: UIMessage): string | undefined {
+  for (const p of m.parts) {
+    if (
+      p &&
+      typeof p === "object" &&
+      "type" in p &&
+      (p as { type: string }).type === "tool-web_search" &&
+      "toolCallId" in p &&
+      typeof (p as { toolCallId?: unknown }).toolCallId === "string"
+    ) {
+      return (p as { toolCallId: string }).toolCallId;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Merge `incoming` rows into `prev` (upsert by id), then sort the result
+ * ascending by `(created_at, id)`. The id tiebreaker mirrors
+ * `storage.threads.listMessages`'s `ORDER BY created_at, id` for stability
+ * across batched inserts.
+ *
+ * Messages without a `created_at` (an in-flight optimistic message before
+ * the server has persisted it) sort to the end (treated as +Infinity).
+ * They are the newest by construction; once the persisted row arrives,
+ * the upsert replaces them and the sort resettles.
+ */
+export function mergeAndSort(
+  prev: UIMessage[],
+  incoming: UIMessage[],
+): UIMessage[] {
+  const byId = new Map(prev.map((m) => [m.id, m] as const));
+  for (const m of incoming)
+    byId.set(m.id, preserveCreatedAt(byId.get(m.id), m));
+  const merged = [...byId.values()];
+  merged.sort((a, b) => {
+    const ta = readTimestamp(a);
+    const tb = readTimestamp(b);
+    if (ta !== tb) return ta - tb;
+    // Mirrors `listMessages` role tiebreak: user before assistant on equal
+    // timestamps (in-flight rows with no top-level `created_at` yet).
+    const roleRank = (m: UIMessage) =>
+      m.role === "user" ? 0 : m.role === "assistant" ? 1 : 2;
+    const ra = roleRank(a);
+    const rb = roleRank(b);
+    if (ra !== rb) return ra - rb;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  return dropRedundantStubs(merged);
+}
+
+/**
+ * Persisted messages from COLLECTION_THREAD_MESSAGES_LIST carry the DB row's
+ * `created_at` at the top level. AI-SDK UIMessages don't declare that field,
+ * so we read it via a defensive cast. Some assistant messages additionally
+ * stamp a `metadata.created_at` at run-start. Once the row is persisted the
+ * top-level `created_at` is authoritative — using metadata then would sort
+ * the assistant too early. In-flight assistants (no top-level yet) may fall
+ * back to metadata so a still-streaming turn-1 reply doesn't leap behind a
+ * newly-submitted turn-2 user row during live mergeAndSort.
+ */
+function readTimestamp(m: UIMessage): number {
+  const withTs = m as unknown as { created_at?: string | number | Date };
+  if (withTs.created_at != null) {
+    return new Date(withTs.created_at).getTime();
+  }
+  const meta = m.metadata as
+    | { created_at?: string | number | Date }
+    | undefined;
+  if (meta?.created_at != null) {
+    return new Date(meta.created_at).getTime();
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+// ─── Module-scoped slot ──────────────────────────────────────────────────────
+
+let current: ThreadConnection | null = null;
+
+/** Idempotent: same key → same instance. Different key → dispose + reopen. */
+export function getOrOpenStream(
+  orgSlug: string,
+  threadId: string,
+  opts: ThreadConnectionOptions = {},
+): ThreadConnection {
+  const key = `${orgSlug}::${threadId}`;
+  if (current?.key === key) return current;
+  current?.dispose();
+  current = new ThreadConnection(orgSlug, threadId, opts);
+  // DEBUG (temporary): expose the live store for inspecting in-memory order.
+  if (typeof window !== "undefined")
+    (window as unknown as { __conn?: ThreadConnection }).__conn = current;
+  return current;
+}
+
+/** Test-only: clear the active connection. Aborts in-flight fetch. */
+export function __resetRegistry(): void {
+  current?.dispose();
+  current = null;
+}

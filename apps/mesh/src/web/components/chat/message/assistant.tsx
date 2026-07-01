@@ -2,6 +2,7 @@ import { cn } from "@deco/ui/lib/utils.ts";
 import {
   Lightbulb01,
   MessageTextSquare01,
+  RefreshCw01,
   Stars01,
   Target04,
   Tool02,
@@ -15,30 +16,42 @@ import { MessageTextPart } from "./parts/text-part.tsx";
 import {
   GenericToolCallPart,
   GenerateImagePart,
+  TakeScreenshotPart,
   WebSearchPart,
   ProposePlanPart,
   SubtaskPart,
   SubtaskPartFallback,
   UserAskPart,
+  BrandContextPart,
+  BrandContextGetPart,
+  BrandContextListPart,
+  AgentCreatePart,
+  AgentListPart,
+  ConnectionListPart,
 } from "./parts/tool-call-part/index.ts";
+import { NextActionChip } from "./next-action-chip.tsx";
 import { SmartAutoScroll } from "./smart-auto-scroll.tsx";
-import { ThreadOutputs } from "./thread-outputs.tsx";
+import { ThreadHtmlPreviews } from "./thread-html-previews.tsx";
+import { MessageProducedFiles } from "./thread-outputs.tsx";
 import {
   type DataParts,
   type RenderItem,
   useFilterParts,
 } from "./use-filter-parts.ts";
+import { RUN_STATUS_COPY } from "../run-status.ts";
 import { addUsage, emptyUsageStats } from "@decocms/mesh-sdk";
 import { useOptionalChatStream, useOptionalChatTask } from "../context.tsx";
 import { LiveTimer } from "../../live-timer.tsx";
 import { GridLoader } from "../../grid-loader.tsx";
-import { formatDuration } from "../../../lib/format-time.ts";
+import { formatDuration, toEpochMs } from "../../../lib/format-time.ts";
+import { useClockTick } from "../../../lib/use-clock-tick.ts";
 
 type ThinkingStage = "planning" | "thinking";
 
 interface ThinkingStageConfig {
   icon: ReactNode;
   label: string;
+  detail: string;
 }
 
 const THINKING_STAGES: Record<ThinkingStage, ThinkingStageConfig> = {
@@ -50,6 +63,7 @@ const THINKING_STAGES: Record<ThinkingStage, ThinkingStageConfig> = {
       />
     ),
     label: "Planning next moves",
+    detail: "Deciding how to approach the request",
   },
   thinking: {
     icon: (
@@ -59,36 +73,84 @@ const THINKING_STAGES: Record<ThinkingStage, ThinkingStageConfig> = {
       />
     ),
     label: "Thinking",
+    detail: "Working through the next response",
   },
 };
 
 const PLANNING_DURATION = 1200;
 
-function TypingIndicator() {
-  const [stage, setStage] = useState<ThinkingStage>("planning");
+function ThoughtSummaryShell({
+  icon,
+  title,
+  summary,
+  detail,
+  state,
+  detailVariant = "prose",
+  latency,
+  trailing,
+}: {
+  icon: ReactNode;
+  title: ReactNode;
+  summary?: ReactNode;
+  detail?: string | null;
+  state: "loading" | "error" | "idle";
+  detailVariant?: "code" | "prose";
+  latency?: number;
+  trailing?: ReactNode;
+}) {
+  return (
+    <ToolCallShell
+      icon={icon}
+      title={title}
+      summary={summary}
+      detail={detail}
+      state={state}
+      detailVariant={detailVariant}
+      latency={latency}
+      trailing={trailing}
+    />
+  );
+}
+
+function RunStatusIndicator({ startedAt }: { startedAt: number | null }) {
+  const stage = useOptionalChatStream()?.runStatusStage ?? null;
+  const [fallbackStage, setFallbackStage] = useState<ThinkingStage>("planning");
 
   // oxlint-disable-next-line ban-use-effect/ban-use-effect
   useEffect(() => {
+    if (stage !== null) return;
     const planningTimer = setTimeout(() => {
-      setStage("thinking");
+      setFallbackStage("thinking");
     }, PLANNING_DURATION);
 
     return () => {
       clearTimeout(planningTimer);
     };
-  }, []);
+  }, [stage]);
 
-  const config = THINKING_STAGES[stage];
+  if (stage !== null) {
+    const copy = RUN_STATUS_COPY[stage];
+    return (
+      <ThoughtSummaryShell
+        icon={<Stars01 className="size-4" />}
+        title={`${copy.label}...`}
+        summary={copy.detail}
+        state="loading"
+        trailing={startedAt !== null && <LiveTimer since={startedAt} />}
+      />
+    );
+  }
+
+  const config = THINKING_STAGES[fallbackStage];
 
   return (
-    <div className="flex items-center gap-1.5 py-2 opacity-60">
-      <span className="flex items-center gap-1.5">
-        {config.icon}
-        <span className="text-[14px] text-muted-foreground shimmer">
-          {config.label}...
-        </span>
-      </span>
-    </div>
+    <ThoughtSummaryShell
+      icon={config.icon}
+      title={`${config.label}...`}
+      summary={config.detail}
+      state="loading"
+      trailing={startedAt !== null && <LiveTimer since={startedAt} />}
+    />
   );
 }
 
@@ -97,6 +159,44 @@ function GeneratingFooter({ startedAt }: { startedAt: number }) {
     <div className="flex items-center gap-2.5 mt-1 pb-1 text-muted-foreground/40 select-none">
       <GridLoader />
       <LiveTimer since={startedAt} />
+    </div>
+  );
+}
+
+// After this long with no streamed content, the turn looks frozen even though
+// the model may just be slow to first token (common with proxied/liteLLM
+// providers). Surface the elapsed time + a cancel escape hatch rather than a
+// silent "Thinking…".
+const SLOW_AFTER_MS = 20_000;
+
+/**
+ * Waiting state for a turn that has produced no parts yet. Pairs the
+ * `RunStatusIndicator` with a live elapsed clock and, once the wait crosses
+ * `SLOW_AFTER_MS`, a "taking longer than usual" hint + Cancel. `useClockTick`
+ * (singleton interval via useSyncExternalStore — no useEffect) re-renders this
+ * once per second so the threshold flips without a per-component timer.
+ */
+function ThinkingState({ startedAt }: { startedAt: number | null }) {
+  useClockTick(1000);
+  const stream = useOptionalChatStream();
+  const elapsedMs = startedAt !== null ? Date.now() - startedAt : 0;
+  const isSlow = elapsedMs >= SLOW_AFTER_MS;
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <RunStatusIndicator startedAt={startedAt} />
+      {isSlow && stream?.stop && (
+        <div className="flex items-center gap-2 pb-1 text-[13px] text-muted-foreground/60">
+          <span>This is taking longer than usual.</span>
+          <button
+            type="button"
+            onClick={() => stream.stop()}
+            className="text-muted-foreground hover:text-foreground underline underline-offset-2"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -146,7 +246,7 @@ function ThoughtSummary({
     !isStreaming && duration != null ? duration / 1000 : undefined;
 
   return (
-    <ToolCallShell
+    <ThoughtSummaryShell
       icon={
         isStreaming ? (
           <Stars01 className="size-4" />
@@ -215,7 +315,8 @@ function collapsedCounts(
         messages++;
       } else if (
         (type === "dynamic-tool" || type?.startsWith("tool-")) &&
-        type !== "tool-todo_write"
+        type !== "tool-todo_write" &&
+        type !== "tool-update_interests"
       ) {
         toolCalls++;
       }
@@ -308,6 +409,15 @@ function CollapsedSection({
 
 interface MessageAssistantProps {
   message: ChatMessage | null;
+  /**
+   * Top-level `created_at` of the user message that opened this turn. Used as
+   * the anchor for the live elapsed-time chronometer so the value is stable
+   * across page reload, thread switch, and SSE resume (the user row is
+   * inserted once and never re-stamped). Null when there's no preceding user
+   * message in the pair (assistant-initiated welcomes, async-research stubs),
+   * in which case the chronometer falls back to `Date.now()` at mount.
+   */
+  turnStartedAt?: string | Date | null;
   status?: "streaming" | "submitted" | "ready" | "error";
   className?: string;
   isLast: boolean;
@@ -414,11 +524,14 @@ function MessagePart({
           part={part}
           annotations={getMeta(part.toolCallId)?.annotations}
           latency={getMeta(part.toolCallId)?.latencySeconds}
+          outputBytes={getMeta(part.toolCallId)?.outputBytes}
           isLastMessage={isLastMessage}
           toolMeta={getMeta(part.toolCallId)?._meta}
         />
       );
     case "tool-todo_write":
+      return null;
+    case "tool-update_interests":
       return null;
     case "tool-user_ask":
       return (
@@ -436,7 +549,15 @@ function MessagePart({
           latency={getMeta(part.toolCallId)?.latencySeconds}
         />
       );
+    case "tool-take_screenshot":
+      return (
+        <TakeScreenshotPart
+          part={part}
+          latency={getMeta(part.toolCallId)?.latencySeconds}
+        />
+      );
     case "tool-web_search":
+    case "tool-deep_research":
       return (
         <WebSearchPart
           part={part}
@@ -465,6 +586,7 @@ function MessagePart({
           extraActions={usageStats}
           copyable
           alwaysShowActions={!!usageStats && !isLoading}
+          animate={isLoading && isLastMessage}
         />
       );
     case "reasoning":
@@ -481,6 +603,57 @@ function MessagePart({
       return null;
     default: {
       const fallback = part as ToolUIPart;
+      if (
+        fallback.type === "tool-brand_context_setup" ||
+        fallback.type === "tool-BRAND_CONTEXT_EXTRACT"
+      ) {
+        return (
+          <BrandContextPart
+            part={fallback}
+            latency={getMeta(fallback.toolCallId)?.latencySeconds}
+          />
+        );
+      }
+      if (fallback.type === "tool-BRAND_CONTEXT_GET") {
+        return (
+          <BrandContextGetPart
+            part={fallback}
+            latency={getMeta(fallback.toolCallId)?.latencySeconds}
+          />
+        );
+      }
+      if (fallback.type === "tool-BRAND_CONTEXT_LIST") {
+        return (
+          <BrandContextListPart
+            part={fallback}
+            latency={getMeta(fallback.toolCallId)?.latencySeconds}
+          />
+        );
+      }
+      if (fallback.type === "tool-COLLECTION_VIRTUAL_MCP_CREATE") {
+        return (
+          <AgentCreatePart
+            part={fallback}
+            latency={getMeta(fallback.toolCallId)?.latencySeconds}
+          />
+        );
+      }
+      if (fallback.type === "tool-COLLECTION_VIRTUAL_MCP_LIST") {
+        return (
+          <AgentListPart
+            part={fallback}
+            latency={getMeta(fallback.toolCallId)?.latencySeconds}
+          />
+        );
+      }
+      if (fallback.type === "tool-COLLECTION_CONNECTIONS_LIST") {
+        return (
+          <ConnectionListPart
+            part={fallback}
+            latency={getMeta(fallback.toolCallId)?.latencySeconds}
+          />
+        );
+      }
       if (fallback.type.startsWith("tool-")) {
         const toolCallId = (fallback as ToolUIPart).toolCallId;
         const meta = dataParts.toolMetadata.get(toolCallId);
@@ -489,6 +662,7 @@ function MessagePart({
             part={fallback}
             annotations={meta?.annotations}
             latency={meta?.latencySeconds}
+            outputBytes={meta?.outputBytes}
             isLastMessage={isLastMessage}
             toolMeta={meta?._meta}
           />
@@ -555,6 +729,7 @@ function Container({
 
 export function MessageAssistant({
   message,
+  turnStartedAt,
   status,
   className,
   isLast = false,
@@ -565,25 +740,35 @@ export function MessageAssistant({
   const isSubmitted = status === "submitted";
   const isLoading = isStreaming || isSubmitted;
 
-  // Track when this message's generation started for the live elapsed timer
-  const [startedAt, setStartedAt] = useState<number | null>(() =>
-    isLoading ? Date.now() : null,
-  );
+  // Track when this turn started for the live elapsed-time chronometer.
+  //
+  // Anchor on the user message's top-level `created_at` (passed in via
+  // `turnStartedAt` from MessagePair). This timestamp is set once when the
+  // user row is inserted on the server and never re-stamped, so it survives
+  // page reload, thread switch, and SSE resume cleanly — the chronometer
+  // resumes counting from the real turn-start instead of restarting on
+  // remount. It's also the most semantically meaningful anchor: the chron
+  // shows how long the user has been waiting since *they* submitted.
+  //
+  // Client fallback (`Date.now()`) covers two cases:
+  //   1. The brief optimistic-submit window where the user row exists locally
+  //      but the server hasn't yet inserted it (no top-level `created_at`).
+  //   2. Assistant-only pairs (welcomes, async-research stubs) where there's
+  //      no preceding user message at all.
+  const turnEpochMs = toEpochMs(turnStartedAt);
+  const [clientFallbackStartedAt, setClientFallbackStartedAt] = useState<
+    number | null
+  >(() => (isLoading ? Date.now() : null));
   const [prevIsLoading, setPrevIsLoading] = useState(isLoading);
   if (prevIsLoading !== isLoading) {
     setPrevIsLoading(isLoading);
-    if (isLoading) {
-      setStartedAt(Date.now());
-    } else {
-      setStartedAt(null);
-    }
+    setClientFallbackStartedAt(isLoading ? Date.now() : null);
   }
-
-  // Handle null message or empty parts
-  const hasContent = message !== null && message.parts.length > 0;
+  const startedAt = turnEpochMs ?? clientFallbackStartedAt;
 
   // Use hook to extract reasoning groups, build render order, and data parts
   const { reasoningGroups, renderOrder, dataParts } = useFilterParts(message);
+  const hasVisibleContent = message !== null && renderOrder.length > 0;
 
   // Reasoning is actively streaming only when the last part in the array
   // is a reasoning part (the model is currently inside a thinking block).
@@ -628,7 +813,7 @@ export function MessageAssistant({
     });
   const shouldCollapse =
     !isLoading &&
-    hasContent &&
+    hasVisibleContent &&
     isTerminallyDone &&
     (() => {
       let toolCallCount = 0;
@@ -649,8 +834,14 @@ export function MessageAssistant({
 
   return (
     <Container className={className}>
-      {hasContent ? (
+      {hasVisibleContent ? (
         <div className="flex flex-col gap-3 sm:gap-2">
+          {message!.metadata?.resumedFromBackground && (
+            <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground/60 select-none">
+              <RefreshCw01 className="size-3 shrink-0" />
+              <span>Resumed — background task completed</span>
+            </div>
+          )}
           {collapsed.length > 0 && (
             <CollapsedSection
               items={collapsed}
@@ -681,15 +872,21 @@ export function MessageAssistant({
               renderOrder,
             });
           })}
+          {taskId && (
+            <MessageProducedFiles threadId={taskId} message={message!} />
+          )}
           {isLast && isLoading && startedAt !== null && (
             <GeneratingFooter startedAt={startedAt} />
           )}
           {isLast && !isLoading && taskId && (
-            <ThreadOutputs threadId={taskId} />
+            <>
+              <ThreadHtmlPreviews />
+              {isTerminallyDone && <NextActionChip />}
+            </>
           )}
         </div>
       ) : isLoading ? (
-        <TypingIndicator />
+        <ThinkingState startedAt={startedAt} />
       ) : (
         <EmptyAssistantState isRunInProgress={isLast && isRunInProgress} />
       )}

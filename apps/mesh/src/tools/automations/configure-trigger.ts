@@ -6,7 +6,7 @@
  * so the external MCP can call back to Mesh when the trigger fires.
  */
 
-import type { MeshContext } from "@/core/mesh-context";
+import type { StudioContext } from "@/core/studio-context";
 import { clientFromConnection } from "@/mcp-clients";
 import { toServerClient } from "@/api/routes/proxy";
 import type { AutomationTrigger } from "@/storage/types";
@@ -14,7 +14,7 @@ import type { TriggerCallbackTokenStorage } from "@/storage/trigger-callback-tok
 import { TriggerBinding } from "@decocms/bindings/trigger";
 
 export async function configureTriggerOnMcp(
-  ctx: MeshContext,
+  ctx: StudioContext,
   trigger: AutomationTrigger,
   enabled: boolean,
   tokenStorage?: TriggerCallbackTokenStorage,
@@ -28,6 +28,7 @@ export async function configureTriggerOnMcp(
   if (!connection) return { success: true }; // Connection may have been deleted
 
   const organizationId = ctx.organization?.id;
+  const organizationSlug = ctx.organization?.slug;
 
   try {
     const mcpClient = await clientFromConnection(connection, ctx, true);
@@ -41,7 +42,11 @@ export async function configureTriggerOnMcp(
       const pair = await tokenStorage.generateTokenPair();
       callbackToken = pair.plaintext;
       tokenHash = pair.hash;
-      callbackUrl = `${ctx.baseUrl}/api/trigger-callback`;
+      // Prefer the org-scoped path; fall back to the legacy unscoped route
+      // only if the org slug is unavailable.
+      callbackUrl = organizationSlug
+        ? `${ctx.baseUrl}/api/${organizationSlug}/trigger-callback`
+        : `${ctx.baseUrl}/api/trigger-callback`;
     }
 
     const TIMEOUT_MS = 5000;
@@ -53,8 +58,9 @@ export async function configureTriggerOnMcp(
       }, TIMEOUT_MS),
     );
 
+    let mcpResult: unknown;
     try {
-      await Promise.race([
+      mcpResult = await Promise.race([
         client.TRIGGER_CONFIGURE({
           type: trigger.event_type!,
           params: JSON.parse(trigger.params ?? "{}"),
@@ -76,7 +82,29 @@ export async function configureTriggerOnMcp(
       }
       // On definitive (non-timeout) failure, skip persistence —
       // the MCP rejected the call, old token (if any) is still valid.
+      console.error(
+        `[configureTriggerOnMcp] TRIGGER_CONFIGURE threw on connection=${trigger.connection_id} type=${trigger.event_type}:`,
+        err,
+      );
       return { success: false, error: String(err) };
+    }
+
+    // The contract (TriggerConfigureOutputSchema) is `{ success: boolean }`.
+    // The proxy only throws on `isError: true`; anything else — `{ success:
+    // false }`, missing field, null, raw text — slipped through and the
+    // caller would save a trigger the MCP never actually accepted. Be
+    // strict: require an explicit `success === true`. Log the raw payload
+    // so we can see exactly what the MCP returned when this fires.
+    const payload = mcpResult as { success?: unknown } | null | undefined;
+    if (!payload || payload.success !== true) {
+      console.error(
+        `[configureTriggerOnMcp] TRIGGER_CONFIGURE did not return success=true on connection=${trigger.connection_id} type=${trigger.event_type}. Raw payload:`,
+        JSON.stringify(mcpResult),
+      );
+      return {
+        success: false,
+        error: `TRIGGER_CONFIGURE did not return success=true (got ${JSON.stringify(mcpResult)})`,
+      };
     }
 
     // MCP confirmed — persist token or clean up.

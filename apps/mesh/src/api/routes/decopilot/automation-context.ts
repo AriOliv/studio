@@ -1,7 +1,7 @@
 /**
  * Automation Context Factory
  *
- * Builds a MeshContext for background operations (automation recovery, cron,
+ * Builds a StudioContext for background operations (automation recovery, cron,
  * event triggers) without an HTTP request. Verifies the user still has an
  * active membership in the organization before constructing the context.
  */
@@ -11,28 +11,29 @@ import {
   ContextFactory,
   createBoundAuthClient,
   fetchRolePermissions,
+  rebindOrgScope,
 } from "@/core/context-factory";
-import type { MeshContext } from "@/core/mesh-context";
+import type { StudioContext } from "@/core/studio-context";
 import type { Database } from "@/storage/types";
-import { OrgScopedThreadStorage } from "@/storage/threads";
 import type { Kysely } from "kysely";
-import type { SqlThreadStorage } from "@/storage/threads";
-import type { MeshContextFactory } from "@/automations/fire";
+import type { StudioContextFactory } from "@/automations/fire";
 
 export interface BuildAutomationContextDeps {
   db: Kysely<Database>;
-  threadStorage: SqlThreadStorage;
 }
 
 /**
- * Creates a MeshContextFactory that verifies org membership and builds a full
- * MeshContext scoped to the given user/org pair. Returns null when the user is
+ * Creates a StudioContextFactory that verifies org membership and builds a full
+ * StudioContext scoped to the given user/org pair. Returns null when the user is
  * no longer a member of the organization.
  */
 export function createAutomationContextFactory(
   deps: BuildAutomationContextDeps,
-): MeshContextFactory {
-  return async (orgId: string, userId: string): Promise<MeshContext | null> => {
+): StudioContextFactory {
+  return async (
+    orgId: string,
+    userId: string,
+  ): Promise<StudioContext | null> => {
     // Verify org membership
     const membership = await deps.db
       .selectFrom("member")
@@ -82,7 +83,6 @@ export function createAutomationContextFactory(
       userId,
     });
     ctx.access = new AccessControl(
-      ctx.authInstance,
       userId,
       undefined, // toolName set later by defineTool
       ctx.boundAuth,
@@ -90,12 +90,11 @@ export function createAutomationContextFactory(
       "self",
     );
 
-    // Rebuild thread storage with the correct org so OrgScopedThreadStorage
-    // doesn't throw "thread operations require an authenticated organization".
-    ctx.storage.threads = new OrgScopedThreadStorage(
-      deps.threadStorage,
-      membership.orgId,
-    );
+    // The base context was built without `req`, so every org-scoped facet
+    // (thread storage, object storage, org-fs, asset hoisters) was created
+    // org-less. Rebind it all to the verified membership org — the SAME
+    // helper the path-scoped middleware uses, so the two paths can't drift.
+    rebindOrgScope(ctx, { id: membership.orgId, slug: membership.orgSlug });
 
     return ctx;
   };

@@ -4,7 +4,7 @@ import {
   requireAuth,
   requireOrganization,
   getUserId,
-} from "../../core/mesh-context";
+} from "../../core/studio-context";
 import { PROVIDER_IDS } from "../../ai-providers/provider-ids";
 import { getProviders } from "../../ai-providers/registry";
 import { mintGatewayJwt } from "../../auth/jwt";
@@ -45,7 +45,7 @@ export const AI_PROVIDER_TOPUP_URL = defineTool({
       );
     }
 
-    const meshJwt = await mintGatewayJwt(userId);
+    const meshJwt = await mintGatewayJwt(userId, ctx.auth.user?.email);
 
     const url = await adapter.getTopUpUrl(
       meshJwt,

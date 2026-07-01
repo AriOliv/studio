@@ -3,7 +3,14 @@ import { IntegrationIcon } from "@/web/components/integration-icon.tsx";
 import { cn } from "@deco/ui/lib/utils.ts";
 import { Button } from "@deco/ui/components/button.tsx";
 import type { ConnectionEntity } from "@decocms/mesh-sdk";
-import { Loading01, Plus, Settings02, Trash01 } from "@untitledui/icons";
+import {
+  Loading01,
+  Plus,
+  Power01,
+  Settings02,
+  SlashCircle01,
+  Trash01,
+} from "@untitledui/icons";
 import { Suspense } from "react";
 
 interface ConnectionInstancesPanelProps {
@@ -11,9 +18,12 @@ interface ConnectionInstancesPanelProps {
   onConfigure: (instance: ConnectionEntity) => void;
   onAuthenticate: (instance: ConnectionEntity) => void;
   onDelete: (instance: ConnectionEntity) => void;
+  onToggleStatus: (
+    instance: ConnectionEntity,
+    status: "active" | "inactive",
+  ) => void;
   onAdd: () => void;
   isAdding?: boolean;
-  canManage?: boolean;
 }
 
 function InstanceItem({
@@ -21,24 +31,28 @@ function InstanceItem({
   onConfigure,
   onAuthenticate,
   onDelete,
-  canManage,
+  onToggleStatus,
 }: {
   instance: ConnectionEntity;
   onConfigure: (instance: ConnectionEntity) => void;
   onAuthenticate: (instance: ConnectionEntity) => void;
   onDelete: (instance: ConnectionEntity) => void;
-  canManage: boolean;
+  onToggleStatus: (
+    instance: ConnectionEntity,
+    status: "active" | "inactive",
+  ) => void;
 }) {
   const authStatus = useMCPAuthStatus({ connectionId: instance.id });
   const isVirtual = instance.connection_type === "VIRTUAL";
   const needsAuth =
     !isVirtual && authStatus.supportsOAuth && !authStatus.isAuthenticated;
+  const isDisabled = instance.status !== "active";
 
   return (
     <div
       className={cn(
         "flex items-center gap-3 rounded-lg border px-4 py-2.5 transition-colors",
-        needsAuth
+        needsAuth || isDisabled
           ? "border-destructive/50 bg-destructive/5"
           : "border-transparent",
       )}
@@ -51,11 +65,15 @@ function InstanceItem({
       />
       <div className="flex-1 min-w-0">
         <p className="text-sm font-medium truncate">{instance.title}</p>
-        {needsAuth && (
+        {needsAuth ? (
           <span className="text-xs text-destructive font-medium">
             Needs authorization
           </span>
-        )}
+        ) : isDisabled ? (
+          <span className="text-xs text-destructive font-medium">
+            {instance.status === "error" ? "Disabled (error)" : "Disabled"}
+          </span>
+        ) : null}
       </div>
       <div className="flex items-center gap-1 shrink-0">
         {needsAuth && (
@@ -68,28 +86,45 @@ function InstanceItem({
             Authorize
           </Button>
         )}
-        {canManage && (
+        {isDisabled ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs gap-1.5"
+            onClick={() => onToggleStatus(instance, "active")}
+          >
+            <Power01 size={13} />
+            Enable
+          </Button>
+        ) : (
           <Button
             variant="ghost"
             size="icon"
-            className="h-7 w-7"
-            onClick={() => onConfigure(instance)}
-            title="Configure"
+            className="h-7 w-7 text-muted-foreground"
+            onClick={() => onToggleStatus(instance, "inactive")}
+            title="Disable"
           >
-            <Settings02 size={13} />
+            <SlashCircle01 size={13} />
           </Button>
         )}
-        {canManage && (
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7 text-muted-foreground hover:text-destructive"
-            onClick={() => onDelete(instance)}
-            title="Delete"
-          >
-            <Trash01 size={13} />
-          </Button>
-        )}
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+          onClick={() => onConfigure(instance)}
+          title="Configure"
+        >
+          <Settings02 size={13} />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 text-muted-foreground hover:text-destructive"
+          onClick={() => onDelete(instance)}
+          title="Delete"
+        >
+          <Trash01 size={13} />
+        </Button>
       </div>
     </div>
   );
@@ -98,11 +133,9 @@ function InstanceItem({
 function InstanceItemFallback({
   instance,
   onConfigure,
-  canManage,
 }: {
   instance: ConnectionEntity;
   onConfigure: (instance: ConnectionEntity) => void;
-  canManage: boolean;
 }) {
   return (
     <div className="flex items-center gap-3 rounded-lg border border-transparent px-4 py-2.5 transition-colors">
@@ -116,17 +149,15 @@ function InstanceItemFallback({
         <p className="text-sm font-medium truncate">{instance.title}</p>
       </div>
       <div className="flex items-center gap-1 shrink-0">
-        {canManage && (
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7"
-            onClick={() => onConfigure(instance)}
-            title="Configure"
-          >
-            <Settings02 size={13} />
-          </Button>
-        )}
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+          onClick={() => onConfigure(instance)}
+          title="Configure"
+        >
+          <Settings02 size={13} />
+        </Button>
       </div>
     </div>
   );
@@ -137,9 +168,9 @@ export function ConnectionInstancesPanel({
   onConfigure,
   onAuthenticate,
   onDelete,
+  onToggleStatus,
   onAdd,
   isAdding,
-  canManage = true,
 }: ConnectionInstancesPanelProps) {
   if (instances.length === 0) return null;
   return (
@@ -148,22 +179,20 @@ export function ConnectionInstancesPanel({
         <h3 className="text-sm font-semibold text-foreground">
           {instances.length === 1 ? "Instance" : "Instances"}
         </h3>
-        {canManage && (
-          <Button
-            variant="default"
-            size="sm"
-            className="h-7 gap-1.5 text-xs"
-            onClick={onAdd}
-            disabled={isAdding}
-          >
-            {isAdding ? (
-              <Loading01 size={13} className="animate-spin" />
-            ) : (
-              <Plus size={13} />
-            )}
-            Add instance
-          </Button>
-        )}
+        <Button
+          variant="default"
+          size="sm"
+          className="h-7 gap-1.5 text-xs"
+          onClick={onAdd}
+          disabled={isAdding}
+        >
+          {isAdding ? (
+            <Loading01 size={13} className="animate-spin" />
+          ) : (
+            <Plus size={13} />
+          )}
+          Add instance
+        </Button>
       </div>
       <div className="p-2 flex flex-col gap-1">
         {instances.map((instance) => (
@@ -173,7 +202,6 @@ export function ConnectionInstancesPanel({
               <InstanceItemFallback
                 instance={instance}
                 onConfigure={onConfigure}
-                canManage={canManage}
               />
             }
           >
@@ -182,7 +210,7 @@ export function ConnectionInstancesPanel({
               onConfigure={onConfigure}
               onAuthenticate={onAuthenticate}
               onDelete={onDelete}
-              canManage={canManage}
+              onToggleStatus={onToggleStatus}
             />
           </Suspense>
         ))}

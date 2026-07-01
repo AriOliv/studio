@@ -1,8 +1,11 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { claudeCodeHarnessFactory } from "./claude-code";
-import { codexHarnessFactory } from "./codex";
-import { decopilotHarnessFactory } from "./decopilot";
-import { getHarnessFactory, registerHarnessFactory } from "./registry";
+import { claudeCodeHarnessFactory } from "@decocms/harness/claude-code/index";
+import { codexHarnessFactory } from "@decocms/harness/codex/index";
+import {
+  getHarnessFactory,
+  registerHarnessFactory,
+} from "@decocms/harness/registry";
+import { decopilotHarnessFactory } from "@decocms/harness/decopilot/index";
 
 describe("harness registration", () => {
   // Re-register explicitly here so the test doesn't depend on test-file
@@ -25,5 +28,11 @@ describe("harness registration", () => {
 
   test("codex is registered", () => {
     expect(getHarnessFactory("codex")?.id).toBe("codex");
+  });
+
+  test("cluster harness registration does not register desktop Decopilot builder", async () => {
+    const source = await Bun.file("apps/mesh/src/harnesses/index.ts").text();
+    expect(source).not.toContain("registerDesktopEnvironmentBuilder");
+    expect(source).not.toContain("buildDesktopEnvironmentTools");
   });
 });

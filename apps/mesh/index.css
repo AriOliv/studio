@@ -1,16 +1,61 @@
 @import "@deco/ui/styles/global.css";
 @import "@daveyplate/better-auth-ui/css";
 
+@theme {
+  /* Global/reusable section indicator — purple hue 289 */
+  --color-global-section: oklch(0.7278 0.151 289);
+  --color-global-section-fg: oklch(0.45 0.15 289);
+  --color-global-section-fg-dark: oklch(0.78 0.15 289);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
   body {
     @apply bg-background text-foreground;
-    padding-top: env(titlebar-area-height, 0);
   }
   svg {
     stroke-width: 1.75;
+  }
+}
+
+/* Window Controls Overlay (installed PWA on Chromium):
+   The toolbar header is already the top element of the flex shell, so all
+   we need to do is (1) make its background act as the OS drag region,
+   (2) inset its content to clear the OS title-bar controls on the left
+   and right, (3) hide elements that duplicate the chrome (e.g. app logo),
+   and (4) opt buttons back to clickable.
+
+   Lives outside @layer base so it wins against Tailwind utilities like
+   h-12, pl-1, pr-2 that would otherwise cascade later. */
+@media (display-mode: window-controls-overlay) {
+  .app-titlebar {
+    padding-left: env(titlebar-area-x, 0);
+    padding-right: calc(
+      100vw -
+      env(titlebar-area-x, 0) -
+      env(titlebar-area-width, 100vw)
+    );
+    /* Match the OS title-bar strip height so close/min/max buttons line up
+       vertically with the header's icon buttons. Overrides Tailwind's h-12
+       (3rem) for the WCO case only. */
+    height: env(titlebar-area-height, 3rem);
+  }
+  .wco-drag {
+    -webkit-app-region: drag;
+    app-region: drag;
+  }
+  .wco-drag button,
+  .wco-drag a,
+  .wco-drag input,
+  .wco-drag [role="button"],
+  .wco-no-drag {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+  .wco-hide {
+    display: none !important;
   }
 }
 
@@ -143,6 +188,22 @@
     100% {
       opacity: 1;
       transform: translateY(0);
+    }
+  }
+
+  /* Per-word fade-in for streamed assistant text (see markdown.tsx AnimatedText).
+     Opacity-only so layout never shifts; runs once on mount. Tune the duration
+     to taste (lower = snappier). */
+  .stream-word {
+    animation: streamWordIn 0.5s ease-out both;
+  }
+
+  @keyframes streamWordIn {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
     }
   }
 }

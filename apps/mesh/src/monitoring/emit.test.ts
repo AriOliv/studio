@@ -1,17 +1,27 @@
-import { describe, it, expect, beforeEach, vi } from "bun:test";
-import { logs, type LogRecord } from "@opentelemetry/api-logs";
+import { describe, it, expect, beforeEach } from "bun:test";
+import type {
+  Logger,
+  LoggerProvider,
+  LogRecord,
+} from "@opentelemetry/api-logs";
 import { MONITORING_LOG_ATTR, MONITORING_LOG_TYPE_VALUE } from "./schema";
 import { emitMonitoringLog } from "./emit";
 import type { EmitMonitoringLogParams } from "./emit";
+import { setMonitoringLoggerProvider } from "./logger";
 
-// Intercept log records by spying on logs.getLogger()
+// Capture emitted records by wiring a fake monitoring LoggerProvider through
+// the real accessor (setMonitoringLoggerProvider) that initObservability uses.
 let emittedRecords: LogRecord[] = [];
 
-vi.spyOn(logs, "getLogger").mockReturnValue({
+const captureLogger: Logger = {
   emit(record: LogRecord) {
     emittedRecords.push(record);
   },
-});
+};
+
+setMonitoringLoggerProvider({
+  getLogger: () => captureLogger,
+} as unknown as LoggerProvider);
 
 function makeParams(
   overrides: Partial<EmitMonitoringLogParams> = {},
@@ -93,6 +103,25 @@ describe("emitMonitoringLog", () => {
     const input = attrs[MONITORING_LOG_ATTR.INPUT] as string;
     expect(input).not.toContain("user@example.com");
     expect(input).toContain("[REDACTED:email]");
+  });
+
+  it("should redact PII in nested values and object keys", () => {
+    emitMonitoringLog(
+      makeParams({
+        result: {
+          contact: { primary: "nested@example.com" },
+          "owner@example.com": "value",
+        },
+      }),
+    );
+
+    expect(emittedRecords.length).toBe(1);
+    const output = emittedRecords[0]!.attributes![
+      MONITORING_LOG_ATTR.OUTPUT
+    ] as string;
+    expect(output).not.toContain("nested@example.com");
+    expect(output).not.toContain("owner@example.com");
+    expect(output).toContain("[REDACTED:email]");
   });
 
   it("should redact PII in error message", () => {

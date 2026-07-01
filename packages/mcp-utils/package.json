@@ -1,8 +1,10 @@
 {
   "name": "@decocms/mcp-utils",
-  "version": "1.0.2",
+  "version": "1.0.10",
   "description": "Primitives for building MCP proxies, gateways, and sandboxes",
   "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
   "scripts": {
     "check": "tsc --noEmit",
     "test": "bun test"
@@ -11,6 +13,11 @@
     ".": "./src/index.ts",
     "./sandbox": "./src/sandbox/index.ts",
     "./aggregate": "./src/aggregate/index.ts"
+  },
+  "dependencies": {
+    "@decocms/std": "^0.1.0",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1"
   },
   "peerDependencies": {
     "@modelcontextprotocol/sdk": ">=1.27.0"

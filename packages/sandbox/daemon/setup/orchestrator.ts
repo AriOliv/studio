@@ -15,6 +15,8 @@ import type { Broadcaster } from "../events/broadcast";
 import type { DaemonStatus } from "../events/types";
 import type { BranchStatusMonitor } from "../git/branch-status";
 import { gitSync } from "../git/git-sync";
+import { spawnCheckoutBranch } from "../git/checkout-branch";
+import { syncOriginRemote } from "../git/sync-origin-remote";
 import type { InstallState } from "../install/install-state";
 import { InstallState as InstallStateClass } from "../install/install-state";
 import type { LifecycleManager } from "../lifecycle/manager";
@@ -78,6 +80,7 @@ export class SetupOrchestrator {
       if (summary.intentional) return;
       if (summary.exitCode === 0 || summary.exitCode === null) return;
       const reason = `dev script exited with code ${summary.exitCode}`;
+      this.chunk(`\r\n[orchestrator] ${reason}\r\n`);
       this.deps.setStatus({ state: "error", reason });
       // Lifecycle was at `starting` (post-spawn) or `running` (probe saw it
       // up briefly). Either way the dev script is gone now; surface a
@@ -94,15 +97,19 @@ export class SetupOrchestrator {
     });
   }
 
-  /** Config-store transition → step. Fire-and-forget. */
-  handle(transition: Transition): void {
-    const step = transitionToStep(transition);
-    if (!step) return;
+  /** Studio retry endpoint → resume from a named step. Fire-and-forget. */
+  resumeFrom(step: Step): void {
     this.enqueueStep(step);
   }
 
-  /** Studio retry endpoint → resume from a named step. Fire-and-forget. */
-  resumeFrom(step: Step): void {
+  /** Token rotation on an already-cloned repo — sync origin, no full clone. */
+  handle(transition: Transition): void {
+    if (transition.kind === "git-credential-refresh") {
+      this.syncGitRemoteCredentials(transition.cloneUrl);
+      return;
+    }
+    const step = transitionToStep(transition);
+    if (!step) return;
     this.enqueueStep(step);
   }
 
@@ -172,7 +179,9 @@ export class SetupOrchestrator {
         await this.stepStart();
         return;
       case "start":
-        await this.stopDevTask();
+        // stepStart owns the stop: it skips the kill entirely when an
+        // identical dev is already running, so a port-change can't SIGTERM a
+        // mid-boot dev only to respawn the same command.
         await this.stepStart();
         return;
     }
@@ -211,6 +220,10 @@ export class SetupOrchestrator {
     const config = this.currentConfig();
     if (!config) return false;
     const cloneUrl = config.git?.repository?.cloneUrl;
+
+    if (cloneUrl && hasGitRepo(config.repoDir)) {
+      this.syncGitRemoteCredentials(cloneUrl);
+    }
 
     if (cloneUrl && !hasGitRepo(config.repoDir)) {
       this.deps.lifecycle.transition({ phase: "cloning" });
@@ -300,6 +313,7 @@ export class SetupOrchestrator {
     const installTee = new LogTee(installLogPath, INSTALL_LOG_MAX_BYTES);
     const installPromise = spawnInstall({
       config,
+      env: config.env,
       onChunk: (_src, data) => {
         this.rawChunk(data);
         installTee.write(data);
@@ -360,11 +374,22 @@ export class SetupOrchestrator {
       });
       return;
     }
+
+    const running = this.deps.taskManager.runningCommandByLogName(
+      command.source,
+    );
+    if (running?.command === command.cmd && running?.cwd === command.cwd) {
+      this.chunk(
+        `[orchestrator] dev already running (${command.source}) — skipping restart\r\n`,
+      );
+      return;
+    }
+    await this.stopDevTask();
     this.deps.lifecycle.transition({ phase: "starting" });
     await this.deps.taskManager.spawn({
       command: command.cmd,
       cwd: command.cwd,
-      env: buildDevEnv(config),
+      env: buildDevEnv(config, config.env),
       label: command.label,
       mode: "pty",
       logName: command.source,
@@ -537,60 +562,29 @@ export class SetupOrchestrator {
     const repoDir = this.deps.bootConfig.repoDir;
     if (!repoDir) return;
     const onChunk = (_src: "setup", data: string) => this.rawChunk(data);
-    // http.connectTimeout: fail fast on DNS/TCP failures (seconds).
-    // lowSpeedLimit/Time: abort if transfer rate stays below 1 B/s for 10 s.
-    const gc = `git -c safe.directory='*' -c http.connectTimeout=10 -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 -C ${repoDir}`;
+    const gc = `GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git -c safe.directory='*' -c credential.helper= -c http.connectTimeout=10 -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 -C ${repoDir}`;
 
-    // Fresh-clone path already lands on the target branch (clone.ts uses
-    // --branch when ls-remote reports it exists). Short-circuit so gitSetup
-    // doesn't re-fetch what we just cloned.
+    await spawnCheckoutBranch({
+      repoDir,
+      branch,
+      gc,
+      runStep: (cmd) => spawnSetupStep(cmd, onChunk),
+      log: (message) => this.chunk(message),
+    });
+  }
+
+  private syncGitRemoteCredentials(cloneUrl: string): void {
+    const repoDir = this.deps.bootConfig.repoDir;
+    if (!repoDir || !hasGitRepo(repoDir)) return;
     try {
-      const head = gitSync(["rev-parse", "--abbrev-ref", "HEAD"], {
-        cwd: repoDir,
-      });
-      if (head === branch) return;
-    } catch {
-      // No HEAD yet / not a repo — fall through and let the checkout fail loudly.
-    }
-
-    // ls-remote --exit-code distinguishes "absent" from "broken":
-    //   0  → branch exists on origin
-    //   2  → origin reachable, no matching ref
-    //   *  → real failure (auth/DNS/TLS) — surface to caller
-    const probe = await spawnSetupStep(
-      `${gc} ls-remote --exit-code --heads origin ${branch}`,
-      onChunk,
-    );
-
-    if (probe === 0) {
-      const fetchCode = await spawnSetupStep(
-        `${gc} fetch --depth 1 origin +refs/heads/${branch}:refs/remotes/origin/${branch}`,
-        onChunk,
-      );
-      if (fetchCode !== 0)
-        throw new Error(`git fetch origin ${branch} exited ${fetchCode}`);
-      // `checkout -B` creates-or-resets, avoiding DWIM ambiguity on slash-named
-      // branches in shallow clones.
-      const checkoutCode = await spawnSetupStep(
-        `${gc} checkout -B ${branch} refs/remotes/origin/${branch}`,
-        onChunk,
-      );
-      if (checkoutCode !== 0)
-        throw new Error(`git checkout -B ${branch} exited ${checkoutCode}`);
-      return;
-    }
-
-    if (probe === 2) {
+      syncOriginRemote(repoDir, cloneUrl);
+      this.chunk("[orchestrator] synced origin credentials\r\n");
+    } catch (e) {
+      const msg = (e as Error).message;
       this.chunk(
-        `[orchestrator] branch '${branch}' not on remote; creating local branch from HEAD\r\n`,
+        `\r\n[orchestrator] failed to sync origin credentials: ${msg}\r\n`,
       );
-      const code = await spawnSetupStep(`${gc} checkout -B ${branch}`, onChunk);
-      if (code !== 0)
-        throw new Error(`git checkout -B ${branch} exited ${code}`);
-      return;
     }
-
-    throw new Error(`git ls-remote --heads origin ${branch} exited ${probe}`);
   }
 }
 
@@ -604,6 +598,8 @@ function transitionToStep(t: Transition): Step | null {
       return "install";
     case "port-change":
       return "start";
+    case "env-change":
+    case "git-credential-refresh":
     case "identity-conflict":
     case "no-op":
       return null;

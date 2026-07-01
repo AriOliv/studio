@@ -1,148 +1,39 @@
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  mock,
-  beforeAll,
-  afterAll,
-  beforeEach,
-} from "bun:test";
-import {
-  createTestDatabase,
-  closeTestDatabase,
-  type TestDatabase,
-} from "../database/test-db";
-import {
-  createTestSchema,
-  seedCommonTestFixtures,
-} from "../storage/test-helpers";
-import { CredentialVault } from "../encryption/credential-vault";
-import { DownstreamTokenStorage } from "../storage/downstream-token";
-import { ConnectionStorage } from "../storage/connection";
-import type { TokenRefreshResult } from "./refresh-access-token";
+import { describe, it, expect } from "bun:test";
+import { needsTokenEndpointReresolution } from "./token-refresh";
 
-const mockRefreshAccessToken =
-  vi.fn<(...args: unknown[]) => Promise<TokenRefreshResult>>();
-mock.module("./refresh-access-token", () => ({
-  refreshAccessToken: mockRefreshAccessToken,
-}));
-
-const { refreshAndStore } = await import("./token-refresh");
-
-describe("refreshAndStore", () => {
-  let database: TestDatabase;
-  let vault: CredentialVault;
-  let tokenStorage: DownstreamTokenStorage;
-  const connectionId = "conn_refresh_test";
-
-  beforeAll(async () => {
-    database = await createTestDatabase();
-    await createTestSchema(database.db);
-    await seedCommonTestFixtures(database.db);
-    vault = new CredentialVault(CredentialVault.generateKey());
-    tokenStorage = new DownstreamTokenStorage(database.db, vault);
-
-    const connectionStorage = new ConnectionStorage(database.db, vault);
-    await connectionStorage.create({
-      id: connectionId,
-      organization_id: "org_123",
-      created_by: "user_1",
-      title: "GitHub",
-      connection_type: "HTTP",
-      connection_url: "https://mcp.example.com/github",
-      connection_token: null,
-      tools: null,
-    });
+describe("needsTokenEndpointReresolution", () => {
+  it("re-resolves oauth-proxy URLs", () => {
+    expect(
+      needsTokenEndpointReresolution(
+        "https://studio.example.com/oauth-proxy/conn_x/token",
+        "https://sites-x.deco.site/mcp",
+      ),
+    ).toBe(true);
   });
 
-  afterAll(async () => {
-    await closeTestDatabase(database);
+  it("re-resolves when the stored host is stale (host mismatch)", () => {
+    // Captured against the `*.decocache.com` canonical host at authorize time;
+    // the connection lives on the working `*.deco.site` alias.
+    expect(
+      needsTokenEndpointReresolution(
+        "https://sites-x.decocache.com/token",
+        "https://sites-x.deco.site/mcp",
+      ),
+    ).toBe(true);
   });
 
-  beforeEach(async () => {
-    mockRefreshAccessToken.mockReset();
-    await tokenStorage.delete(connectionId, null);
-    await tokenStorage.upsert({
-      connectionId,
-      userId: null,
-      accessToken: "stale",
-      refreshToken: "rt",
-      scope: "repo",
-      expiresAt: new Date(Date.now() - 1000),
-      clientId: "cid",
-      clientSecret: null,
-      tokenEndpoint: "https://example.com/token",
-    });
+  it("does not re-resolve when the host matches", () => {
+    expect(
+      needsTokenEndpointReresolution(
+        "https://sites-x.deco.site/token",
+        "https://sites-x.deco.site/mcp",
+      ),
+    ).toBe(false);
   });
 
-  it("preserves the cached token on transient (5xx) failures", async () => {
-    mockRefreshAccessToken.mockResolvedValueOnce({
-      success: false,
-      permanent: false,
-      status: 500,
-      errorCode: "server_error",
-      error: "Failed to process token request",
-    });
-
-    const token = await tokenStorage.get(connectionId, null);
-    expect(token).not.toBeNull();
-    const result = await refreshAndStore(token!, tokenStorage);
-
-    expect(result).toBeNull();
-    const after = await tokenStorage.get(connectionId, null);
-    expect(after).not.toBeNull();
-    expect(after?.refreshToken).toBe("rt");
-  });
-
-  it("deletes the cached token on permanent (400 invalid_grant) failure", async () => {
-    mockRefreshAccessToken.mockResolvedValueOnce({
-      success: false,
-      permanent: true,
-      status: 400,
-      errorCode: "invalid_grant",
-      error: "refresh token revoked",
-    });
-
-    const token = await tokenStorage.get(connectionId, null);
-    expect(token).not.toBeNull();
-    const result = await refreshAndStore(token!, tokenStorage);
-
-    expect(result).toBeNull();
-    expect(await tokenStorage.get(connectionId, null)).toBeNull();
-  });
-
-  it("preserves the cached token when refresh result lacks the permanent flag (defensive: legacy callers)", async () => {
-    // Older code paths or unmocked-in-prod callers might forget to set
-    // `permanent`. Default behavior must be "preserve" so we don't
-    // regress to the old delete-on-anything bug.
-    mockRefreshAccessToken.mockResolvedValueOnce({
-      success: false,
-      error: "something broke",
-    });
-
-    const token = await tokenStorage.get(connectionId, null);
-    const result = await refreshAndStore(token!, tokenStorage);
-
-    expect(result).toBeNull();
-    expect(await tokenStorage.get(connectionId, null)).not.toBeNull();
-  });
-
-  it("stores the refreshed token on success", async () => {
-    mockRefreshAccessToken.mockResolvedValueOnce({
-      success: true,
-      accessToken: "fresh",
-      refreshToken: "rt2",
-      expiresIn: 3600,
-      scope: "repo",
-    });
-
-    const token = await tokenStorage.get(connectionId, null);
-    const result = await refreshAndStore(token!, tokenStorage);
-
-    expect(result).toBe("fresh");
-    const after = await tokenStorage.get(connectionId, null);
-    expect(after?.accessToken).toBe("fresh");
-    expect(after?.refreshToken).toBe("rt2");
+  it("does not re-resolve on unparseable input", () => {
+    expect(
+      needsTokenEndpointReresolution("not a url", "https://x.deco.site/mcp"),
+    ).toBe(false);
   });
 });

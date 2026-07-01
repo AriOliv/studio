@@ -1,37 +1,25 @@
 /**
  * DBOS workflow definitions for automation fires.
  *
- * Three-level queueing (tenant isolation → per-automation isolation → global
- * resource cap):
- * - `automations-org-<orgId>` — one queue per organization, lazily created
- *   on first fire via `ensureOrgQueue`. Per-org `concurrency` is mutable at
- *   runtime through `WorkflowQueue.setConcurrency`, so users/admins can
- *   self-tune the cap from a settings UI without redeploying. The
- *   `dbos.queues` row is the source of truth for the limit — mesh keeps
- *   no copy.
- * - `AUTOMATIONS_GATE_QUEUE` — partitioned by automationId,
- *   concurrency=`AUTOMATIONS_GATE_PARTITION_CONCURRENCY`. Caps per-automation
- *   concurrent fires.
- * - `AUTOMATIONS_GLOBAL_QUEUE` — flat queue,
- *   concurrency=`AUTOMATIONS_GLOBAL_CONCURRENCY`. Caps total in-flight fires
- *   across the whole cluster (protects the pg pool from exhaustion under
- *   burst load).
+ * Single cap — per-org tenant fairness:
+ * - One partitioned queue (`AUTOMATIONS_QUEUE`), partitioned by orgId. DBOS
+ *   enforces `concurrency` per partition, so the per-org cap is preserved —
+ *   one org saturating its slots only blocks its own partition, never
+ *   another org's — without paying for one queue (and one dequeue loop) per
+ *   org. See `AUTOMATIONS_QUEUE` below for the idle-polling rationale.
  *
- * Four workflows:
- * - `fireAutomationWorkflow` — runs on the global queue, split into recorded
- *   steps (prepare → createRunThread → updateTriggerTiming → dispatchRunAndWait).
- * - `gateWorkflow` — enqueued on the per-automation gate queue with
- *   partitionKey=automationId, awaits a fire on the global queue. Holding
- *   the partition slot until the child returns is what enforces the
- *   per-automation cap.
- * - `orgGateWorkflow` — top-level entry for both cron and event paths.
- *   Enqueued on the org gate queue with partitionKey=organizationId, awaits
- *   the per-automation gate. Holding the org slot until the chain returns is
- *   what enforces the per-org cap.
+ * `fireAutomationWorkflow` runs *directly* on the partitioned queue, so the
+ * queue's per-partition concurrency IS the cap — no dedicated gate workflow
+ * holds a slot just to enforce it.
+ *
+ * Two workflows:
+ * - `fireAutomationWorkflow` — runs on the partitioned queue, split into
+ *   recorded steps (prepare → createRunThread → updateTriggerTiming →
+ *   dispatchRunAndWait).
  * - `cronEntryWorkflow` — bound to `DBOS.createSchedule`. The Schedule API
- *   can't carry a partition key, so this wrapper re-enqueues `orgGateWorkflow`
- *   on the org gate with the partition key. Returns without awaiting so the
- *   scheduler tick is never blocked.
+ *   can't target a partition key directly, so this fire-and-forget shim
+ *   re-enqueues `fireAutomationWorkflow` on the org's partition and returns
+ *   without awaiting so the scheduler tick is never blocked.
  *
  * Exactly-once semantics:
  * Cron is intrinsically exactly-once: `DBOS.createSchedule` assigns each tick
@@ -48,11 +36,17 @@
  */
 
 import { DBOS, SchedulerMode } from "@dbos-inc/dbos-sdk";
+import type { Pool } from "pg";
 import {
-  awaitThreadRun,
+  runDispatchSteps,
   type SerializableDispatchRunInput,
 } from "@/dispatch-queue";
-import { resolveTier } from "@/core/resolve-tier";
+import {
+  resolveSpecificModel,
+  resolveTier,
+  tryResolveTier,
+} from "@/core/resolve-tier";
+import { isPermanentRunError } from "@/core/dispatch-errors";
 import type { AutomationsStorage } from "@/storage/automations";
 import type { Automation } from "@/storage/types";
 import type { SimpleModeTier } from "@/tools/organization/schema";
@@ -60,53 +54,77 @@ import {
   buildStreamRequest,
   type ResolvedAutomationModel,
 } from "./build-stream-request";
-import { computeNextRunAt, type MeshContextFactory } from "./fire";
-
-export const AUTOMATIONS_GATE_QUEUE = "automations-gate";
-export const AUTOMATIONS_GLOBAL_QUEUE = "automations-global";
+import { computeNextRunAt, type StudioContextFactory } from "./fire";
 
 /**
- * Per-org queueing uses one DB-backed queue per organization, named
- * `automations-org-<orgId>`. The `dbos.queues` row IS the per-org config:
- * `concurrency` is mutable at runtime via the `WorkflowQueue` setters,
- * and `discoverAndLaunchDbQueues` makes every replica honor changes
- * within one poll cycle. Mesh stores no copy of these limits — DBOS owns
- * them end-to-end.
+ * Automation fires run on ONE partitioned queue, partitioned by orgId.
  *
- * Lazy-created on the first enqueue (`ensureOrgQueue`) with default
- * concurrency.
+ * DBOS enforces `concurrency` PER PARTITION (its dequeue counts running
+ * workflows scoped to the partition key), so each org still gets its own
+ * fairness cap — a saturated org blocks only its own partition, never
+ * another's — exactly like the retired per-org-queue model. The win: one
+ * queue means one dequeue-polling loop per replica instead of one loop per
+ * org, and DBOS only polls partitions that currently have ENQUEUED work
+ * (`getQueuePartitions`), so idle queue-poll cost is flat regardless of how
+ * many orgs exist. The per-org model paid one dequeue/sec/org forever — even
+ * for orgs that fired once and never again — which scaled linearly with org
+ * count.
+ *
+ * Registered once at boot in `app.initDbos` (like the thread-gate queue),
+ * not lazily per fire.
  */
-const AUTOMATIONS_ORG_QUEUE_PREFIX = "automations-org-";
-/** Concurrency a new org's queue starts at. Updatable per-org afterwards. */
-const DEFAULT_ORG_CONCURRENCY = 3;
-/** Per-automation concurrent fire cap (partition cap on the gate queue). */
-export const AUTOMATIONS_GATE_PARTITION_CONCURRENCY = 3;
+export { AUTOMATIONS_QUEUE } from "../dispatch-queue/queue-names";
+import { AUTOMATIONS_QUEUE } from "../dispatch-queue/queue-names";
+/** Per-org (per-partition) concurrency cap. */
+export const AUTOMATIONS_PARTITION_CONCURRENCY = 10;
 /**
- * Global concurrent fire cap across the entire cluster. Set conservatively to
- * keep the pg pool from being exhausted by tool fan-out inside each fire's
- * dispatchRunAndWait call. Bump when `databasePoolMax` is bumped.
+ * Poll interval for the automations dequeue loop. DBOS dispatches queued
+ * workflows by polling the system DB (no notify path), and the loop only backs
+ * off on DB contention — never when idle — so the default 1s means a steady
+ * ~1 dequeue txn/sec/replica even with zero automations. Automation fires are
+ * event/cron-triggered background work, not interactive, so trading up to ~5s
+ * of dispatch latency for ~5× less idle DB polling is a good deal. The
+ * thread-gate queue is left at the 1s default because it gates live agent runs.
  */
-export const AUTOMATIONS_GLOBAL_CONCURRENCY = 5;
+export const AUTOMATIONS_POLL_INTERVAL_MS = 5_000;
+/** Prefix of the retired per-org queues — kept only for migration cleanup. */
+const AUTOMATIONS_ORG_QUEUE_PREFIX = "automations-org-";
 const AUTOMATIONS_RUN_TIMEOUT_MS = 5 * 60 * 1000;
-export function orgQueueName(orgId: string): string {
-  return `${AUTOMATIONS_ORG_QUEUE_PREFIX}${orgId}`;
-}
 
 /**
- * Idempotently create the org's queue with default concurrency. Safe to
- * call on every fire — `onConflict: "never_update"` means an existing
- * user-tuned `concurrency` value is never clobbered by this call.
+ * MIGRATION (remove once no `automations-org-*` rows remain): delete the
+ * retired per-org queue rows so DBOS stops launching a dequeue loop for each.
+ * Only deletes queues with NO non-terminal (ENQUEUED/PENDING) workflows, so
+ * fires enqueued before the cutover drain on their original queue first — a
+ * later boot removes the now-empty row. Same Postgres as the app DB
+ * (`systemDatabaseUrl` = app `databaseUrl`, schema `dbos`), so the app pool
+ * can reach `dbos.queues`. Idempotent and best-effort.
  */
-export async function ensureOrgQueue(orgId: string): Promise<void> {
-  await DBOS.registerQueue(orgQueueName(orgId), {
-    concurrency: DEFAULT_ORG_CONCURRENCY,
-    onConflict: "never_update",
-  });
+export async function cleanupOrphanedOrgQueues(pool: Pool): Promise<void> {
+  try {
+    const { rows } = await pool.query<{ name: string }>(
+      `SELECT q.name FROM dbos.queues q
+        WHERE q.name LIKE $1
+          AND NOT EXISTS (
+            SELECT 1 FROM dbos.workflow_status w
+             WHERE w.queue_name = q.name
+               AND w.status IN ('ENQUEUED', 'PENDING')
+          )`,
+      [`${AUTOMATIONS_ORG_QUEUE_PREFIX}%`],
+    );
+    if (rows.length === 0) return;
+    await Promise.allSettled(rows.map((r) => DBOS.deleteQueue(r.name)));
+    console.log(
+      `[automations] migration: removed ${rows.length} orphaned per-org queue(s)`,
+    );
+  } catch (err) {
+    console.error("[automations] per-org queue cleanup failed:", err);
+  }
 }
 
 export interface AutomationRuntime {
   storage: AutomationsStorage;
-  meshContextFactory: MeshContextFactory;
+  meshContextFactory: StudioContextFactory;
   runTimeoutMs?: number;
 }
 
@@ -125,11 +143,29 @@ function requireRuntime(): AutomationRuntime {
   return runtime;
 }
 
+/**
+ * A part of a trigger-context message handed to the agent. `text` parts are
+ * what the model reads (`convertToModelMessages` keeps them); `data-trigger-event`
+ * is a UI-only part the model never sees — it carries the structured event so
+ * the chat can render a dedicated card instead of raw JSON.
+ */
+export type ContextMessagePart =
+  | { type: "text"; text: string }
+  | {
+      type: "data-trigger-event";
+      data: { source: string; type: string; data: unknown };
+    };
+
+export interface ContextMessage {
+  role: "user" | "assistant" | "system";
+  parts: ContextMessagePart[];
+}
+
 export interface FireAutomationContext {
   automationId: string;
   organizationId: string;
   triggerId: string | null;
-  contextMessages?: Array<{ role: string; content: string }>;
+  contextMessages?: ContextMessage[];
 }
 
 export type FireAutomationOutcome =
@@ -180,29 +216,73 @@ async function prepareFireStep(
 
   const parsedModels = JSON.parse(automation.models) as {
     tier?: SimpleModeTier;
+    modelId?: string;
+    credentialId?: string;
   };
-  if (!parsedModels.tier) {
+  // Specific-model override: when the automation pins a concrete model +
+  // credential, resolve it directly (no org tier/default-pick). Otherwise fall
+  // back to the org tier preset.
+  const pinned =
+    parsedModels.modelId && parsedModels.credentialId
+      ? {
+          modelId: parsedModels.modelId,
+          credentialId: parsedModels.credentialId,
+        }
+      : null;
+  if (!pinned && !parsedModels.tier) {
     console.warn(
       `[fireAutomationWorkflow] automation ${automation.id} missing tier, defaulting to "smart"`,
     );
   }
   const tier: SimpleModeTier = parsedModels.tier ?? "smart";
-  const resolved = await resolveTier(meshCtx, tier);
+  // Match the chat POST /messages path: resolve the chat model strictly
+  // (failure aborts the run), and optimistically resolve `image` and
+  // `web_research` so the corresponding built-in tools (generate_image,
+  // web_search) light up the same way they do in interactive chat. Without
+  // these, the automation agent reports "I don't have a web_search tool"
+  // even when the org has Perplexity/Gemini Deep Research configured.
+  const [resolved, image, webSearch, deepResearch] = await Promise.all([
+    pinned
+      ? resolveSpecificModel(meshCtx, pinned.credentialId, pinned.modelId)
+      : resolveTier(meshCtx, tier),
+    tryResolveTier(meshCtx, "image"),
+    tryResolveTier(meshCtx, "web_search"),
+    tryResolveTier(meshCtx, "deep_research"),
+  ]);
+  const toModel = (r: Awaited<ReturnType<typeof resolveTier>>) => ({
+    id: r.modelId,
+    title: r.modelMeta.title,
+    provider: r.modelMeta.providerId ?? null,
+    capabilities: toThinkingCapabilities(r.modelMeta.capabilities),
+    limits: r.modelMeta.limits
+      ? {
+          contextWindow: r.modelMeta.limits.contextWindow,
+          maxOutputTokens: r.modelMeta.limits.maxOutputTokens ?? undefined,
+        }
+      : undefined,
+  });
   const resolvedModel: ResolvedAutomationModel = {
     credentialId: resolved.credentialId,
-    thinking: {
-      id: resolved.modelId,
-      title: resolved.modelMeta.title,
-      provider: resolved.modelMeta.providerId ?? null,
-      capabilities: toThinkingCapabilities(resolved.modelMeta.capabilities),
-      limits: resolved.modelMeta.limits
-        ? {
-            contextWindow: resolved.modelMeta.limits.contextWindow,
-            maxOutputTokens:
-              resolved.modelMeta.limits.maxOutputTokens ?? undefined,
-          }
-        : undefined,
-    },
+    thinking: toModel(resolved),
+    ...(image
+      ? { image: { ...toModel(image), credentialId: image.credentialId } }
+      : {}),
+    ...(webSearch
+      ? {
+          webSearch: {
+            ...toModel(webSearch),
+            credentialId: webSearch.credentialId,
+          },
+        }
+      : {}),
+    ...(deepResearch
+      ? {
+          deepResearch: {
+            ...toModel(deepResearch),
+            credentialId: deepResearch.credentialId,
+          },
+        }
+      : {}),
   };
 
   return { automation, resolvedModel };
@@ -246,13 +326,11 @@ type BuildDispatchRequestOutcome =
  *
  * Runs as a step so the request payload — including `crypto.randomUUID()`
  * message ids — is recorded in the workflow journal and replay returns the
- * same payload. `awaitThreadRun` is invoked from the workflow body (not
- * here) because DBOS forbids workflow-to-workflow calls from inside a
- * step.
+ * same payload. `runDispatchSteps` is invoked from the workflow body (not
+ * here) because its inner steps can't be nested inside another step.
  *
- * The membership check is intentionally repeated by the thread-gate
- * workflow on dispatch; doing it here as well lets us early-exit before
- * the thread-gate queue takes a slot.
+ * The membership check is intentionally repeated by the dispatch body; doing
+ * it here as well lets us early-exit before running the dispatch.
  */
 async function buildDispatchRequestStep(
   automation: Automation,
@@ -276,15 +354,22 @@ async function buildDispatchRequestStep(
     taskId,
     resolvedModel,
   );
-  if (ctx.contextMessages) {
-    request.messages = [
-      ...request.messages,
-      ...ctx.contextMessages.map((m) => ({
-        id: crypto.randomUUID(),
-        role: m.role as "user" | "assistant" | "system",
-        parts: [{ type: "text" as const, text: m.content }],
-      })),
-    ];
+  if (ctx.contextMessages && ctx.contextMessages.length > 0) {
+    // The dispatch path (`dispatch-run.ts`) persists and forwards only the
+    // FIRST non-system message plus all system messages — any extra non-system
+    // message is dropped. So the event parts must ride ON the request message,
+    // not be appended as a separate one (which would vanish). Prepended so the
+    // event card/context precedes the automation's own instruction.
+    const extraParts = ctx.contextMessages.flatMap((m) => m.parts);
+    const target = request.messages.find((m) => m.role !== "system");
+    if (target) {
+      target.parts = [...extraParts, ...target.parts] as typeof target.parts;
+    } else {
+      request.messages = [
+        ...request.messages,
+        { id: crypto.randomUUID(), role: "user", parts: extraParts },
+      ] as typeof request.messages;
+    }
   }
 
   // Strip the (non-serializable, locally-built) abort signal — the
@@ -297,6 +382,15 @@ async function markRunFailedStep(taskId: string): Promise<void> {
   const rt = requireRuntime();
   try {
     await rt.storage.markRunFailed(taskId);
+  } catch {
+    // best-effort
+  }
+}
+
+async function deactivateAutomationStep(automationId: string): Promise<void> {
+  const rt = requireRuntime();
+  try {
+    await rt.storage.deactivateAutomation(automationId);
   } catch {
     // best-effort
   }
@@ -328,9 +422,10 @@ async function fireAutomationWorkflowFn(
   //   1. `buildDispatchRequest` step — membership pre-check + assemble the
   //      serializable request. Recorded in the journal so replays reuse the
   //      same message ids.
-  //   2. `awaitThreadRun` from the workflow body — calls
-  //      `DBOS.startWorkflow(threadGateWorkflow, ...)`, which is illegal
-  //      from inside a step. Errors are caught here to preserve the
+  //   2. `runDispatchSteps` from the workflow body — runs the dispatch (and
+  //      its analytics steps) directly. We already hold this org's queue slot,
+  //      and each fire is a fresh thread, so there's no per-thread gate to
+  //      cross — no second queue hop. Errors are caught here to preserve the
   //      `FireAutomationOutcome` API (callers expect a resolved
   //      `{taskId, error}` outcome, not a thrown promise).
   const built = await DBOS.runStep(
@@ -352,7 +447,7 @@ async function fireAutomationWorkflowFn(
 
   const rt = requireRuntime();
   try {
-    await awaitThreadRun({
+    await runDispatchSteps({
       threadId: taskId,
       request: built.request,
       timeoutMs: rt.runTimeoutMs ?? AUTOMATIONS_RUN_TIMEOUT_MS,
@@ -360,6 +455,18 @@ async function fireAutomationWorkflowFn(
     });
   } catch (err) {
     const runError = err instanceof Error ? err.message : String(err);
+    if (isPermanentRunError(err)) {
+      console.warn(
+        `[fireAutomationWorkflow] deactivating "${prep.automation.name}" (${prep.automation.id}) — permanent dispatch error, will not fire again: ${runError}`,
+      );
+      await DBOS.runStep(() => deactivateAutomationStep(prep.automation.id), {
+        name: "deactivateAutomation",
+      });
+      await DBOS.runStep(() => markRunFailedStep(taskId), {
+        name: "markRunFailed",
+      });
+      return { taskId, error: runError };
+    }
     console.error(
       `[fireAutomationWorkflow] ERROR "${prep.automation.name}" taskId=${taskId}:`,
       runError,
@@ -373,73 +480,32 @@ async function fireAutomationWorkflowFn(
   return { taskId };
 }
 
-const fireAutomationWorkflow = DBOS.registerWorkflow(fireAutomationWorkflowFn, {
-  name: "fireAutomationWorkflow",
-});
-
-/**
- * Per-automation gate. Runs on the partitioned gate queue; holds its
- * partition slot until the inner fire on the global queue returns. That hold
- * is what enforces per-automation concurrency.
- *
- * Replays are safe: DBOS records the child workflow's ID via OAOO, so on
- * recovery `startWorkflow` returns the same handle and `getResult` waits on
- * the in-flight child rather than spawning a duplicate.
- */
-async function gateWorkflowFn(
-  ctx: FireAutomationContext,
-): Promise<FireAutomationOutcome> {
-  const handle = await DBOS.startWorkflow(fireAutomationWorkflow, {
-    queueName: AUTOMATIONS_GLOBAL_QUEUE,
-  })(ctx);
-  return await handle.getResult();
-}
-
-const gateWorkflow = DBOS.registerWorkflow(gateWorkflowFn, {
-  name: "automationGateWorkflow",
-});
-
-/**
- * Per-org gate. Top-level entry for both cron and event-triggered fires.
- * The workflow itself runs on the per-org queue `automations-org-<orgId>`
- * (set at enqueue time, not here); it holds that slot until the nested
- * per-automation gate returns. That hold is what enforces per-org
- * concurrency and prevents a single tenant from monopolising the global
- * queue's slot pool.
- *
- * Replays are safe: DBOS records the child workflow's ID via OAOO, so on
- * recovery `startWorkflow` returns the same handle and `getResult` waits on
- * the in-flight child rather than spawning a duplicate.
- */
-async function orgGateWorkflowFn(
-  ctx: FireAutomationContext,
-): Promise<FireAutomationOutcome> {
-  const handle = await DBOS.startWorkflow(gateWorkflow, {
-    queueName: AUTOMATIONS_GATE_QUEUE,
-    enqueueOptions: { queuePartitionKey: ctx.automationId },
-  })(ctx);
-  return await handle.getResult();
-}
-
-export const orgGateWorkflow = DBOS.registerWorkflow(orgGateWorkflowFn, {
-  name: "automationOrgGateWorkflow",
-});
+// ⚠️ Durable DBOS workflow. Changing its STEP SEQUENCE (add/remove/reorder a
+// step, or change a step's recorded I/O) requires bumping DBOS_WORKFLOW_VERSION
+// — see apps/mesh/src/dbos/workflow-version.ts.
+export const fireAutomationWorkflow = DBOS.registerWorkflow(
+  fireAutomationWorkflowFn,
+  { name: "fireAutomationWorkflow" },
+);
 
 /**
  * Scheduled-fire entry. Bound to DBOS schedules created per cron trigger.
- * Ensures the org queue exists, then re-enqueues `orgGateWorkflow` on it.
- * Returns without awaiting so the scheduler tick stays fast.
+ * Re-enqueues `fireAutomationWorkflow` on the org's partition of the shared
+ * automations queue. Returns without awaiting so the scheduler tick stays fast.
  */
 async function cronEntryWorkflowFn(
   _scheduledTime: Date,
   ctx: FireAutomationContext,
 ): Promise<void> {
-  await ensureOrgQueue(ctx.organizationId);
-  await DBOS.startWorkflow(orgGateWorkflow, {
-    queueName: orgQueueName(ctx.organizationId),
+  await DBOS.startWorkflow(fireAutomationWorkflow, {
+    queueName: AUTOMATIONS_QUEUE,
+    enqueueOptions: { queuePartitionKey: ctx.organizationId },
   })(ctx);
 }
 
+// ⚠️ Durable DBOS workflow. Changing its STEP SEQUENCE (add/remove/reorder a
+// step, or change a step's recorded I/O) requires bumping DBOS_WORKFLOW_VERSION
+// — see apps/mesh/src/dbos/workflow-version.ts.
 export const cronEntryWorkflow = DBOS.registerWorkflow(cronEntryWorkflowFn, {
   name: "cronEntryWorkflow",
 });
@@ -514,6 +580,9 @@ async function automationsGcWorkflowFn(
   });
 }
 
+// ⚠️ Durable DBOS workflow. Changing its STEP SEQUENCE (add/remove/reorder a
+// step, or change a step's recorded I/O) requires bumping DBOS_WORKFLOW_VERSION
+// — see apps/mesh/src/dbos/workflow-version.ts.
 const automationsGcWorkflow = DBOS.registerWorkflow(automationsGcWorkflowFn, {
   name: "automationsGcWorkflow",
 });

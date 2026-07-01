@@ -16,15 +16,31 @@ import type {
   VirtualMCPUpdateData,
 } from "../tools/virtual/schema";
 import type {
+  AsyncResearchJob,
+  AsyncResearchJobCitation,
   BrandContext,
-  InflightAsyncJob,
+  DomainJoinMode,
+  DomainVerificationMethod,
+  DomainVerificationStatus,
+  JoinRequestStatus,
   MonitoringLog,
   OrganizationDomain,
+  OrganizationJoinRequest,
+  OrgSite,
   OrganizationSettings,
   OrganizationTag,
   Thread,
   ThreadMessage,
 } from "./types";
+
+export type ThreadUpdateData = Partial<Thread> & {
+  /**
+   * Internal liveness heartbeat. Exposed only on updates so RUN_STARTED can
+   * clear progress from an older turn in the same write that marks the new run
+   * active.
+   */
+  last_progress_at?: string | null;
+};
 
 export interface ThreadStoragePort {
   create(data: Partial<Thread>): Promise<Thread>;
@@ -32,8 +48,17 @@ export interface ThreadStoragePort {
   update(
     id: string,
     organizationId: string,
-    data: Partial<Thread>,
+    data: ThreadUpdateData,
   ): Promise<Thread>;
+  /**
+   * Atomically transition an in-progress thread to completed.
+   * Returns the updated row when this call won the transition, or null when the
+   * run was already terminal or no longer active.
+   */
+  completeRunIfNotCompleted(
+    id: string,
+    organizationId: string,
+  ): Promise<Thread | null>;
   /**
    * Atomically transitions a thread to "failed" only when its current
    * persisted status is "in_progress". Safe to call concurrently — the
@@ -65,63 +90,37 @@ export interface ThreadStoragePort {
     triggerIds: string[],
     options?: { limit?: number; offset?: number },
   ): Promise<{ threads: Thread[]; total: number }>;
-  /** Atomically claim an orphaned run. Returns true if this pod won the CAS. */
-  claimOrphanedRun(
-    taskId: string,
-    organizationId: string,
-    podId: string,
-  ): Promise<boolean>;
-
-  /** List all in_progress threads not owned by the given pod (null or stale owner). */
-  listOrphanedRuns(currentPodId: string): Promise<Thread[]>;
-
-  /** List all in_progress threads owned by a specific (dead) pod. */
-  listOrphanedRunsByPod(deadPodId: string): Promise<Thread[]>;
+  /**
+   * Stamp `last_progress_at = now()` on a thread. Cheap single-column UPDATE
+   * used by the progress-liveness heartbeat (throttled by the caller). No-op
+   * if the row doesn't exist.
+   */
+  bumpProgress(taskId: string, organizationId: string): Promise<void>;
 
   /**
-   * Atomically claim a run start via CAS. Returns true if this pod won.
-   * Allows: new runs (not in_progress), orphans (null pod), or same-pod restarts.
+   * Read the progress-liveness columns for a thread. `lastProgressAt` is the
+   * epoch-ms of the most recent progress signal (null when the run just
+   * started and hasn't emitted a chunk yet); `runStartedAt` is the epoch-ms
+   * the current run claimed the thread (null when not running). The reaper
+   * uses these to decide whether a run is stuck (`isRunStuck`).
    */
-  claimRunStart(
+  getProgress(
     taskId: string,
     organizationId: string,
-    data: Partial<Thread>,
-    podId: string | null,
-  ): Promise<boolean>;
-
-  /** Release ownership for all runs owned by this pod (graceful shutdown). */
-  orphanRunsByPod(podId: string): Promise<string[]>;
-
-  /** Append an entry to threads.inflight_async_jobs. Atomic via jsonb concat. */
-  addInflightAsyncJob(
-    taskId: string,
-    organizationId: string,
-    entry: InflightAsyncJob,
-  ): Promise<void>;
+  ): Promise<{
+    lastProgressAt: number | null;
+    runStartedAt: number | null;
+  } | null>;
 
   /**
-   * Find an in-flight async job for this thread matching provider + modelId + query.
-   * Returns the most recently submitted match, or null.
+   * For each given virtual MCP id, return the timestamp and creator of the most recent thread.
+   * Used by the dedicated last-used endpoint; not on the agent fetch hot path.
    */
-  findInflightAsyncJob(
-    taskId: string,
+  findLastUsedByVirtualMcpIds(
     organizationId: string,
-    provider: string,
-    modelId: string,
-    query: string,
-  ): Promise<InflightAsyncJob | null>;
+    virtualMcpIds: string[],
+  ): Promise<Map<string, { last_used_at: string; last_used_by: string }>>;
 
-  /** Remove all entries matching provider + modelId + query from threads.inflight_async_jobs. */
-  removeInflightAsyncJob(
-    taskId: string,
-    organizationId: string,
-    provider: string,
-    modelId: string,
-    query: string,
-  ): Promise<void>;
-
-  // Message operations - upserts by id (updates existing rows)
-  saveMessages(data: ThreadMessage[], organizationId: string): Promise<void>;
   listMessages(
     taskId: string,
     organizationId: string,
@@ -134,11 +133,130 @@ export interface ThreadStoragePort {
 }
 
 // ============================================================================
+// Async Research Jobs Storage Port
+// ============================================================================
+
+/**
+ * Persistent store for async research jobs (Gemini Deep Research et al).
+ *
+ * Each `web_search` tool call that goes through a submit-then-poll provider
+ * gets one row here. The row is the source of truth for the job's lifecycle:
+ * the runtime reads it on resume, writes status transitions as the job
+ * progresses, and never deletes rows so the table doubles as an audit log.
+ *
+ * Idempotency on (organizationId, toolCallId) — DBOS replay of the tool
+ * step MUST find the existing row instead of submitting a duplicate
+ * provider job.
+ */
+export interface AsyncResearchJobStoragePort {
+  /**
+   * Insert a new row in status='pending'. Returns the existing row if one
+   * already exists for (organizationId, toolCallId) — that's the resume
+   * path on DBOS step replay or pod handoff.
+   */
+  upsertPending(input: {
+    organizationId: string;
+    threadId: string;
+    toolCallId: string;
+    messageId?: string | null;
+    provider: string;
+    modelId: string;
+    query: string;
+  }): Promise<AsyncResearchJob>;
+
+  findByToolCall(
+    organizationId: string,
+    toolCallId: string,
+  ): Promise<AsyncResearchJob | null>;
+
+  /**
+   * Transition pending → polling once the provider has accepted the job
+   * and returned an interaction id. The interaction id is the only key
+   * Studio operators have for cross-referencing logs with the upstream
+   * provider's console.
+   *
+   * Atomically writes a stub assistant message that carries the
+   * `tool-input-available` part into `thread_message_parts`. Without that
+   * stub, a browser refresh during the long polling window leaves
+   * `loadInitialPage` with no assistant message to seed the AI SDK reader,
+   * and the eventual `tool-output-available` chunk on reconnect throws
+   * "No tool invocation found for tool call ID …" (ai/dist/index.mjs:5398).
+   *
+   * The stub uses the deterministic id `msg_async_stub_<toolCallId>`
+   * and is deleted by `markCompleted` / `markFailed` / `markCancelled`
+   * in the same transaction as the status flip — so callers never
+   * observe a half-state of "polling row exists but no stub" or vice
+   * versa.
+   */
+  markPolling(
+    organizationId: string,
+    toolCallId: string,
+    interactionId: string,
+    stub: {
+      threadId: string;
+      toolName: string;
+      query: string;
+    },
+  ): Promise<void>;
+
+  /** Bump `attempts` and refresh `last_polled_at`. Cheap UPDATE per tick. */
+  recordPoll(
+    organizationId: string,
+    toolCallId: string,
+    lastError?: string | null,
+  ): Promise<void>;
+
+  markCompleted(
+    organizationId: string,
+    toolCallId: string,
+    result: {
+      inputTokens: number;
+      outputTokens: number;
+      citations: AsyncResearchJobCitation[];
+      /**
+       * Blob-storage URI when the report was offloaded for size, NULL
+       * for inline results. When set, `resultContent` is NULL and the
+       * full text is fetched from blob storage on read.
+       */
+      resultUri: string | null;
+      /** Short truncated snippet for SQL-side inspection. */
+      resultPreview: string;
+      /**
+       * Full report text for inline results; NULL when offloaded to
+       * blob. Used by replays of the same tool_call_id so a re-entry
+       * returns the original content rather than just the preview.
+       */
+      resultContent: string | null;
+    },
+  ): Promise<void>;
+
+  markFailed(
+    organizationId: string,
+    toolCallId: string,
+    error: string,
+  ): Promise<void>;
+
+  markCancelled(
+    organizationId: string,
+    toolCallId: string,
+    reason?: string,
+  ): Promise<void>;
+
+  /**
+   * Flip any row in pending/polling that hasn't been touched within
+   * `staleAfterMs` to status='abandoned'. Returns the number of rows
+   * affected so the caller can log when it actually does something.
+   */
+  sweepAbandoned(staleAfterMs: number): Promise<number>;
+}
+
+// ============================================================================
 // Connection Storage Port
 // ============================================================================
 
 export interface ConnectionStoragePort {
   create(data: Partial<ConnectionEntity>): Promise<ConnectionEntity>;
+  createNew(data: Partial<ConnectionEntity>): Promise<ConnectionEntity>;
   findById(id: string): Promise<ConnectionEntity | null>;
   list(
     organizationId: string,
@@ -342,13 +460,84 @@ export interface MonitoringStorage {
       p95: number;
     }>;
   }>;
+
+  /**
+   * Aggregate LLM-call usage (tokens + USD cost) for the AI Usage dashboard.
+   *
+   * Unlike queryMetricTimeseries (which reads pre-aggregated metric histograms),
+   * this reads the raw log rows — one row per LLM completion — so it can SUM the
+   * token/cost values stored in the `output` JSON and filter by `user_id`.
+   * Cost is only populated for providers that report it (deco ai-gateway /
+   * OpenRouter); it is 0 otherwise and for rows logged before cost capture shipped.
+   */
+  queryLlmUsageStats(params: {
+    organizationId: string;
+    interval: string;
+    connectionId: string;
+    startDate?: Date;
+    endDate?: Date;
+    userIds?: string[];
+    topN?: number;
+  }): Promise<{
+    totalCalls: number;
+    totalErrors: number;
+    avgDurationMs: number;
+    p50DurationMs: number;
+    p95DurationMs: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalTokens: number;
+    totalCostUsd: number;
+    topTools: Array<{
+      toolName: string;
+      connectionId: string | null;
+      calls: number;
+      inputTokens: number;
+      outputTokens: number;
+      costUsd: number;
+    }>;
+    timeseries: Array<{
+      timestamp: string;
+      calls: number;
+      errors: number;
+      errorRate: number;
+      avg: number;
+      p50: number;
+      p95: number;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      costUsd: number;
+    }>;
+  }>;
+
+  /**
+   * Per-thread LLM usage (tokens + USD cost), aggregated from llm_call logs
+   * grouped by `properties.thread_id`. Used to decorate the Threads monitoring
+   * tab. Filtered to the given thread IDs to keep the scan bounded.
+   */
+  queryThreadUsage(params: {
+    organizationId: string;
+    connectionId: string;
+    threadIds: string[];
+    startDate?: Date;
+    endDate?: Date;
+  }): Promise<
+    Array<{
+      threadId: string;
+      calls: number;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      costUsd: number;
+    }>
+  >;
 }
 
 // ============================================================================
 // Virtual MCP Storage Port
 // ============================================================================
 
-// Re-export types from schema for convenience
 export type {
   VirtualMCPEntity,
   VirtualMCPCreateData,
@@ -370,6 +559,7 @@ export interface VirtualMCPStoragePort {
     organizationId: string,
     options?: { pinnedOnly?: boolean },
   ): Promise<VirtualMCPEntity[]>;
+  listByIds(organizationId: string, ids: string[]): Promise<VirtualMCPEntity[]>;
   listByConnectionId(
     organizationId: string,
     connectionId: string,
@@ -463,21 +653,83 @@ export interface TagStoragePort {
 // Organization Domain Storage Port
 // ============================================================================
 
+export interface AddDomainInput {
+  joinMode?: DomainJoinMode;
+  verificationStatus?: DomainVerificationStatus;
+  verificationMethod?: DomainVerificationMethod | null;
+  verificationToken?: string | null;
+}
+
 export interface OrganizationDomainStoragePort {
-  getByDomain(domain: string): Promise<OrganizationDomain | null>;
-  getByOrganizationId(
-    organizationId: string,
-  ): Promise<OrganizationDomain | null>;
-  setDomain(
+  /** Every org claiming a domain (across orgs) — used by discovery/lookup. */
+  getAllByDomain(domain: string): Promise<OrganizationDomain[]>;
+  /** All domains an org has claimed. */
+  listByOrganizationId(organizationId: string): Promise<OrganizationDomain[]>;
+  getById(id: string): Promise<OrganizationDomain | null>;
+  getByOrgAndDomain(
     organizationId: string,
     domain: string,
-    autoJoinEnabled?: boolean,
-  ): Promise<OrganizationDomain>;
-  updateAutoJoin(
+  ): Promise<OrganizationDomain | null>;
+  add(
     organizationId: string,
-    autoJoinEnabled: boolean,
+    domain: string,
+    input?: AddDomainInput,
   ): Promise<OrganizationDomain>;
-  clearDomain(organizationId: string): Promise<void>;
+  updateJoinMode(
+    id: string,
+    joinMode: DomainJoinMode,
+  ): Promise<OrganizationDomain>;
+  markVerified(
+    id: string,
+    method: DomainVerificationMethod,
+  ): Promise<OrganizationDomain>;
+  removeById(id: string): Promise<void>;
+}
+
+export interface JoinRequestWithUser extends OrganizationJoinRequest {
+  user: {
+    id: string;
+    name: string;
+    email: string;
+    image: string | null;
+  } | null;
+}
+
+export interface OrganizationJoinRequestStoragePort {
+  /** Create a pending request, or return the existing pending one (idempotent). */
+  create(
+    organizationId: string,
+    userId: string,
+  ): Promise<OrganizationJoinRequest>;
+  getById(id: string): Promise<OrganizationJoinRequest | null>;
+  getPending(
+    organizationId: string,
+    userId: string,
+  ): Promise<OrganizationJoinRequest | null>;
+  /** Pending requests for an org, enriched with the requesting user's profile. */
+  listPendingWithUser(organizationId: string): Promise<JoinRequestWithUser[]>;
+  /** Atomic pending→decided transition; null if it was already decided. */
+  decide(
+    id: string,
+    status: Exclude<JoinRequestStatus, "pending">,
+    decidedBy: string,
+  ): Promise<OrganizationJoinRequest | null>;
+}
+
+export interface OrgSiteStoragePort {
+  /**
+   * Claim a globally-unique site slug for an organization. Idempotent for the
+   * same org; throws OrgSiteConflictError if a different org already owns it.
+   */
+  claimSite(params: {
+    slug: string;
+    organizationId: string;
+    source?: string;
+    by: string;
+  }): Promise<OrgSite>;
+  getBySlug(slug: string): Promise<OrgSite | null>;
+  /** Authorization primitive: does this org own this slug? */
+  isOwnedBy(slug: string, organizationId: string): Promise<boolean>;
 }
 
 export interface BrandContextStoragePort {

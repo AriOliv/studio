@@ -13,8 +13,11 @@
 import type { Kysely } from "kysely";
 import { generatePrefixedId } from "@/shared/utils/generate-id";
 import {
+  getWellKnownBrandContextSetupVirtualMCP,
   getWellKnownDecopilotVirtualMCP,
+  isBrandContextSetup,
   isDecopilot,
+  normalizeSandboxMap,
 } from "@decocms/mesh-sdk";
 import type {
   VirtualMCPCreateData,
@@ -64,59 +67,61 @@ export class VirtualMCPStorage implements VirtualMCPStoragePort {
     const id = options?.id ?? generatePrefixedId("vir");
     const now = new Date().toISOString();
 
-    // Insert as a VIRTUAL connection
-    await this.db
-      .insertInto("connections")
-      .values({
-        id,
-        organization_id: organizationId,
-        created_by: userId,
-        title: data.title,
-        description: data.description ?? null,
-        icon: data.icon ?? null,
-        app_name: null,
-        app_id: null,
-        connection_type: "VIRTUAL",
-        pinned: data.pinned ?? false,
-        connection_url: `virtual://${id}`,
-        connection_token: null,
-        connection_headers: null,
-        oauth_config: null,
-        auth_mode: "shared",
-        configuration_state: null,
-        configuration_scopes: null,
-        metadata: data.metadata ? JSON.stringify(data.metadata) : null,
-        bindings: null,
-        status: data.status ?? "active",
-        created_at: now,
-        updated_at: now,
-      })
-      .execute();
-
-    // Insert connection aggregations (all explicit connections are 'direct' dependencies)
-    if (data.connections.length > 0) {
-      await this.db
-        .insertInto("connection_aggregations")
-        .values(
-          data.connections.map((conn) => ({
-            id: generatePrefixedId("agg"),
-            parent_connection_id: id,
-            child_connection_id: conn.connection_id,
-            selected_tools: conn.selected_tools
-              ? JSON.stringify(conn.selected_tools)
-              : null,
-            selected_resources: conn.selected_resources
-              ? JSON.stringify(conn.selected_resources)
-              : null,
-            selected_prompts: conn.selected_prompts
-              ? JSON.stringify(conn.selected_prompts)
-              : null,
-            dependency_mode: "direct" as DependencyMode,
-            created_at: now,
-          })),
-        )
+    await this.db.transaction().execute(async (trx) => {
+      // Insert as a VIRTUAL connection
+      await trx
+        .insertInto("connections")
+        .values({
+          id,
+          organization_id: organizationId,
+          created_by: userId,
+          title: data.title,
+          description: data.description ?? null,
+          icon: data.icon ?? null,
+          app_name: null,
+          app_id: null,
+          connection_type: "VIRTUAL",
+          pinned: data.pinned ?? false,
+          connection_url: `virtual://${id}`,
+          connection_token: null,
+          connection_headers: null,
+          oauth_config: null,
+          auth_mode: "shared",
+          configuration_state: null,
+          configuration_scopes: null,
+          metadata: data.metadata ? JSON.stringify(data.metadata) : null,
+          bindings: null,
+          status: data.status ?? "active",
+          created_at: now,
+          updated_at: now,
+        })
         .execute();
-    }
+
+      // Insert connection aggregations (all explicit connections are 'direct' dependencies)
+      if (data.connections.length > 0) {
+        await trx
+          .insertInto("connection_aggregations")
+          .values(
+            data.connections.map((conn) => ({
+              id: generatePrefixedId("agg"),
+              parent_connection_id: id,
+              child_connection_id: conn.connection_id,
+              selected_tools: conn.selected_tools
+                ? JSON.stringify(conn.selected_tools)
+                : null,
+              selected_resources: conn.selected_resources
+                ? JSON.stringify(conn.selected_resources)
+                : null,
+              selected_prompts: conn.selected_prompts
+                ? JSON.stringify(conn.selected_prompts)
+                : null,
+              dependency_mode: "direct" as DependencyMode,
+              created_at: now,
+            })),
+          )
+          .execute();
+      }
+    });
 
     const virtualMcp = await this.findById(id);
     if (!virtualMcp) {
@@ -140,6 +145,19 @@ export class VirtualMCPStorage implements VirtualMCPStoragePort {
       const resolvedOrgId = organizationId ?? decopilotOrgId;
       return {
         ...getWellKnownDecopilotVirtualMCP(resolvedOrgId),
+        pinned: false,
+        connections: [],
+      };
+    }
+
+    // Well-known guided-onboarding agent for the brand-context preset.
+    // System prompt lives in `metadata.instructions`; the matching
+    // built-in tool is injected by dispatchRun based on this id.
+    const bcsOrgId = isBrandContextSetup(id);
+    if (bcsOrgId) {
+      const resolvedOrgId = organizationId ?? bcsOrgId;
+      return {
+        ...getWellKnownBrandContextSetupVirtualMCP(resolvedOrgId),
         pinned: false,
         connections: [],
       };
@@ -209,6 +227,46 @@ export class VirtualMCPStorage implements VirtualMCPStoragePort {
       .execute();
 
     // Group aggregations by parent_connection_id
+    const aggregationsByParent = new Map<string, RawAggregationRow[]>();
+    for (const agg of aggregationRows as RawAggregationRow[]) {
+      const existing = aggregationsByParent.get(agg.parent_connection_id) ?? [];
+      existing.push(agg);
+      aggregationsByParent.set(agg.parent_connection_id, existing);
+    }
+
+    return rows.map((row) =>
+      this.deserializeVirtualMCPEntity(
+        row as unknown as RawConnectionRow,
+        aggregationsByParent.get(row.id) ?? [],
+      ),
+    );
+  }
+
+  async listByIds(
+    organizationId: string,
+    ids: string[],
+  ): Promise<VirtualMCPEntity[]> {
+    if (ids.length === 0) return [];
+
+    const rows = await this.db
+      .selectFrom("connections")
+      .selectAll()
+      .where("id", "in", ids)
+      .where("organization_id", "=", organizationId)
+      .where("connection_type", "=", "VIRTUAL")
+      .execute();
+
+    if (rows.length === 0) return [];
+
+    const virtualMcpIds = rows.map((r) => r.id);
+
+    const aggregationRows = await this.db
+      .selectFrom("connection_aggregations")
+      .selectAll()
+      .where("parent_connection_id", "in", virtualMcpIds)
+      .where("dependency_mode", "=", "direct")
+      .execute();
+
     const aggregationsByParent = new Map<string, RawAggregationRow[]>();
     for (const agg of aggregationRows as RawAggregationRow[]) {
       const existing = aggregationsByParent.get(agg.parent_connection_id) ?? [];
@@ -314,65 +372,75 @@ export class VirtualMCPStorage implements VirtualMCPStoragePort {
         : null;
     }
 
-    // Update the connection
-    await this.db
-      .updateTable("connections")
-      .set(updateData)
-      .where("id", "=", id)
-      .where("connection_type", "=", "VIRTUAL")
-      .execute();
+    const removedConnectionIds: string[] = [];
 
-    // Update aggregations if provided
-    if (data.connections !== undefined) {
-      // Collect current direct connection IDs before removing them
-      const currentAggs = await this.db
-        .selectFrom("connection_aggregations")
-        .select("child_connection_id")
-        .where("parent_connection_id", "=", id)
-        .where("dependency_mode", "=", "direct")
-        .execute();
-      const previousIds = new Set(
-        currentAggs.map((a) => a.child_connection_id),
-      );
-
-      // Only delete 'direct' dependencies - preserve 'indirect' ones from virtual tools
-      await this.db
-        .deleteFrom("connection_aggregations")
-        .where("parent_connection_id", "=", id)
-        .where("dependency_mode", "=", "direct")
+    await this.db.transaction().execute(async (trx) => {
+      // Update the connection
+      await trx
+        .updateTable("connections")
+        .set(updateData)
+        .where("id", "=", id)
+        .where("connection_type", "=", "VIRTUAL")
         .execute();
 
-      if (data.connections.length > 0) {
-        await this.db
-          .insertInto("connection_aggregations")
-          .values(
-            data.connections.map((conn) => ({
-              id: generatePrefixedId("agg"),
-              parent_connection_id: id,
-              child_connection_id: conn.connection_id,
-              selected_tools: conn.selected_tools
-                ? JSON.stringify(conn.selected_tools)
-                : null,
-              selected_resources: conn.selected_resources
-                ? JSON.stringify(conn.selected_resources)
-                : null,
-              selected_prompts: conn.selected_prompts
-                ? JSON.stringify(conn.selected_prompts)
-                : null,
-              dependency_mode: "direct" as DependencyMode,
-              created_at: now,
-            })),
-          )
+      // Update aggregations if provided
+      if (data.connections !== undefined) {
+        // Collect current direct connection IDs before removing them
+        const currentAggs = await trx
+          .selectFrom("connection_aggregations")
+          .select("child_connection_id")
+          .where("parent_connection_id", "=", id)
+          .where("dependency_mode", "=", "direct")
           .execute();
-      }
+        const previousIds = new Set(
+          currentAggs.map((a) => a.child_connection_id),
+        );
 
-      // Clean up pinned views for removed connections
-      const newIds = new Set(data.connections.map((c) => c.connection_id));
-      for (const prevId of previousIds) {
-        if (!newIds.has(prevId)) {
-          await this.cleanOrphanedPinnedViews([id], prevId);
+        // Only delete 'direct' dependencies - preserve 'indirect' ones from virtual tools
+        await trx
+          .deleteFrom("connection_aggregations")
+          .where("parent_connection_id", "=", id)
+          .where("dependency_mode", "=", "direct")
+          .execute();
+
+        if (data.connections.length > 0) {
+          await trx
+            .insertInto("connection_aggregations")
+            .values(
+              data.connections.map((conn) => ({
+                id: generatePrefixedId("agg"),
+                parent_connection_id: id,
+                child_connection_id: conn.connection_id,
+                selected_tools: conn.selected_tools
+                  ? JSON.stringify(conn.selected_tools)
+                  : null,
+                selected_resources: conn.selected_resources
+                  ? JSON.stringify(conn.selected_resources)
+                  : null,
+                selected_prompts: conn.selected_prompts
+                  ? JSON.stringify(conn.selected_prompts)
+                  : null,
+                dependency_mode: "direct" as DependencyMode,
+                created_at: now,
+              })),
+            )
+            .execute();
+        }
+
+        // Clean up pinned views for removed connections after the transaction
+        // commits. If the new aggregation insert fails, the old dependencies
+        // remain intact and there is nothing to clean up.
+        const newIds = new Set(data.connections.map((c) => c.connection_id));
+        for (const prevId of previousIds) {
+          if (!newIds.has(prevId)) {
+            removedConnectionIds.push(prevId);
+          }
         }
       }
+    });
+
+    for (const prevId of removedConnectionIds) {
+      await this.cleanOrphanedPinnedViews([id], prevId);
     }
 
     const virtualMcp = await this.findById(id);
@@ -384,18 +452,27 @@ export class VirtualMCPStorage implements VirtualMCPStoragePort {
   }
 
   async delete(id: string): Promise<void> {
-    // First delete aggregations (no cascade since it's a different relationship)
-    await this.db
-      .deleteFrom("connection_aggregations")
-      .where("parent_connection_id", "=", id)
-      .execute();
+    await this.db.transaction().execute(async (trx) => {
+      // Delete threads initiated with this agent. virtual_mcp_id has no DB FK,
+      // so there's no automatic cascade; thread_messages cascade via threads.id.
+      await trx
+        .deleteFrom("threads")
+        .where("virtual_mcp_id", "=", id)
+        .execute();
 
-    // Then delete the connection
-    await this.db
-      .deleteFrom("connections")
-      .where("id", "=", id)
-      .where("connection_type", "=", "VIRTUAL")
-      .execute();
+      // Delete aggregations (no cascade since it's a different relationship)
+      await trx
+        .deleteFrom("connection_aggregations")
+        .where("parent_connection_id", "=", id)
+        .execute();
+
+      // Then delete the connection
+      await trx
+        .deleteFrom("connections")
+        .where("id", "=", id)
+        .where("connection_type", "=", "VIRTUAL")
+        .execute();
+    });
   }
 
   async removeConnectionReferences(connectionId: string): Promise<void> {
@@ -493,7 +570,19 @@ export class VirtualMCPStorage implements VirtualMCPStoragePort {
     const status: "active" | "inactive" =
       row.status === "active" ? "active" : "inactive";
 
-    const metadata = this.parseJson<{ instructions?: string }>(row.metadata);
+    const rawMetadata = this.parseJson<{
+      instructions?: string;
+      sandboxMap?: unknown;
+    }>(row.metadata);
+
+    // Migration 091 rewrote every row to the canonical `sandboxMap` key with
+    // the strict 3-level shape; we still run it through `normalizeSandboxMap`
+    // to defend against per-row corruption without crashing the read path.
+    const { sandboxMap: rawSandboxMap, ...metadataRest } = rawMetadata ?? {};
+    const normalizedSandboxMap =
+      rawSandboxMap !== undefined
+        ? normalizeSandboxMap(rawSandboxMap)
+        : undefined;
 
     return {
       id: row.id,
@@ -508,8 +597,11 @@ export class VirtualMCPStorage implements VirtualMCPStoragePort {
       created_by: row.created_by,
       updated_by: row.updated_by ?? undefined,
       metadata: {
-        ...metadata,
-        instructions: metadata?.instructions ?? null,
+        ...metadataRest,
+        instructions: rawMetadata?.instructions ?? null,
+        ...(normalizedSandboxMap !== undefined
+          ? { sandboxMap: normalizedSandboxMap }
+          : {}),
       },
       connections: aggregationRows.map((agg) => ({
         connection_id: agg.child_connection_id,
@@ -534,4 +626,49 @@ export class VirtualMCPStorage implements VirtualMCPStoragePort {
     }
     return value as T;
   }
+}
+
+/**
+ * Wrap a (singleton) VirtualMCPStorage so `list` is memoized for the lifetime of
+ * one request. A single MCP/decopilot request fans out to several independent
+ * callers — management-tool resolution, decopilot prompt assembly — that each
+ * re-read the org's virtual MCPs; without this they issue the same query 3+
+ * times. Concurrent callers share the in-flight promise. Any write through this
+ * wrapper clears the cache, so a mutate-then-read within the same request stays
+ * correct.
+ */
+export function createRequestCachedVirtualMcps(
+  base: VirtualMCPStorage,
+): VirtualMCPStorage {
+  const cache = new Map<string, Promise<unknown>>();
+  const memoize = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+    const hit = cache.get(key);
+    if (hit) return hit as Promise<T>;
+    const promise = fn();
+    cache.set(key, promise);
+    return promise;
+  };
+
+  return new Proxy(base, {
+    get(target, prop, receiver) {
+      if (prop === "list") {
+        return (organizationId: string, options?: { pinnedOnly?: boolean }) =>
+          memoize(`list:${organizationId}:${options?.pinnedOnly ? 1 : 0}`, () =>
+            target.list(organizationId, options),
+          );
+      }
+      if (
+        prop === "create" ||
+        prop === "update" ||
+        prop === "delete" ||
+        prop === "removeConnectionReferences"
+      ) {
+        return (...args: unknown[]) => {
+          cache.clear();
+          return (target[prop] as (...a: unknown[]) => unknown)(...args);
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
 }

@@ -11,4 +11,6 @@ export { AUTOMATION_UPDATE } from "./update";
 export { AUTOMATION_DELETE } from "./delete";
 export { AUTOMATION_TRIGGER_ADD } from "./trigger-add";
 export { AUTOMATION_TRIGGER_REMOVE } from "./trigger-remove";
+export { AUTOMATION_TRIGGER_ROTATE_TOKEN } from "./trigger-rotate-token";
 export { AUTOMATION_RUN } from "./run";
+export { AUTOMATION_RUN_STATS } from "./run-stats";

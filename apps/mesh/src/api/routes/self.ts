@@ -6,13 +6,14 @@
  */
 import { Hono } from "hono";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import type { MeshContext } from "../../core/mesh-context";
+import type { StudioContext } from "../../core/studio-context";
 import { getAllowedToolsForRole } from "../../auth/role-tools";
-import { managementMCP } from "../../tools";
+import { managementContextStore, managementMCP } from "../../tools";
+import { serveMcpRequest } from "../utils/serve-mcp";
 
 // Define Hono variables type
 type Variables = {
-  meshContext: MeshContext;
+  meshContext: StudioContext;
 };
 
 type SelfEnv = { Variables: Variables };
@@ -40,7 +41,11 @@ export const createSelfRoutes = () => {
         c.req.raw.headers.get("Accept")?.includes("application/json") ?? false,
     });
     await server.connect(transport);
-    return transport.handleRequest(c.req.raw);
+    // Tool handlers read ctx from the ALS store, so the request must run inside
+    // its scope.
+    return managementContextStore.run(ctx, () =>
+      serveMcpRequest(server, transport, c.req.raw, "mcp:self"),
+    );
   });
 
   return app;

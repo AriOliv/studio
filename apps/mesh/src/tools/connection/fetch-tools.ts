@@ -6,9 +6,11 @@
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { sharedJsonSchemaValidator } from "@decocms/mcp-utils";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { getSettings } from "../../settings";
 import type {
   ConnectionParameters,
   HttpConnectionParameters,
@@ -128,10 +130,13 @@ async function fetchToolsFromHttpMCP(
       { requestInit: { headers } },
     );
 
-    client = new Client({
-      name: "mcp-cms-tool-fetcher",
-      version: "1.0.0",
-    });
+    client = new Client(
+      {
+        name: "mcp-cms-tool-fetcher",
+        version: "1.0.0",
+      },
+      { jsonSchemaValidator: sharedJsonSchemaValidator },
+    );
 
     // Add timeout to prevent hanging connections
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -209,7 +214,10 @@ async function fetchToolsFromSSEMCP(
       { requestInit: { headers } },
     );
 
-    client = new Client({ name: "mcp-cms-tool-fetcher", version: "1.0.0" });
+    client = new Client(
+      { name: "mcp-cms-tool-fetcher", version: "1.0.0" },
+      { jsonSchemaValidator: sharedJsonSchemaValidator },
+    );
 
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error("SSE connection timeout")), 15_000);
@@ -251,11 +259,22 @@ async function fetchToolsFromSSEMCP(
 }
 
 /**
- * Fetch tools from a STDIO-based MCP connection
+ * Fetch tools from a STDIO-based MCP connection.
+ * Guarded by localMode — STDIO spawns arbitrary commands as child processes.
  */
 async function fetchToolsFromStdioMCP(
   connection: ConnectionForToolFetch,
 ): Promise<FetchedMCPData | null> {
+  // Defense-in-depth: callers should check localMode before reaching here,
+  // but reject anyway to prevent any code path from spawning commands in
+  // production deployments.
+  if (!getSettings().localMode) {
+    console.error(
+      `[fetch-tools] Blocked STDIO spawn for ${connection.id}: not in local mode`,
+    );
+    return null;
+  }
+
   const stdioParams = isStdioParameters(connection.connection_headers)
     ? connection.connection_headers
     : null;
@@ -275,10 +294,13 @@ async function fetchToolsFromStdioMCP(
       cwd: stdioParams.cwd,
     });
 
-    client = new Client({
-      name: "mcp-cms-tool-fetcher",
-      version: "1.0.0",
-    });
+    client = new Client(
+      {
+        name: "mcp-cms-tool-fetcher",
+        version: "1.0.0",
+      },
+      { jsonSchemaValidator: sharedJsonSchemaValidator },
+    );
 
     // Add timeout to prevent hanging
     const timeoutPromise = new Promise<never>((_, reject) => {

@@ -1,86 +1,75 @@
-import { AgentsList } from "@/web/components/home/agents-list.tsx";
-import { Chat } from "@/web/components/chat";
-import { NoAiProviderEmptyState } from "@/web/components/chat/no-ai-provider-empty-state";
-import { ImportFromDecoDialog } from "@/web/components/import-from-deco-dialog.tsx";
-import { IntegrationIcon } from "@/web/components/integration-icon";
-import { useAiProviderKeys } from "@/web/hooks/collections/use-ai-providers";
-import { authClient } from "@/web/lib/auth-client";
-import { KEYS } from "@/web/lib/query-keys";
-import { useDecoCredits } from "@/web/hooks/use-deco-credits";
+import {
+  getWellKnownDecopilotVirtualMCP,
+  SELF_MCP_ALIAS_ID,
+  useMCPClient,
+  useProjectContext,
+  useVirtualMCP,
+  virtualMcpItemQueryOptions,
+} from "@decocms/mesh-sdk";
+import { useQuery, useSuspenseQueries } from "@tanstack/react-query";
+import { type ReactNode, useState } from "react";
+import { Check, LayoutAlt04, Plus, X } from "@untitledui/icons";
+import { Button } from "@deco/ui/components/button.tsx";
 import { useIsMobile } from "@deco/ui/hooks/use-mobile.ts";
-import { ArrowRight } from "@untitledui/icons";
-import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
-
-const DECO_BANNER_GRADIENT = [
-  "radial-gradient(ellipse 25% 220% at -5% 120%, rgba(165,149,255,0.35) 0%, transparent 100%)",
-  "radial-gradient(ellipse 25% 220% at 105% -20%, rgba(208,236,26,0.32) 0%, transparent 100%)",
-].join(", ");
-const DECO_BANNER_TEXTURE = "/decotexture.svg";
-
-function ImportDecoSiteBanner({ onClick }: { onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="w-full relative flex items-center gap-4 px-4 py-4 rounded-lg border border-border bg-background overflow-hidden transition-colors text-left cursor-pointer group"
-      style={{ backgroundImage: DECO_BANNER_GRADIENT }}
-    >
-      <div className="relative shrink-0 p-1.5 bg-[var(--brand-green-light)] rounded-lg border border-border">
-        <IntegrationIcon
-          icon="/logos/deco%20logo.svg"
-          name="deco.cx"
-          size="xs"
-          className="border-0 rounded-none bg-transparent"
-        />
-      </div>
-      <p className="flex-1 relative text-sm font-medium text-foreground leading-none whitespace-nowrap">
-        Import your deco.cx site
-      </p>
-      <img
-        src={DECO_BANNER_TEXTURE}
-        alt=""
-        aria-hidden
-        className="absolute pointer-events-none"
-        style={{
-          width: "274.5px",
-          height: "272.25px",
-          left: "calc(50% + 145.5px)",
-          top: "calc(50% + 40px)",
-          transform: "translate(-50%, -50%)",
-        }}
-      />
-      <div className="relative bg-background flex items-center justify-center size-8 rounded-md shrink-0">
-        <ArrowRight
-          size={16}
-          className="text-foreground transition-transform group-hover:translate-x-0.5"
-        />
-      </div>
-    </button>
-  );
-}
-
-function useIsDecoUser() {
-  const { data: session } = authClient.useSession();
-  const { data } = useQuery({
-    queryKey: KEYS.decoProfile(session?.user?.email),
-    queryFn: async () => {
-      const res = await fetch("/api/deco-sites/profile");
-      if (!res.ok) return { isDecoUser: false };
-      return res.json() as Promise<{ isDecoUser: boolean }>;
-    },
-    enabled: Boolean(session?.user?.email),
-    staleTime: 5 * 60_000,
-  });
-  return data?.isDecoUser ?? false;
-}
+import { cn } from "@deco/ui/lib/utils.ts";
+import { Chat } from "@/web/components/chat";
+import { useChatPrefs } from "@/web/components/chat/context";
+import { NoAiProviderEmptyState } from "@/web/components/chat/no-ai-provider-empty-state";
+import { AddTileDrawer } from "@/web/components/home/add-tile-drawer";
+import {
+  HomeEditProvider,
+  useHomeEdit,
+} from "@/web/components/home/home-edit-context";
+import { HomeGrid, useHomeGridStats } from "@/web/components/home/home-grid";
+import {
+  aiProviderKeysQueryOptions,
+  useAiProviderKeys,
+} from "@/web/hooks/collections/use-ai-providers";
+import { useCurrentLink } from "@/web/hooks/use-current-link";
+import { useDecoCredits } from "@/web/hooks/use-deco-credits";
+import { homeNextActionsQueryOptions } from "@/web/hooks/use-home-next-actions";
+import { organizationSettingsQueryOptions } from "@/web/hooks/use-organization-settings";
+import {
+  agentHasClonableSource,
+  hasLocalCliHarness,
+} from "@/web/lib/agent-capabilities";
+import { authClient } from "@/web/lib/auth-client";
+import { Toolbar } from "@/web/layouts/agent-shell-layout/toolbar";
+import { HomeBackground } from "./background";
 
 export function HomePage() {
   const { data: session } = authClient.useSession();
-  const [importOpen, setImportOpen] = useState(false);
-  const isDecoUser = useIsDecoUser();
+  const { org } = useProjectContext();
   const isMobile = useIsMobile();
+  const link = useCurrentLink();
+  const { selectedVirtualMcp } = useChatPrefs();
+  const defaultAgent = getWellKnownDecopilotVirtualMCP(org.id);
+  const displayAgent = selectedVirtualMcp ?? defaultAgent;
+
+  // Warm the tile-gating home feed in parallel with the self tool calls below.
+  // Plain (non-suspense) query so a flaky feed never blanks the home — it only
+  // starts the fetch early; useHomeGridStats reads the same cache entry.
+  useQuery(homeNextActionsQueryOptions(org.slug));
+
+  // Resolve the self MCP client once, then fire every independent self tool call
+  // in a single parallel batch. Without this, the stacked useSuspenseQuery hooks
+  // below each suspend before the next starts, serializing into a waterfall that
+  // delayed home-next-actions (and thus the tiles) by seconds.
+  const selfClient = useMCPClient({
+    connectionId: SELF_MCP_ALIAS_ID,
+    orgId: org.id,
+    orgSlug: org.slug,
+  });
+  useSuspenseQueries({
+    queries: [
+      aiProviderKeysQueryOptions(org.slug, org.id),
+      organizationSettingsQueryOptions(org.slug, org.id),
+      virtualMcpItemQueryOptions(org.id, displayAgent.id, selfClient),
+    ],
+  });
+
   const allKeys = useAiProviderKeys();
+  const fullVm = useVirtualMCP(displayAgent.id);
   const {
     hasDecoKey,
     isZeroBalance,
@@ -88,8 +77,13 @@ export function HomePage() {
     balanceDollars,
     hasOnlyDecoProvider,
   } = useDecoCredits();
+  const { hasVisibleTiles } = useHomeGridStats(org.slug);
 
-  if (allKeys.length === 0) {
+  const isClonableAgent = agentHasClonableSource(fullVm?.metadata);
+  const showProviderEmptyState =
+    allKeys.length === 0 && !(isClonableAgent && hasLocalCliHarness(link));
+
+  if (showProviderEmptyState) {
     return (
       <div className="flex-1 overflow-y-auto">
         <div className="min-h-full flex items-center justify-center px-4 py-10">
@@ -100,83 +94,181 @@ export function HomePage() {
   }
 
   const userName = session?.user?.name?.split(" ")[0] || "there";
-
   const showEyebrow =
     hasDecoKey && isInitialFreeCredit && balanceDollars != null;
   const showNoCreditsEyebrow =
     hasDecoKey && isZeroBalance && hasOnlyDecoProvider;
+  const eyebrow = showEyebrow ? (
+    <Chat.CreditsEyebrow balanceDollars={balanceDollars} />
+  ) : showNoCreditsEyebrow ? (
+    <Chat.NoCreditsEyebrow />
+  ) : null;
 
-  if (isMobile) {
-    return (
-      <>
-        <div className="flex-1 relative flex flex-col items-center px-4">
-          <div className="flex-1 flex flex-col items-center justify-center w-full">
-            {showEyebrow && (
-              <div className="mb-4">
-                <Chat.CreditsEyebrow balanceDollars={balanceDollars} />
-              </div>
-            )}
-            {showNoCreditsEyebrow && (
-              <div className="mb-4">
-                <Chat.NoCreditsEyebrow />
-              </div>
-            )}
-            <p className="text-3xl font-medium text-foreground text-center max-w-[280px]">
-              What's on your mind, {userName}?
-            </p>
-          </div>
-          <div className="w-full flex flex-col gap-4 pb-4">
-            <AgentsList />
-            <Chat.Input showConnectionsBanner />
-          </div>
-          {isDecoUser && (
-            <div className="w-full">
-              <ImportDecoSiteBanner onClick={() => setImportOpen(true)} />
-            </div>
-          )}
-        </div>
-        <ImportFromDecoDialog open={importOpen} onOpenChange={setImportOpen} />
-      </>
-    );
-  }
+  return (
+    <HomeEditProvider>
+      {isMobile ? (
+        <MobileHome eyebrow={eyebrow} userName={userName} />
+      ) : (
+        <DesktopHome
+          eyebrow={eyebrow}
+          userName={userName}
+          hasVisibleTiles={hasVisibleTiles}
+        />
+      )}
+    </HomeEditProvider>
+  );
+}
+
+function MobileHome({
+  eyebrow,
+  userName,
+}: {
+  eyebrow: ReactNode;
+  userName: string;
+}) {
+  return (
+    <div className="flex-1 relative flex flex-col items-center overflow-y-auto">
+      <HomeBackground />
+      <div className="relative flex flex-col items-center justify-center w-full pt-28 pb-8 px-4">
+        {eyebrow && <div className="mb-4">{eyebrow}</div>}
+        <p className="text-3xl font-medium text-foreground text-center max-w-[280px]">
+          What's on your mind, {userName}?
+        </p>
+      </div>
+      <div className="relative w-full flex flex-col gap-4 pb-8 px-4">
+        <Chat.Input showConnectionsBanner />
+      </div>
+      <div className="relative w-full px-4 pb-8">
+        <HomeGrid isEditMode={false} />
+      </div>
+    </div>
+  );
+}
+
+function DesktopHome({
+  eyebrow,
+  userName,
+  hasVisibleTiles,
+}: {
+  eyebrow: ReactNode;
+  userName: string;
+  hasVisibleTiles: boolean;
+}) {
+  const { isEditMode, enter, save, cancel, hasChanges } = useHomeEdit();
+  const [addTileOpen, setAddTileOpen] = useState(false);
 
   return (
     <>
-      <div className="flex-1 relative flex flex-col items-center px-10">
-        <div className="flex-1 flex flex-col items-center justify-center w-full">
-          <div className="flex flex-col items-center w-full max-w-[672px]">
-            <div className="text-center mb-10">
-              {showEyebrow && (
-                <div className="mb-4">
-                  <Chat.CreditsEyebrow balanceDollars={balanceDollars} />
-                </div>
-              )}
-              {showNoCreditsEyebrow && (
-                <div className="mb-4">
-                  <Chat.NoCreditsEyebrow />
-                </div>
-              )}
-              <p className="text-3xl font-medium text-foreground">
-                What's on your mind, {userName}?
-              </p>
+      <Toolbar.Right>
+        <CustomizeToolbar
+          isEditMode={isEditMode}
+          hasChanges={hasChanges}
+          onEnter={enter}
+          onSave={save}
+          onCancel={cancel}
+          onAddTile={() => setAddTileOpen(true)}
+        />
+      </Toolbar.Right>
+      <AddTileDrawer open={addTileOpen} onOpenChange={setAddTileOpen} />
+      <div className="flex-1 relative flex flex-col min-h-0">
+        <HomeBackground />
+        <div className="flex-1 relative flex flex-col overflow-y-auto">
+          <div
+            className={cn(
+              "relative flex flex-col items-center px-10 pb-4",
+              hasVisibleTiles || isEditMode ? "pt-32" : "flex-1 justify-center",
+            )}
+          >
+            <div className="flex flex-col items-center w-full max-w-[672px]">
+              <div className="text-center mb-10">
+                {eyebrow && <div className="mb-4">{eyebrow}</div>}
+                <p className="text-3xl font-medium text-foreground">
+                  What's on your mind, {userName}?
+                </p>
+              </div>
+              <div className="relative w-full">
+                <Capybara />
+                <Chat.Input showConnectionsBanner />
+              </div>
             </div>
-            <div className="w-full">
-              <Chat.Input showConnectionsBanner />
+            <div className="relative w-full mt-10 mx-auto max-w-[1280px] px-2 pb-16">
+              <HomeGrid isEditMode={isEditMode} />
             </div>
-          </div>
-          <div className="w-full mt-10 mx-auto">
-            <AgentsList />
           </div>
         </div>
-        {isDecoUser && (
-          <div className="absolute bottom-6 left-0 right-0 px-10">
-            <div className="w-full max-w-[500px] mx-auto">
-              <ImportDecoSiteBanner onClick={() => setImportOpen(true)} />
-            </div>
-          </div>
-        )}
       </div>
-      <ImportFromDecoDialog open={importOpen} onOpenChange={setImportOpen} />
     </>
+  );
+}
+
+function CustomizeToolbar({
+  isEditMode,
+  hasChanges,
+  onEnter,
+  onSave,
+  onCancel,
+  onAddTile,
+}: {
+  isEditMode: boolean;
+  hasChanges: boolean;
+  onEnter: () => void;
+  onSave: () => void;
+  onCancel: () => void;
+  onAddTile: () => void;
+}) {
+  if (isEditMode) {
+    return (
+      <>
+        <button
+          type="button"
+          onClick={onAddTile}
+          className="flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors"
+          title="Add a tile from any agent"
+        >
+          <Plus size={14} />
+          Add tile
+        </button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={onCancel}
+          className="gap-1.5 h-7 text-xs"
+        >
+          <X size={14} />
+          Cancel
+        </Button>
+        <Button
+          size="sm"
+          onClick={onSave}
+          disabled={!hasChanges}
+          className="gap-1.5 h-7 text-xs"
+        >
+          <Check size={14} />
+          Save
+        </Button>
+      </>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onEnter}
+      className="flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors"
+      title="Customize your home"
+    >
+      <LayoutAlt04 size={14} />
+      Customize
+    </button>
+  );
+}
+
+function Capybara() {
+  return (
+    <img
+      src="/home/capybara.png"
+      alt=""
+      aria-hidden
+      className="pointer-events-none absolute -top-16 right-6 z-20 h-20 w-auto select-none"
+    />
   );
 }

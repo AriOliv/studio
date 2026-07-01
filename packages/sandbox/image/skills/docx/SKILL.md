@@ -1,3 +1,8 @@
+---
+name: docx
+description: Read and extract text, tables, and structure from .docx Word documents. Use when the user uploads or references a Word file to read or summarize.
+---
+
 # docx — Word documents
 
 Use this skill to read or summarize `.docx` files.
@@ -10,7 +15,7 @@ Print text content from a `.docx` as plain text. Paragraphs are separated by
 blank lines; tables are rendered with tab-separated cells.
 
 ```
-python /mnt/skills/public/docx/extract.py <path-to-file.docx>
+python org/public/core/docx/extract.py <path-to-file.docx>
 ```
 
 ## Direct python-docx usage

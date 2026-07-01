@@ -10,7 +10,8 @@
  */
 
 import { MCP_MESH_KEY } from "@/core/constants";
-import type { BetterAuthInstance, BoundAuthClient } from "./mesh-context";
+import { BASIC_USAGE_TOOLS } from "@/tools/registry-metadata";
+import type { BoundAuthClient } from "./studio-context";
 
 // ============================================================================
 // Types
@@ -56,11 +57,10 @@ export class ForbiddenError extends Error {
  * Delegates all permission checks to Better Auth's Organization plugin
  * via the BoundAuthClient (which encapsulates HTTP headers)
  */
-export class AccessControl implements Disposable {
+export class AccessControl {
   private _granted: boolean = false;
 
   constructor(
-    _auth: BetterAuthInstance, // Kept for backwards compatibility, not used
     private userId?: string,
     private toolName?: string,
     private boundAuth?: BoundAuthClient, // Bound auth client for permission checks
@@ -69,10 +69,6 @@ export class AccessControl implements Disposable {
     private getToolMeta?: GetToolMetaFn, // Optional callback for public tool check
     private organizationId?: string, // Path-resolved org (overrides session active org)
   ) {}
-
-  [Symbol.dispose](): void {
-    this._granted = false;
-  }
 
   setToolName(toolName: string): void {
     this.toolName = toolName;
@@ -111,13 +107,8 @@ export class AccessControl implements Disposable {
    * Grant access unconditionally
    * Use for manual overrides, admin actions, or custom validation
    */
-  grant(): Disposable {
+  grant(): void {
     this._granted = true;
-    return {
-      [Symbol.dispose]: () => {
-        this._granted = false;
-      },
-    };
   }
 
   /**
@@ -190,28 +181,57 @@ export class AccessControl implements Disposable {
       return false;
     }
 
-    // Admin and owner roles bypass all checks (they have full access)
+    // Two kinds of principal, each with its OWN self-contained rule:
+    //   - API key   → the key's stored allowlist is the whole decision. It is a
+    //     capability, not a member: no role, no basic-usage, no Better Auth.
+    //   - everyone else (session / MCP OAuth / mesh JWT) → membership floor +
+    //     admin/owner bypass + Better Auth grants.
+    return this.boundAuth?.isApiKeyPrincipal
+      ? this.checkApiKeyAccess(resource)
+      : this.checkMemberAccess(resource);
+  }
+
+  /**
+   * API-key authorization: the key's stored allowlist is the entire decision.
+   * Never inherits the owner's role, basic-usage floor, or any Better Auth
+   * grant — so a "read-only" key minted by an admin can't act beyond its scope.
+   * See auth/api-key-permissions.ts (`checkApiKeyPermission`).
+   */
+  private async checkApiKeyAccess(resource: string): Promise<boolean> {
+    // `isApiKeyPrincipal` is only set on a real bound client, so this is
+    // defensive; the dispatcher already routed non-bound principals away.
+    if (!this.boundAuth) return false;
+    return this.boundAuth.hasPermission({ [this.connectionId]: [resource] });
+  }
+
+  /**
+   * Member authorization (session / MCP OAuth / mesh JWT).
+   *
+   * Basic-usage tools are granted to every authenticated org MEMBER regardless
+   * of role — resolved here, not baked into each role, so the set evolves with
+   * a one-line edit to BASIC_USAGE_TOOLS. Both signals are required: `userId`
+   * (a verified principal — `boundAuth` exists for every request, even
+   * anonymous, so it must not gate this) and `role` (set only for members).
+   * Admin/owner bypass everything; everyone else falls through to the stored /
+   * Better Auth grant.
+   */
+  private async checkMemberAccess(resource: string): Promise<boolean> {
+    if (this.userId && this.role && BASIC_USAGE_TOOLS.has(resource)) {
+      return true;
+    }
     if (this.role === "admin" || this.role === "owner") {
       return true;
     }
-
-    // No bound auth client = deny (should not happen in normal flow)
     if (!this.boundAuth) {
       return false;
     }
-
-    // Build permission check - use connectionId as the resource key
-    const permissionToCheck: Record<string, string[]> = {};
-    if (this.connectionId) {
-      permissionToCheck[this.connectionId] = [resource];
-    }
-
-    // Delegate to Better Auth's hasPermission API. When an organizationId is
-    // set (path-resolved org), pass it through so Better Auth uses it instead
-    // of the session's active org.
+    // Pass `this.role` so boundAuth can resolve built-in roles in-memory (no
+    // Better Auth round-trip); admin/owner already returned above, so this only
+    // accelerates the `user` role. `organizationId` (path-resolved org) makes
+    // Better Auth check the right org instead of the session's active one.
     return this.boundAuth.hasPermission(
-      permissionToCheck,
-      this.organizationId ? { organizationId: this.organizationId } : undefined,
+      { [this.connectionId]: [resource] },
+      { organizationId: this.organizationId, role: this.role },
     );
   }
 

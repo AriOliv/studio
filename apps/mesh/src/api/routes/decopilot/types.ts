@@ -11,7 +11,8 @@ import type { LanguageModelV2 } from "@ai-sdk/provider";
 import type { InferUITool, UIMessage } from "ai";
 import type { ToolDefinition, UsageStats } from "@decocms/mesh-sdk";
 import type { Metadata } from "@/web/components/chat/types";
-import type { BuiltInToolSet } from "../../../harnesses/decopilot/built-in-tools";
+import type { BuiltInToolSet } from "@/harnesses/decopilot/built-in-tools";
+import type { ModelsConfig as HarnessModelsConfig } from "@decocms/harness/types";
 
 // ============================================================================
 // Stream API Message Types
@@ -29,11 +30,14 @@ export type ChatMessage = UIMessage<
     "tool-metadata": {
       annotations?: NonNullable<ToolDefinition["annotations"]>;
       latencyMs?: number;
+      /** UTF-8 byte length of the JSON-serialized tool result. */
+      outputBytes?: number;
     };
     "tool-subtask-metadata": {
       usage: UsageStats;
       agent: string;
-      models: ModelsConfig;
+      /** Slot-keyed harness models (per-slot credentialId). */
+      models: HarnessModelsConfig;
     };
     "thread-title": {
       title: string;
@@ -46,6 +50,16 @@ export type ChatMessage = UIMessage<
     "web-search": {
       delta: string;
     };
+    /**
+     * Structured trigger payload for an event/webhook-fired automation run.
+     * UI-only — dropped by `convertToModelMessages`; the sibling text part is
+     * what the model reads. Rendered as a dedicated card on the user message.
+     */
+    "trigger-event": {
+      source: string;
+      type: string;
+      data: unknown;
+    };
   },
   {
     [K in keyof BuiltInToolSet]: InferUITool<BuiltInToolSet[K]>;
@@ -56,27 +70,20 @@ export type ChatMessage = UIMessage<
 // Model Config Types
 // ============================================================================
 
-export interface ModelInfo {
-  id: string;
-  title?: string;
-  capabilities?: {
-    vision?: boolean;
-    text?: boolean;
-    tools?: boolean;
-    reasoning?: boolean;
-    file?: boolean;
-  };
-  provider?: string | null;
-  limits?: { contextWindow?: number; maxOutputTokens?: number };
-}
+import type { ModelInfo } from "@decocms/harness/decopilot/model-info";
 
+export type { ModelInfo };
+
+/** CLIENT request shape: root credentialId for the chat model. Dispatch
+ *  normalizes this into the per-slot harness/wire `ModelsConfig`
+ *  (`@/harnesses`) before invoking a harness. No `coding` slot (D11). */
 export interface ModelsConfig {
   credentialId: string;
   thinking: ModelInfo;
-  coding?: ModelInfo;
   fast?: ModelInfo;
-  image?: ModelInfo;
-  deepResearch?: ModelInfo;
+  image?: ModelInfo & { credentialId: string };
+  webSearch?: ModelInfo & { credentialId: string };
+  deepResearch?: ModelInfo & { credentialId: string };
 }
 
 // ============================================================================

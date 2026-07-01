@@ -1,10 +1,7 @@
 /* oxlint-disable no-explicit-any */
 /* oxlint-disable ban-types */
-import {
-  OnEventsInputSchema,
-  OnEventsOutputSchema,
-  type EventBusBindingClient,
-} from "@decocms/bindings";
+import { OnEventsInputSchema, OnEventsOutputSchema } from "@decocms/bindings";
+import { sharedJsonSchemaValidator } from "@decocms/mcp-utils";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport as HttpServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type {
@@ -21,16 +18,24 @@ import { Event, type EventHandlers } from "./events.ts";
 import type { DefaultEnv, User } from "./index.ts";
 import { State } from "./state.ts";
 import {
-  type WorkflowDefinition,
-  Workflow,
-  WORKFLOW_SCOPES,
-  workflowToolId,
-} from "./workflows.ts";
+  type InstallContext,
+  type StudioVaultBootstrap,
+  makeCreateAgent,
+} from "./agents.ts";
 
 // Re-export EventHandlers type and SELF constant for external use
 export { SELF } from "./events.ts";
 export type { EventHandlers } from "./events.ts";
-export type { WorkflowDefinition } from "./workflows.ts";
+export { AGENT_SCOPES } from "./agents.ts";
+export type {
+  InstallContext,
+  StudioVaultBootstrap,
+  CreateAgentInput,
+  CreateAgentResult,
+  CreatedAutomation,
+  TriggerResult,
+  AutomationTrigger,
+} from "./agents.ts";
 
 export const createRuntimeContext = (prev?: AppContext) => {
   const store = State.getStore();
@@ -63,6 +68,8 @@ export interface Tool<
 > {
   _meta?: Record<string, unknown>;
   id: TId;
+  /** Human-readable name exposed via MCP tools/list `title` */
+  title?: string;
   description?: string;
   annotations?: ToolAnnotations;
   inputSchema: TSchemaIn;
@@ -82,6 +89,7 @@ export interface Tool<
 export type CreatedTool = {
   _meta?: Record<string, unknown>;
   id: string;
+  title?: string;
   description?: string;
   annotations?: ToolAnnotations;
   inputSchema: ZodTypeAny;
@@ -353,8 +361,72 @@ export interface Integration {
 
 export interface OnChangeCallback<TState> {
   state: TState;
-  scopes: string[];
+  scopes: ConfigurationScope[];
+  vault?: StudioVaultBootstrap;
 }
+
+/**
+ * Canonical scope value for reading a refreshable OAuth access token from
+ * Studio's credential vault for a configured binding.
+ *
+ * Use it in configuration scopes as `${STATE_KEY}::credential:access-token:read`,
+ * where `STATE_KEY` points at a `BindingOf(...)` value in configuration state.
+ * This scope is intentionally narrower than static secret access: Studio should
+ * return only the current access token and keep refresh tokens/client secrets
+ * inside the vault.
+ *
+ * @example
+ * ```ts
+ * const scopes = ["github::credential:access-token:read"] satisfies ConfigurationScope[];
+ * ```
+ */
+export const CREDENTIAL_ACCESS_TOKEN_READ_SCOPE =
+  "credential:access-token:read" as const;
+
+/**
+ * Canonical scope value for reading saved MCP configuration state from
+ * Studio's credential vault for a configured binding.
+ *
+ * Use it in configuration scopes as
+ * `${STATE_KEY}::credential:configuration:read`, where `STATE_KEY` points at a
+ * `BindingOf(...)` value in configuration state. This scope is intentionally
+ * separate from OAuth access-token reads because some MCPs store provider
+ * settings or credentials in configuration state instead of OAuth.
+ *
+ * The runtime vault client returns Studio's already-saved configuration state;
+ * it does not call the target MCP's `MCP_CONFIGURATION` discovery tool.
+ *
+ * @example
+ * ```ts
+ * const scopes = ["github::credential:configuration:read"] satisfies ConfigurationScope[];
+ * ```
+ */
+export const CREDENTIAL_CONFIGURATION_READ_SCOPE =
+  "credential:configuration:read" as const;
+
+export type CredentialAccessTokenReadScope =
+  typeof CREDENTIAL_ACCESS_TOKEN_READ_SCOPE;
+export type CredentialConfigurationReadScope =
+  typeof CREDENTIAL_CONFIGURATION_READ_SCOPE;
+
+export type BindingCredentialAccessTokenReadScope<
+  TStateKey extends string = string,
+> = `${TStateKey}::${CredentialAccessTokenReadScope}`;
+export type BindingCredentialConfigurationReadScope<
+  TStateKey extends string = string,
+> = `${TStateKey}::${CredentialConfigurationReadScope}`;
+
+/**
+ * Configuration scopes use `STATE_KEY::SCOPE`, where `STATE_KEY` points at a
+ * value in the MCP configuration state. Most scopes are MCP-specific tool or
+ * capability names. `credential:access-token:read` leases a downstream OAuth
+ * access token for direct API calls, and `credential:configuration:read` reads
+ * the target connection's saved MCP configuration state.
+ */
+export type ConfigurationScope =
+  | BindingCredentialAccessTokenReadScope
+  | BindingCredentialConfigurationReadScope
+  | string;
 
 /**
  * OAuth 2.0 Token Exchange Parameters
@@ -460,13 +532,6 @@ export interface OAuthConfig {
   };
 }
 
-/**
- * Constructs a type by picking all properties from T that are assignable to Value.
- */
-type PickByType<T, Value> = {
-  [P in keyof T as T[P] extends Value ? P : never]: T[P];
-};
-
 export interface CreateMCPServerOptions<
   Env = unknown,
   TSchema extends ZodTypeAny = never,
@@ -480,13 +545,18 @@ export interface CreateMCPServerOptions<
   before?: (env: TEnv) => Promise<void> | void;
   oauth?: OAuthConfig;
   events?: {
-    bus?: keyof PickByType<State, EventBusBindingClient>;
     handlers?: EventHandlers<TEnv, TSchema>;
   };
   configuration?: {
     onChange?: (env: TEnv, cb: OnChangeCallback<State>) => Promise<void>;
+    /**
+     * Fired once per connection, on the first ON_MCP_CONFIGURATION call (the
+     * user's first config save). Use it to provision agents/automations via
+     * the injected `createAgent` helper. Requires AGENT_SCOPES in `scopes`.
+     */
+    onInstall?: (env: TEnv, ctx: InstallContext) => Promise<void>;
     state?: TSchema;
-    scopes?: string[];
+    scopes?: ConfigurationScope[];
   };
   tools?:
     | Array<
@@ -524,9 +594,6 @@ export interface CreateMCPServerOptions<
             | Promise<CreatedResource[]>)
       >
     | ((env: TEnv) => CreatedResource[] | Promise<CreatedResource[]>);
-  workflows?:
-    | WorkflowDefinition[]
-    | ((env: TEnv) => WorkflowDefinition[] | Promise<WorkflowDefinition[]>);
 }
 
 export type Fetch<TEnv = unknown> = (
@@ -541,23 +608,11 @@ export interface AppContext<TEnv extends DefaultEnv = DefaultEnv> {
   req?: Request;
 }
 
-const getEventBus = (
-  prop: string | number,
-  env: DefaultEnv,
-): EventBusBindingClient | undefined => {
-  const bus = env as unknown as { [prop]: EventBusBindingClient };
-  return typeof bus[prop] !== "undefined"
-    ? bus[prop]
-    : env?.MESH_REQUEST_CONTEXT?.state?.[prop];
-};
-
-// TEnv is erased here because toolsFor() only reads events/workflows/configuration
+// TEnv is erased here because toolsFor() only reads events/configuration
 // and doesn't need the full env type. Replacing `any` with a proper generic
 // would require threading TEnv through toolsFor, which is a larger refactor.
-type ResolvedMCPServerOptions<TSchema extends ZodTypeAny = never> = Omit<
-  CreateMCPServerOptions<any, TSchema>, // eslint-disable-line @typescript-eslint/no-explicit-any
-  "workflows"
-> & { workflows?: WorkflowDefinition[] };
+type ResolvedMCPServerOptions<TSchema extends ZodTypeAny = never> =
+  CreateMCPServerOptions<any, TSchema>; // eslint-disable-line @typescript-eslint/no-explicit-any
 
 const getMeshCtx = (input: { runtimeContext: AppContext }) => {
   const ctx = input.runtimeContext.env.MESH_REQUEST_CONTEXT;
@@ -570,15 +625,13 @@ const getMeshCtx = (input: { runtimeContext: AppContext }) => {
 
 const toolsFor = <TSchema extends ZodTypeAny = never>({
   events,
-  workflows,
-  configuration: { state: schema, scopes, onChange } = {},
+  configuration: { state: schema, scopes, onChange, onInstall } = {},
 }: ResolvedMCPServerOptions<TSchema> = {}): CreatedTool[] => {
   const jsonSchema = schema
     ? injectBindingSchemas(z.toJSONSchema(schema) as Record<string, unknown>)
     : { type: "object", properties: {} };
-  const busProp = String(events?.bus ?? "EVENT_BUS");
   return [
-    ...(onChange || events || workflows?.length
+    ...(onChange || onInstall || events
       ? [
           createTool({
             id: "ON_MCP_CONFIGURATION",
@@ -590,64 +643,42 @@ const toolsFor = <TSchema extends ZodTypeAny = never>({
                 .describe(
                   "Array of scopes in format 'KEY::SCOPE' (e.g., 'GMAIL::GetCurrentUser')",
                 ),
+              firstRun: z
+                .boolean()
+                .optional()
+                .describe(
+                  "True on the first configuration save for this connection — fires onInstall.",
+                ),
+              vault: z
+                .object({
+                  baseUrl: z.string(),
+                  org: z.string(),
+                  subjectConnectionId: z.string(),
+                  token: z.string(),
+                })
+                .optional(),
             }),
             outputSchema: z.object({}),
             execute: async (input) => {
               const state = (input.context as { state: unknown })
                 .state as z.infer<TSchema>;
+              const vault = (input.context as { vault?: StudioVaultBootstrap })
+                .vault;
               await onChange?.(input.runtimeContext.env, {
                 state,
                 scopes: (input.context as { scopes: string[] }).scopes,
+                vault,
               });
-              const bus = getEventBus(busProp, input.runtimeContext.env);
-              if (events && state && bus) {
-                const { connectionId } = getMeshCtx(input);
-                // Sync subscriptions - always call to handle deletions too
-                const subscriptions = Event.subscriptions(
-                  events?.handlers ?? ({} as Record<string, never>),
-                  state,
-                  connectionId,
-                );
-                await bus.EVENT_SYNC_SUBSCRIPTIONS({ subscriptions });
 
-                // Publish cron events for SELF cron subscriptions
-                // Publishing is idempotent - if cron event already exists, it returns existing
-                if (connectionId) {
-                  const cronSubscriptions = subscriptions.filter(
-                    (sub) =>
-                      sub.eventType.startsWith("cron/") &&
-                      sub.publisher === connectionId,
-                  );
-
-                  await Promise.all(
-                    cronSubscriptions.map(async (sub) => {
-                      const parsed = Event.parseCron(sub.eventType);
-                      if (parsed) {
-                        const [, cronExpression] = parsed;
-                        await bus.EVENT_PUBLISH({
-                          type: sub.eventType,
-                          cron: cronExpression,
-                        });
-                      }
-                    }),
-                  );
-                }
-              }
-
-              if (workflows?.length) {
-                const {
-                  connectionId: wfConnectionId,
-                  meshUrl,
-                  token,
-                } = getMeshCtx(input);
-                if (wfConnectionId && meshUrl) {
-                  await Workflow.sync(
-                    workflows,
-                    meshUrl,
-                    wfConnectionId,
-                    token,
-                  );
-                }
+              if (
+                onInstall &&
+                (input.context as { firstRun?: boolean }).firstRun
+              ) {
+                const { meshUrl, token, connectionId } = getMeshCtx(input);
+                await onInstall(input.runtimeContext.env, {
+                  createAgent: makeCreateAgent(meshUrl, token, connectionId),
+                  vault,
+                });
               }
 
               return Promise.resolve({});
@@ -690,100 +721,10 @@ const toolsFor = <TSchema extends ZodTypeAny = never>({
       execute: () => {
         return Promise.resolve({
           stateSchema: jsonSchema,
-          scopes: [
-            ...((scopes as string[]) ?? []),
-            ...(events ? [`${busProp}::EVENT_SYNC_SUBSCRIPTIONS`] : []),
-            ...(workflows?.length ? [...WORKFLOW_SCOPES] : []),
-          ],
+          scopes: [...((scopes as string[]) ?? [])],
         });
       },
     }),
-
-    // Auto-generated trigger tool for each declared workflow.
-    // Calls COLLECTION_WORKFLOW_EXECUTION_CREATE on the mesh and returns the
-    // execution ID immediately (fire-and-forget; poll with
-    // COLLECTION_WORKFLOW_EXECUTION_GET to track progress).
-    ...(workflows?.length
-      ? workflows.map((wf) => {
-          const id = wf.toolId ?? workflowToolId(wf.title);
-          const baseDescription = [
-            wf.description
-              ? `Run workflow: ${wf.description}`
-              : `Start the "${wf.title}" workflow.`,
-            "Returns an execution_id immediately. Use COLLECTION_WORKFLOW_EXECUTION_GET to track progress.",
-          ].join(" ");
-          return createTool({
-            id,
-            description: (() => {
-              if (!wf.inputSchema) return baseDescription;
-              const schemaStr = JSON.stringify(wf.inputSchema, null, 2);
-              return schemaStr.length <= 2048
-                ? `${baseDescription}\n\nInput schema:\n${schemaStr}`
-                : `${baseDescription}\n\nThis workflow expects structured input. Use COLLECTION_WORKFLOW_GET to inspect the full input schema.`;
-            })(),
-            inputSchema: z.object({
-              input: z
-                .record(z.string(), z.unknown())
-                .optional()
-                .describe(
-                  "Input data for the workflow. Steps reference these values via @input.field.",
-                ),
-              virtual_mcp_id: z
-                .string()
-                .optional()
-                .describe(
-                  wf.virtual_mcp_id
-                    ? `Virtual MCP ID to use for execution (defaults to "${wf.virtual_mcp_id}").`
-                    : "Virtual MCP ID that will execute the workflow steps.",
-                ),
-              start_at_epoch_ms: z
-                .number()
-                .int()
-                .min(0)
-                .optional()
-                .describe(
-                  "Unix timestamp (ms) for scheduled execution. Omit to start immediately.",
-                ),
-            }),
-            outputSchema: z.object({
-              execution_id: z
-                .string()
-                .describe("ID of the created workflow execution."),
-            }),
-            execute: async (input) => {
-              const { connectionId, meshUrl, token } = getMeshCtx(input);
-
-              if (!connectionId || !meshUrl) {
-                throw new Error(
-                  `[${id}] Missing MESH_REQUEST_CONTEXT (connectionId or meshUrl).`,
-                );
-              }
-
-              const ctx = input.context as {
-                input?: Record<string, unknown>;
-                virtual_mcp_id?: string;
-                start_at_epoch_ms?: number;
-              };
-
-              const virtualMcpId = ctx.virtual_mcp_id ?? wf.virtual_mcp_id;
-
-              const collectionId = Workflow.workflowId(connectionId, wf.title);
-              const executionId = await Workflow.createExecution(
-                meshUrl,
-                token,
-                {
-                  workflow_collection_id: collectionId,
-                  virtual_mcp_id: virtualMcpId,
-                  input: ctx.input,
-                  start_at_epoch_ms: ctx.start_at_epoch_ms,
-                },
-              );
-
-              return { execution_id: executionId };
-            },
-          });
-        })
-      : []),
   ];
 };
 
@@ -818,7 +759,6 @@ export const createMCPServer = <
     tools: CreatedTool[];
     prompts: CreatedPrompt[];
     resources: CreatedResource[];
-    workflows?: WorkflowDefinition[];
   };
 
   let cached: Registrations | null = null;
@@ -891,14 +831,7 @@ export const createMCPServer = <
           tools = await resolveArray<CreatedTool>(options.tools, bindings);
         }
 
-        const resolvedWorkflows =
-          typeof options.workflows === "function"
-            ? await options.workflows(bindings)
-            : options.workflows;
-
-        tools.push(
-          ...toolsFor<TSchema>({ ...options, workflows: resolvedWorkflows }),
-        );
+        tools.push(...toolsFor<TSchema>({ ...options }));
 
         let prompts: CreatedPrompt[];
         if (typeof options.prompts === "function") {
@@ -926,7 +859,6 @@ export const createMCPServer = <
           tools,
           prompts,
           resources,
-          workflows: resolvedWorkflows,
         };
         cached = result;
         return result;
@@ -945,6 +877,7 @@ export const createMCPServer = <
         tool.id,
         {
           _meta: tool._meta,
+          title: tool.title,
           description: tool.description,
           annotations: tool.annotations,
           // Pass the full ZodObject (not its `.shape`) so the SDK skips
@@ -1082,6 +1015,7 @@ export const createMCPServer = <
       },
       {
         capabilities: { tools: {}, prompts: {}, resources: {} },
+        jsonSchemaValidator: sharedJsonSchemaValidator,
         ...(instructions && { instructions }),
       },
     );

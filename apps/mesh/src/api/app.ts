@@ -8,10 +8,18 @@
  * - CORS support
  */
 
+import { readFileSync } from "node:fs";
+import { jetstreamManager } from "@nats-io/jetstream";
 import { getSettings } from "../settings";
+import {
+  kickPublicSetsBootSync,
+  registerPublicSetsSyncWorkflow,
+  setPublicSetsSyncRuntime,
+} from "../file-storage/dbos-public-sets-sync";
+import { getPublicUrl } from "@/core/server-constants";
 import { usesLocalObjectStorage } from "../tools/connection/dev-assets";
 import { DECO_STORE_URL, isDecoHostedMcp } from "@/core/deco-constants";
-import { WellKnownOrgMCPId } from "@decocms/mesh-sdk";
+import { createDecopilotThreadStatusEvent } from "@decocms/mesh-sdk";
 import { PrometheusSerializer } from "@opentelemetry/exporter-prometheus";
 import { Hono } from "hono";
 import { getCookie } from "hono/cookie";
@@ -21,12 +29,16 @@ import { auth } from "../auth";
 import { createMemberRoleCache } from "../auth/member-role-cache";
 import {
   ContextFactory,
-  createMeshContextFactory,
+  createStudioContextFactory,
 } from "../core/context-factory";
-import type { MeshContext } from "../core/mesh-context";
-import { closeDatabase, getDb, type MeshDatabase } from "../database";
-import { asDockerRunner, getSharedRunnerIfInit } from "../sandbox/lifecycle";
-import { createEventBus, type EventBus } from "../event-bus";
+import type { StudioContext } from "../core/studio-context";
+import { startSSEHub } from "../event-bus";
+import {
+  closeDatabase,
+  getDb,
+  type StudioDatabase,
+  withSslmode,
+} from "../database";
 import {
   flushMonitoringData,
   meter,
@@ -34,21 +46,34 @@ import {
   tracer,
   tracingMiddleware,
 } from "../observability";
+import { posthog } from "../posthog";
 import authRoutes from "./routes/auth";
 import { createSsoRoutes } from "./routes/org-sso";
 import { createDecopilotRoutes } from "./routes/decopilot";
 import { createDownstreamTokenRoutes } from "./routes/downstream-token";
 import {
+  DownstreamTokenStorage,
+  type DownstreamTokenData,
+} from "../storage/downstream-token";
+import { resolveOriginTokenEndpoint } from "../oauth/resolve-token-endpoint";
+import {
   createLogDeprecatedRoute,
   logDeprecatedRoute,
 } from "./middleware/log-deprecated-route";
+import { handleApiError } from "./error-handler";
 import { resolveOrgFromPath } from "./middleware/resolve-org-from-path";
 import { createOrgScopedApi } from "./routes/org-scoped";
+import {
+  type LinkBearerAuthApi,
+  resolveLinkBearer,
+} from "./routes/decopilot/link-bearer-auth";
+import { createLinkSessionRoutes } from "./routes/links/session";
 import { createVmEventsRoutes } from "./routes/vm-events";
 import {
   createDecoSitesOrgRoutes,
   createDecoSitesUserRoutes,
 } from "./routes/deco-sites";
+import { createDecoAppsRoutes } from "./routes/deco-apps";
 import { createVirtualMcpRoutes } from "./routes/virtual-mcp";
 import {
   createLegacyWellKnownProtectedResourceRoutes,
@@ -59,18 +84,16 @@ import {
 } from "./routes/oauth-proxy";
 import openaiCompatRoutes from "./routes/openai-compat";
 import { createProxyRoutes } from "./routes/proxy";
-import { createKVRoutes } from "./routes/kv";
 import { createTriggerCallbackRoutes } from "./routes/trigger-callback";
 import publicConfigRoutes from "./routes/public-config";
 import filesRoutes from "./routes/files";
 import { createThreadOutputsRoutes } from "./routes/thread-outputs";
 import { createSelfRoutes } from "./routes/self";
-import { shouldSkipMeshContext, SYSTEM_PATHS } from "./utils/paths";
 import {
-  mountPluginRoutes,
-  initializePluginStorage,
-  runPluginStartupHooks,
-} from "../core/plugin-loader";
+  isHealthPath,
+  shouldSkipStudioContext,
+  SYSTEM_PATHS,
+} from "./utils/paths";
 import { CredentialVault } from "../encryption/credential-vault";
 import type { CancelBroadcast } from "./routes/decopilot/cancel-broadcast";
 import {
@@ -82,49 +105,79 @@ import {
   setMcpListCache,
   type McpListCache,
 } from "../mcp-clients/mcp-list-cache";
+import { isMcpCacheEnabled } from "../mcp-clients/mcp-read-cache";
 import {
-  JetStreamKVModelListCache,
+  startMcpCacheInvalidation,
+  teardownMcpCacheInvalidation,
+} from "../mcp-clients/mcp-cache-invalidation";
+import {
+  type ConnectionCircuitStore,
+  JetStreamKVConnectionCircuitStore,
+  NoopConnectionCircuitStore,
+  setConnectionCircuitStore,
+} from "../mcp-clients/connection-circuit-store";
+import {
+  InMemoryModelListCache,
   type ModelListCache,
 } from "../ai-providers/model-list-cache";
+import {
+  createProviderKeyCache,
+  type ProviderKeyCache,
+} from "../storage/provider-key-cache";
 import { NatsCancelBroadcast } from "./routes/decopilot/nats-cancel-broadcast";
 import type { StreamBuffer } from "./routes/decopilot/stream-buffer";
 import { NatsStreamBuffer } from "./routes/decopilot/nats-stream-buffer";
+import {
+  createTunnelStatusProbe,
+  type LinkStatus,
+} from "../links/tunnel-status-probe";
+import { createTunnelDispatch } from "../links/tunnel-dispatch";
+import {
+  createTunnelControlPublisher,
+  createTunnelWorkPublisher,
+  type LinkWorkPublisher,
+} from "../links/tunnel-work-dispatch";
+import type { DispatchFn } from "../links/link-dispatch-types";
 import { RunRegistry } from "./routes/decopilot/run-registry";
 import type { RunReactorDeps } from "./routes/decopilot/run-reactor";
+import { emitTerminalThreadStatus } from "./routes/decopilot/thread-status-events";
 import { SqlThreadStorage } from "../storage/threads";
-import type { Thread } from "../storage/types";
+import { SqlAsyncResearchJobStorage } from "../storage/async-research-jobs";
+import { AsyncResearchJobSweeper } from "../storage/async-research-jobs-sweeper";
 import { registerMonitoringRetentionWorkflow } from "../monitoring/dbos-retention-workflow";
+import "../auth/install-studio-pack-workflow";
 import { cleanupOldMonitoringFiles } from "../monitoring/ndjson-retention";
 import { getLogsDir, getTracesDir, getMetricsDir } from "../monitoring/schema";
 import {
-  AUTOMATIONS_GATE_QUEUE,
-  AUTOMATIONS_GATE_PARTITION_CONCURRENCY,
-  AUTOMATIONS_GLOBAL_CONCURRENCY,
-  AUTOMATIONS_GLOBAL_QUEUE,
+  AUTOMATIONS_PARTITION_CONCURRENCY,
+  AUTOMATIONS_POLL_INTERVAL_MS,
+  AUTOMATIONS_QUEUE,
   AutomationEventDispatcher,
+  cleanupOrphanedOrgQueues,
   enqueueAutomationFire,
   fireAutomationNow,
   reconcileAutomationSchedules,
   setAutomationRuntime,
 } from "../automations";
 import {
+  HOSTED_HARNESS_PARTITION_CONCURRENCY,
+  HOSTED_HARNESS_QUEUE,
+  setHostedHarnessRuntime,
   setThreadGateRuntime,
   THREAD_GATE_PARTITION_CONCURRENCY,
   THREAD_GATE_QUEUE,
 } from "../dispatch-queue";
+import { setProjectorWorkflowRuntime } from "./routes/decopilot/projector-workflow";
+import { backfillStudioPackForAllOrgs } from "../auth/install-studio-pack-workflow";
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import { dispatchRunAndWait } from "./routes/decopilot/dispatch-run";
 import {
-  PersistedRunConfigSchema,
-  toModelsConfig,
-} from "./routes/decopilot/run-config";
-import { getPodId } from "../core/pod-identity";
-import { NatsPodHeartbeat } from "../nats/pod-heartbeat";
+  dispatchRunAndWait,
+  prepareLinkWorkDispatch,
+} from "./routes/decopilot/dispatch-run";
 import { createAutomationsStorage } from "../storage/automations";
 import { KyselyKVStorage } from "../storage/kv";
 import { KyselyTriggerCallbackTokenStorage } from "../storage/trigger-callback-tokens";
 import { createAutomationContextFactory } from "./routes/decopilot/automation-context";
-
 import type { Pool, PoolClient } from "pg";
 
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
@@ -166,8 +219,22 @@ function rejectAfter(ms: number): Promise<never> {
   );
 }
 
-// Track current event bus instance for cleanup during HMR
-let currentEventBus: EventBus | null = null;
+// Module-level singleton for the tunnel reverse-proxy `DispatchFn`.
+// Populated inside `createApp` once `natsProvider` is wired.
+let sharedProxyDispatch: DispatchFn | null = null;
+
+/**
+ * Return the shared tunnel reverse-proxy `DispatchFn`. Throws if `createApp`
+ * hasn't been called yet or no NATS connection is configured.
+ */
+export function getProxyDispatch(): DispatchFn {
+  if (!sharedProxyDispatch) {
+    throw new Error(
+      "getProxyDispatch() called before createApp() or without NATS — proxy dispatch unavailable",
+    );
+  }
+  return sharedProxyDispatch;
+}
 
 // Track decopilot strategy cleanup (abort active runs, stop strategies) during HMR
 let currentDecopilotCleanup: (() => void | Promise<void>) | null = null;
@@ -184,7 +251,7 @@ let currentDecopilotCleanup: (() => void | Promise<void>) | null = null;
  * @param organizationId - The organization ID to search for the registry connection
  */
 async function getDecoStoreProjectLocator(
-  ctx: MeshContext,
+  ctx: StudioContext,
   organizationId: string,
 ): Promise<string | null> {
   // Find registry connection by URL within the organization
@@ -412,16 +479,47 @@ const oauthProxyHandler: MiddlewareHandler<Env> = async (c) => {
   // For token endpoint, we may need to rewrite the 'resource' parameter in the body
   // (same reason as authorize: auth servers validate it's their actual endpoint)
   let requestBody: BodyInit | undefined;
+  // Capture client_id/client_secret from the token request so we can persist
+  // them server-side alongside the resulting access/refresh tokens. The DCR
+  // registration that minted these credentials happened in a prior request,
+  // so the body of /token is the only place we can read them on the proxy.
+  let capturedClientId: string | null = null;
+  let capturedClientSecret: string | null = null;
   if (c.req.method !== "GET" && c.req.method !== "HEAD") {
     if (
       endpoint === "token" &&
       contentType?.includes("application/x-www-form-urlencoded")
     ) {
+      // Per RFC 6749 §2.3.1, confidential clients may send credentials via
+      // HTTP Basic auth instead of the form body. Capture from the header
+      // first so the body parse below can still override when a client sends
+      // both — without this fallback, Basic-auth clients persist with a
+      // null clientId and become non-refreshable.
+      if (authorization?.toLowerCase().startsWith("basic ")) {
+        try {
+          const decoded = atob(authorization.slice(6).trim());
+          const colonIdx = decoded.indexOf(":");
+          if (colonIdx !== -1) {
+            // RFC 6749 §2.3.1: the credentials are form-urlencoded before
+            // being base64'd as the Basic value.
+            const id = decodeURIComponent(decoded.slice(0, colonIdx));
+            const secret = decodeURIComponent(decoded.slice(colonIdx + 1));
+            capturedClientId = id || null;
+            capturedClientSecret = secret || null;
+          }
+        } catch {
+          // Malformed Basic header — let origin reject the request.
+        }
+      }
       // Parse form body and rewrite resource if present
       const formData = await c.req.formData();
       if (formData.has("resource")) {
         formData.set("resource", connection.connection_url);
       }
+      const cidRaw = formData.get("client_id");
+      const csRaw = formData.get("client_secret");
+      if (typeof cidRaw === "string" && cidRaw) capturedClientId = cidRaw;
+      if (typeof csRaw === "string" && csRaw) capturedClientSecret = csRaw;
       // Convert back to URLSearchParams for form-urlencoded
       const params = new URLSearchParams();
       for (const [key, value] of formData.entries()) {
@@ -514,6 +612,62 @@ const oauthProxyHandler: MiddlewareHandler<Env> = async (c) => {
     }
   }
 
+  // For successful token exchanges (initial code-for-token and refresh_token
+  // grants), persist the token server-side immediately. This decouples the
+  // OAuth flow from the browser's session cookie state — the client used to
+  // POST the token back to /api/:org/connections/:id/oauth-token with
+  // cookie auth, which 401s when the popup's redirect chain leaves the
+  // parent's session in an inconsistent state.
+  if (endpoint === "token" && response.ok) {
+    const bodyText = await response.text();
+    try {
+      const parsed = JSON.parse(bodyText) as {
+        access_token?: unknown;
+        refresh_token?: unknown;
+        expires_in?: unknown;
+        scope?: unknown;
+      };
+      if (typeof parsed.access_token === "string" && parsed.access_token) {
+        const expiresAt =
+          typeof parsed.expires_in === "number"
+            ? new Date(Date.now() + parsed.expires_in * 1000)
+            : null;
+        // Prefer the origin's real token endpoint so future refreshes don't
+        // self-loop through the proxy.
+        let tokenEndpoint: string | null = null;
+        try {
+          tokenEndpoint =
+            (await resolveOriginTokenEndpoint(connection.connection_url)) ??
+            originEndpointUrl;
+        } catch {
+          tokenEndpoint = originEndpointUrl;
+        }
+        const tokenData: DownstreamTokenData = {
+          connectionId,
+          accessToken: parsed.access_token,
+          refreshToken:
+            typeof parsed.refresh_token === "string"
+              ? parsed.refresh_token
+              : null,
+          scope: typeof parsed.scope === "string" ? parsed.scope : null,
+          expiresAt,
+          clientId: capturedClientId,
+          clientSecret: capturedClientSecret,
+          tokenEndpoint,
+        };
+        const tokenStorage = new DownstreamTokenStorage(ctx.db, ctx.vault);
+        await tokenStorage.upsert(tokenData);
+      }
+    } catch (err) {
+      console.error("[oauth-proxy] failed to persist downstream token:", err);
+    }
+    return new Response(bodyText, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders,
+    });
+  }
+
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -522,33 +676,17 @@ const oauthProxyHandler: MiddlewareHandler<Env> = async (c) => {
 };
 
 /**
- * Publish a public event for an org.
- * Resolves the org from `ctx.organization.id` (set by `resolveOrgFromPath`
- * on the `/api/:org/...` mount) or, when missing, from the legacy
- * `:organizationId` path param.
- */
-const eventsHandler: MiddlewareHandler<Env> = async (c) => {
-  const ctx = c.var.meshContext;
-  const orgId = ctx.organization?.id ?? c.req.param("organizationId");
-  if (!orgId) {
-    return c.json({ error: "organization id missing" }, 400);
-  }
-  await ctx.eventBus.publish(orgId, WellKnownOrgMCPId.SELF(orgId), {
-    data: await c.req.json(),
-    type: `public:${c.req.param("type")}`,
-    subject: c.req.query("subject"),
-    deliverAt: c.req.query("deliverAt"),
-    cron: c.req.query("cron"),
-  });
-  return c.json({ success: true });
-};
-
-/**
  * SSE events endpoint — streams events for an organization in real time.
  * Resolves the org from `ctx.organization.id` (set by `resolveOrgFromPath`
- * on the `/api/:org/events` mount). Auth is required.
+ * on the `/api/:org/watch` mount). Auth is required.
+ *
+ * On connect, emits in order:
+ *   1. `event: connected` — listener metadata
+ *   2. Live events from the SSE hub.
+ *
+ * Clients use `COLLECTION_THREADS_LIST` for their initial state.
  */
-const watchHandler: MiddlewareHandler<Env> = async (c) => {
+export const watchHandler: MiddlewareHandler<Env> = async (c) => {
   const meshContext = c.var.meshContext;
 
   // Require authentication (user session or API key)
@@ -652,6 +790,12 @@ import { Env } from "./hono-env";
 import { devLogger } from "./utils/dev-logger";
 import { streamSSE } from "hono/streaming";
 import { type SSEEvent, sseHub } from "../event-bus";
+import {
+  BACKGROUND_TOOLS_PARTITION_CONCURRENCY,
+  BACKGROUND_TOOLS_QUEUE,
+  setBackgroundToolRuntime,
+} from "@/harnesses/decopilot/background-tool-workflow";
+import { abortBackgroundJobs } from "@/harnesses/decopilot/background-abort-registry";
 const getHandleOAuthProtectedResourceMetadata = () =>
   oAuthProtectedResourceMetadata(auth);
 const getHandleOAuthDiscoveryMetadata = () => oAuthDiscoveryMetadata(auth);
@@ -671,9 +815,9 @@ interface ResourceServerMetadata {
  */
 export interface CreateAppOptions {
   /** Custom database instance (for testing) */
-  database?: MeshDatabase;
-  /** Custom event bus instance (for testing) */
-  eventBus?: EventBus;
+  database?: StudioDatabase;
+  /** Skip NATS wiring and use local-only no-op stubs (for testing) */
+  disableNats?: boolean;
 }
 
 /**
@@ -684,48 +828,47 @@ export async function createApp(options: CreateAppOptions = {}) {
   const database = options.database ?? getDb();
   let isShuttingDown = false;
 
-  // Stop any existing event bus worker and SSE hub (cleanup during HMR)
-  if (currentEventBus && currentEventBus.isRunning()) {
-    // Fire and forget - don't block app creation
-    // The stop is mostly synchronous, async part is just UNLISTEN cleanup
-    Promise.resolve(currentEventBus.stop()).catch((error) => {
-      console.error("[EventBus] Error stopping previous worker:", error);
-    });
-    sseHub.stop().catch((error) => {
-      console.error(
-        "[SSEHub] Error stopping previous broadcast (HMR cleanup):",
-        error,
-      );
-    });
-  }
+  // Stop any existing SSE hub broadcast (cleanup during HMR). No-op if not started.
+  sseHub.stop().catch((error) => {
+    console.error(
+      "[SSEHub] Error stopping previous broadcast (HMR cleanup):",
+      error,
+    );
+  });
 
-  let eventBus: EventBus;
-  let mcpListCache: McpListCache;
-  let modelListCache: ModelListCache;
+  let mcpListCache: McpListCache | null;
+  let connectionCircuitStore: ConnectionCircuitStore;
+  // Model lists are public, low-stakes metadata cached per-replica with a TTL —
+  // no NATS needed, so this is shared across the test and production branches.
+  const modelListCache: ModelListCache = new InMemoryModelListCache();
+  // Provider-key resolve cache. The NATS connection is wired in the production
+  // branch below; without it the cache runs local-only (TTL still applies),
+  // which is what the test/no-NATS branch wants.
+  let providerKeyCache: ProviderKeyCache;
   let cancelBroadcast: CancelBroadcast;
   let streamBuffer: StreamBuffer;
+  let linkStatusProbe: ReturnType<typeof createTunnelStatusProbe> | undefined;
+  let linkWorkPublisher: LinkWorkPublisher | undefined;
   let natsProvider: NatsConnectionProvider | null = null;
 
-  if (options.eventBus) {
-    // Test mode: use provided event bus and no-op stubs (no NATS required)
-    eventBus = options.eventBus;
+  if (options.disableNats) {
+    // Test mode: no-op stubs (no NATS required)
+    // Local-only (no NATS): cross-replica broadcast is a no-op, TTL still applies.
+    providerKeyCache = createProviderKeyCache();
     mcpListCache = {
       get: async () => null,
       set: async () => {},
       invalidate: async () => {},
       teardown: () => {},
     };
-    modelListCache = {
-      get: async () => null,
-      set: async () => {},
-      invalidate: async () => {},
-      teardown: () => {},
-    };
+    connectionCircuitStore = new NoopConnectionCircuitStore();
     cancelBroadcast = {
       start: async () => {},
       broadcast: () => {},
+      publishControlFrame: () => {},
       stop: async () => {},
     };
+    linkWorkPublisher = undefined;
     streamBuffer = {
       init: async () => {},
       // Test/no-NATS stub: drain the stream so `createUIMessageStream`'s
@@ -747,6 +890,14 @@ export async function createApp(options: CreateAppOptions = {}) {
           }
         })();
       },
+      // No-NATS stub: there is no durable subject to commit to, so signal
+      // "unavailable" (false) — the publish-then-consume ingest must not
+      // advance its ack cursor when the chunk wasn't actually persisted.
+      publishRawChunk: async () => false,
+      // No-NATS stub: no durable done marker to publish, so signal
+      // "unavailable" (false) — the caller must not treat the run as handed
+      // off to the projector.
+      publishDone: async () => false,
       createTailStream: async () => null,
       purge: () => {},
       teardown: () => {},
@@ -754,19 +905,42 @@ export async function createApp(options: CreateAppOptions = {}) {
   } else {
     // Production/dev mode: connect to NATS (required)
     natsProvider = createNatsConnectionProvider();
-    natsProvider.init(getSettings().natsUrls);
+    // Optional cluster creds: local dev runs NATS in operator mode (anonymous
+    // connect is impossible there), so ensure-services persists a cluster creds
+    // file and points NATS_CREDS at it. Absent (production) → anonymous connect.
+    const credsPath = getSettings().natsCredsPath;
+    let creds: string | undefined;
+    if (credsPath) {
+      try {
+        creds = readFileSync(credsPath, "utf8");
+      } catch (err) {
+        console.error(
+          `[app] failed to read NATS_CREDS at ${credsPath}; connecting anonymously`,
+          err,
+        );
+      }
+    }
+    natsProvider.init(getSettings().natsUrls, creds ? { creds } : undefined);
 
-    const tlc = new JetStreamKVMcpListCache({
-      getJetStream: () => natsProvider!.getJetStream(),
-    });
-    tlc.init().catch(() => {});
+    // Cross-pod MCP list cache is gated by the same flag as the read cache.
+    // When disabled, leave mcpListCache null so getMcpListCache() callers fetch live.
+    const tlc = isMcpCacheEnabled()
+      ? new JetStreamKVMcpListCache({
+          getJetStream: () => natsProvider!.getJetStream(),
+        })
+      : null;
+    tlc?.init().catch(() => {});
     mcpListCache = tlc;
 
-    const mlc = new JetStreamKVModelListCache({
+    const ccs = new JetStreamKVConnectionCircuitStore({
       getJetStream: () => natsProvider!.getJetStream(),
     });
-    mlc.init().catch(() => {});
-    modelListCache = mlc;
+    ccs.init().catch(() => {});
+    connectionCircuitStore = ccs;
+
+    providerKeyCache = createProviderKeyCache({
+      getConnection: () => natsProvider!.getConnection(),
+    });
 
     cancelBroadcast = new NatsCancelBroadcast({
       getConnection: () => natsProvider!.getConnection(),
@@ -777,33 +951,63 @@ export async function createApp(options: CreateAppOptions = {}) {
       getJetStream: () => natsProvider!.getJetStream(),
     });
 
-    eventBus = createEventBus(database, natsProvider);
+    linkStatusProbe = createTunnelStatusProbe({
+      getConnection: () => natsProvider!.getConnection(),
+    });
+
+    linkWorkPublisher = createTunnelWorkPublisher({
+      getConnection: () => natsProvider!.getConnection(),
+    });
+    const tunnelControlPublisher = createTunnelControlPublisher({
+      getConnection: () => natsProvider!.getConnection(),
+    });
+    const natsCancelBroadcast = cancelBroadcast;
+    cancelBroadcast = {
+      start: (onCancel) => natsCancelBroadcast.start(onCancel),
+      broadcast: (taskId) => natsCancelBroadcast.broadcast(taskId),
+      publishControlFrame: (userSub, frame) => {
+        void tunnelControlPublisher
+          .publishControlFrame(userSub, frame)
+          .catch((err) => {
+            console.warn(
+              "[TunnelControl] publishControlFrame failed (non-critical):",
+              err,
+            );
+          });
+      },
+      stop: () => natsCancelBroadcast.stop(),
+    };
+
+    startSSEHub(natsProvider);
 
     // When NATS connects, (re-)initialize all deferred consumers
     natsProvider.onReady(() => {
-      tlc.init().catch((err: unknown) => {
+      tlc?.init().catch((err: unknown) => {
         console.error("[McpListCache] Deferred init failed:", err);
       });
-      mlc.init().catch((err: unknown) => {
-        console.error("[ModelListCache] Deferred init failed:", err);
+      ccs.init().catch((err: unknown) => {
+        console.error("[ConnectionCircuitStore] Deferred init failed:", err);
       });
+      // Subscribe to cross-replica key invalidations (idempotent).
+      providerKeyCache.start();
+      // Subscribe to cross-replica MCP read/result cache invalidations.
+      startMcpCacheInvalidation(() => natsProvider!.getConnection());
+      // `streamBuffer.init()` CREATES the DECOPILOT_STREAMS JetStream stream.
       streamBuffer.init().catch((err: unknown) => {
         console.warn(
-          "[StreamBuffer] Deferred init failed, late-join disabled:",
+          "[Decopilot] StreamBuffer init failed (late-join disabled):",
           err,
         );
       });
     });
   }
 
-  // Track for cleanup during HMR
-  currentEventBus = eventBus;
-
   // Decopilot strategy cleanup on HMR / shutdown
   if (currentDecopilotCleanup) await currentDecopilotCleanup();
 
   // Set tool list cache after cleanup to avoid previous cleanup nulling the new cache
   setMcpListCache(mcpListCache);
+  setConnectionCircuitStore(connectionCircuitStore);
 
   const threadStorage = new SqlThreadStorage(database.db);
 
@@ -813,11 +1017,28 @@ export async function createApp(options: CreateAppOptions = {}) {
     sseHub,
   };
 
-  const POD_ID = getPodId();
-  const runRegistry = new RunRegistry(cancelReactorDeps, POD_ID);
+  const runRegistry = new RunRegistry(cancelReactorDeps);
+
+  // Shared async-research-job storage — used both by the background
+  // sweeper and by the automation context factory below, which rebinds it
+  // with the right org for dispatched runs (without that rebind, the
+  // web_search tool throws on its first call).
+  const asyncResearchJobStorage = new SqlAsyncResearchJobStorage(database.db);
+
+  // Background sweeper for the async_research_jobs table. Marks rows that
+  // have been stuck in pending/polling longer than the staleness window as
+  // 'abandoned' so they show up in audit queries instead of silently rotting.
+  const asyncResearchJobSweeper = new AsyncResearchJobSweeper(
+    asyncResearchJobStorage,
+  );
+  asyncResearchJobSweeper.start();
 
   cancelBroadcast
     .start((taskId) => {
+      // Abort any in-flight background-tool work (e.g. generate_image) on this
+      // pod before cancelling the live turn — the work runs on whichever pod
+      // dequeued the DBOS job, which this NATS fan-out reaches.
+      abortBackgroundJobs(taskId);
       runRegistry.execute({ type: "CANCEL", taskId }).catch((err) => {
         console.error("[Decopilot] CancelBroadcast execute failed:", err);
       });
@@ -839,45 +1060,19 @@ export async function createApp(options: CreateAppOptions = {}) {
     );
   });
 
-  // Per-pod heartbeat via NATS KV (only when NATS is available)
-  let podHeartbeat: NatsPodHeartbeat | null = null;
-  if (natsProvider) {
-    podHeartbeat = new NatsPodHeartbeat({
-      getConnection: () => natsProvider!.getConnection(),
-      getJetStream: () => natsProvider!.getJetStream(),
-    });
-
-    // Attempt immediate init (may no-op if NATS not ready)
-    podHeartbeat
-      .init()
-      .then(() => {
-        podHeartbeat!.start(POD_ID);
-      })
-      .catch(() => {});
-
-    // Re-init when NATS connects
-    natsProvider.onReady(() => {
-      podHeartbeat!
-        .init()
-        .then(() => {
-          podHeartbeat!.start(POD_ID);
-        })
-        .catch((err: unknown) => {
-          console.error("[PodHeartbeat] Deferred init failed:", err);
-        });
-    });
-  }
-
   currentDecopilotCleanup = async () => {
-    // Delete KV key first → watcher fires on other pods → immediate handoff
-    await podHeartbeat?.stop();
     await runRegistry.stopAll();
     runRegistry.dispose();
+    asyncResearchJobSweeper.dispose();
     cancelBroadcast.stop().catch(() => {});
     streamBuffer.teardown();
-    mcpListCache.teardown();
+    mcpListCache?.teardown();
     modelListCache.teardown();
+    providerKeyCache.teardown();
+    teardownMcpCacheInvalidation();
+    connectionCircuitStore.teardown();
     setMcpListCache(null);
+    setConnectionCircuitStore(null);
   };
 
   const app = new Hono<Env>();
@@ -919,6 +1114,13 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   app.use("*", async (c, next) => {
     await next();
+    // Org-scoped /files/* and org-fs /fs/:volume/read serve user content
+    // (HTML pages written by the web-developer agent, uploaded images,
+    // thread outputs, etc.) that we deliberately iframe back into the app
+    // (pages preview, FileTab). Same-origin only — auth middleware still
+    // gates access — and consumers are expected to sandbox the iframe.
+    if (c.req.path.includes("/files/")) return;
+    if (c.req.path.includes("/fs/") && c.req.path.endsWith("/read")) return;
     c.header("X-Frame-Options", "DENY");
     c.header("Content-Security-Policy", "frame-ancestors 'none'");
   });
@@ -930,6 +1132,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // Log response body for 5xx errors
   app.use("*", async (c, next) => {
     await next();
+    if (isHealthPath(c.req.path)) return;
     if (c.res.status >= 500) {
       const clonedRes = c.res.clone();
       const body = await clonedRes.text();
@@ -943,6 +1146,17 @@ export async function createApp(options: CreateAppOptions = {}) {
   // ============================================================================
   // Health Check & Metrics
   // ============================================================================
+
+  // AWS NLB target-group health check (path "/health"). Cheap — no DB/NATS
+  // probe — but flips to 503 during shutdown so the load balancer stops routing
+  // to a draining pod. Without an explicit route this falls through to the SPA
+  // handler and returns 200 forever, hiding shutdown from the NLB.
+  app.get(SYSTEM_PATHS.HEALTH, (c) => {
+    if (isShuttingDown) {
+      return c.json({ status: "shutting_down" }, 503);
+    }
+    return c.json({ status: "ok" });
+  });
 
   // Liveness probe — the process is alive and the event loop is not stuck
   app.get(SYSTEM_PATHS.HEALTH_LIVE, (c) => {
@@ -1027,7 +1241,21 @@ export async function createApp(options: CreateAppOptions = {}) {
   // mounted via `createOrgScopedApi` below.
   const legacyWellKnownProtectedResource =
     createLegacyWellKnownProtectedResourceRoutes();
-  legacyWellKnownProtectedResource.use("*", logDeprecatedRoute);
+  // Scope the deprecation log to the two specific legacy paths this sub-app
+  // owns, NOT `use("*", ...)`. Because this sub-app is mounted at `/`, a
+  // wildcard middleware fires for every request to the root app — and the
+  // suppression logic in `log-deprecated-route.ts` can't reliably tell
+  // root-app handlers (e.g. `/api/links/heartbeat`) apart from this
+  // sub-app's handlers via basePath alone. Pinning the middleware to the
+  // actual deprecated patterns avoids the false-positive entirely.
+  legacyWellKnownProtectedResource.use(
+    "/.well-known/oauth-protected-resource/mcp/:connectionId",
+    logDeprecatedRoute,
+  );
+  legacyWellKnownProtectedResource.use(
+    "/mcp/:connectionId/.well-known/oauth-protected-resource",
+    logDeprecatedRoute,
+  );
   app.route("/", legacyWellKnownProtectedResource);
 
   // Well-known *prefix* discovery for the new org-scoped server URL shape.
@@ -1090,13 +1318,13 @@ export async function createApp(options: CreateAppOptions = {}) {
   );
 
   // ============================================================================
-  // MeshContext Injection Middleware
+  // StudioContext Injection Middleware
   // ============================================================================
 
   // Create context factory with the provided database and event bus
-  // Context factory only needs the Kysely instance, not the full MeshDatabase
+  // Context factory only needs the Kysely instance, not the full StudioDatabase
   const memberRoleCache = createMemberRoleCache({ ttlMs: 2 * 60 * 1000 });
-  const factory = await createMeshContextFactory({
+  const factory = await createStudioContextFactory({
     db: database.db,
     auth,
     encryption: {
@@ -1106,38 +1334,23 @@ export async function createApp(options: CreateAppOptions = {}) {
       tracer,
       meter,
     },
-    eventBus,
     modelListCache,
+    providerKeyCache,
     memberRoleCache,
+    linkStatusProbe,
+    publishLinkControlFrame: (userSub, frame) =>
+      cancelBroadcast.publishControlFrame(userSub, frame),
   });
   ContextFactory.set(factory);
 
-  // Initialize plugin storage BEFORE starting the event bus, because the
-  // startup hooks (runPluginStartupHooks) need storage to be ready and they
-  // run as soon as eventBus.start() resolves — which can happen during any
-  // `await` between here and where initializePluginStorage used to live.
+  // Credential vault — shared by the Private Registry public routes (mounted
+  // below).
   const vault = new CredentialVault(getSettings().encryptionKey);
-  initializePluginStorage(database.db, vault);
 
-  // Start the event bus worker (async - resets stuck deliveries from previous crashes)
-  // Then run plugin startup hooks (e.g., recover stuck workflow executions)
-  // Random jitter (0-2s) prevents all pods from hitting the DB simultaneously
-  // after a deployment causes simultaneous restarts.
-  const startupJitterMs = Math.random() * 2000;
-  new Promise((r) => setTimeout(r, startupJitterMs))
-    .then(() => eventBus.start())
-    .then(() => {
-      // db is typed as `any` to avoid Kysely version mismatch issues between packages
-      return runPluginStartupHooks({
-        db: database.db as any,
-        publish: async (organizationId, event) => {
-          await eventBus.publish(organizationId, "", event);
-        },
-      });
-    })
-    .catch((error) => {
-      console.error("[EventBus] Error during startup:", error);
-    });
+  // Public skill sets: synced by a DBOS scheduled workflow (one pod per tick
+  // instead of every pod racing its own loop). This only stashes deps — the
+  // workflow no-ops when ORGFS_PUBLIC_SETS is unset.
+  setPublicSetsSyncRuntime({ db: database.db, baseUrl: getPublicUrl() });
 
   // ============================================================================
   // Automation Runtime — wire storage + streaming into the DBOS workflow
@@ -1150,31 +1363,199 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   const automationContextFactory = createAutomationContextFactory({
     db: database.db,
-    threadStorage,
   });
 
   // Stash deps for the DBOS workflow body. Safe to call before DBOS.launch():
   // it only writes a module-level pointer, no DBOS API calls.
   // The actual dispatch (and its dispatch-run deps) lives on the thread-gate
-  // runtime now — automations hand off via `awaitThreadRun`.
+  // runtime now — automations invoke its shared `runDispatchSteps` body.
   setAutomationRuntime({
     storage: automationsStorage,
     meshContextFactory: automationContextFactory,
   });
 
-  // Same deps shape as automations — the per-thread gate calls
-  // `dispatchRunAndWait` once the queue lets a message through. Wiring
-  // happens before `DBOS.launch()` for the same reasons.
+  // The per-thread gate now STARTS the run (hosted: fire-and-forget enqueue of
+  // the hosted-harness child; desktop: publish the work item) and lets the
+  // consume step write terminal status. It no longer runs the agent loop itself,
+  // so it no longer needs a `dispatchRunFn` or a status-poll cap. Wiring happens
+  // before `DBOS.launch()` for the same reasons as automations.
   setThreadGateRuntime({
+    meshContextFactory: automationContextFactory,
+    deps: {
+      runRegistry,
+      cancelBroadcast,
+      streamBuffer,
+      sseHub,
+    },
+    // Desktop downstream dispatch is tunnel-only. Test/no-NATS setups leave
+    // `workPublisher` undefined, so user-desktop targets fall back to the
+    // hosted path instead of trying to publish desktop work.
+    prepareLinkWorkFn: prepareLinkWorkDispatch,
+    workPublisher: linkWorkPublisher,
+  });
+
+  // Hosted (in-process) agent-loop runtime — the thread gate's
+  // `dispatchRunAndWaitStep` now enqueues `hostedHarnessWorkflow` fire-and-forget
+  // onto HOSTED_HARNESS_QUEUE instead of running inline. Wired here before
+  // `DBOS.launch()` (it only sets a module-level pointer, no DBOS API calls),
+  // mirroring the thread-gate runtime. The gate immediately proceeds to its
+  // consume step, which writes terminal status for both hosted and desktop runs.
+  setHostedHarnessRuntime({
     dispatchRunFn: dispatchRunAndWait,
     meshContextFactory: automationContextFactory,
-    deps: { runRegistry, cancelBroadcast, streamBuffer },
+    deps: {
+      runRegistry,
+      cancelBroadcast,
+      streamBuffer,
+      sseHub,
+    },
+  });
+
+  // Durable projector workflow runtime — the SOLE v2 DB writer (parts + title +
+  // terminal status). Consumed by the consume-run-projection step which
+  // reconstructs the run from file-backed JetStream and writes durably to the
+  // database. Wired before `DBOS.launch()` for the same reason as
+  // automations/thread-gate: it only sets a module-level pointer.
+  const projectorThreadStorage = new SqlThreadStorage(database.db);
+  setProjectorWorkflowRuntime({
+    getJetStream: () => natsProvider?.getJetStream() ?? null,
+    getJetStreamManager: async () => {
+      const nc = natsProvider?.getConnection();
+      return nc ? await jetstreamManager(nc) : null;
+    },
+    messageParts: projectorThreadStorage.messageParts(),
+    resolveRun: async (runId: string) => {
+      const row = await database.db
+        .selectFrom("threads")
+        .select([
+          "organization_id",
+          "created_by",
+          "message_storage_version",
+          "status",
+          "run_fence_token",
+          "title",
+        ])
+        .where("id", "=", runId)
+        .executeTakeFirst();
+      return row
+        ? {
+            orgId: row.organization_id,
+            createdBy: row.created_by,
+            version: row.message_storage_version ?? 1,
+            status: row.status,
+            runFenceToken: row.run_fence_token,
+            title: row.title ?? null,
+          }
+        : null;
+    },
+    completeRunIfNotCompleted: async (runId, orgId) => {
+      const flipped = await projectorThreadStorage.completeRunIfNotCompleted(
+        runId,
+        orgId,
+      );
+      // Push the terminal status to the org SSE so the sidebar chip updates
+      // live. user-desktop runs finalize here (not via the run-reactor), so
+      // without this the chip stays "running" until a refetch. `flipped` is
+      // null on a no-op (already terminal) → no double-publish.
+      emitTerminalThreadStatus(sseHub, orgId, runId, flipped);
+      return flipped;
+    },
+    markRunRequiresAction: async (runId, orgId) => {
+      const flipped = await projectorThreadStorage.requiresActionIfInProgress(
+        runId,
+        orgId,
+      );
+      emitTerminalThreadStatus(sseHub, orgId, runId, flipped);
+      return flipped;
+    },
+    markRunFailed: async (runId, orgId, reason, kind) => {
+      const flipped = await projectorThreadStorage.markRunFailed(
+        runId,
+        orgId,
+        reason,
+        kind,
+      );
+      emitTerminalThreadStatus(sseHub, orgId, runId, flipped);
+      return flipped;
+    },
+    persistTitle: (runId, orgId, title) =>
+      projectorThreadStorage.update(runId, orgId, { title }),
+    onTitleUpdated: async ({ runId, orgId, title }) => {
+      const row = await projectorThreadStorage
+        .get(runId, orgId)
+        .catch(() => null);
+      sseHub.emit(
+        orgId,
+        createDecopilotThreadStatusEvent(runId, row?.status ?? "in_progress", {
+          title,
+          virtualMcpId: row?.virtual_mcp_id ?? undefined,
+          createdBy: row?.created_by,
+          triggerId: row?.trigger_id,
+          branch: row?.branch ?? null,
+          createdAt: row?.created_at,
+          updatedAt: row?.updated_at,
+        }),
+      );
+    },
+    bumpProgress: async ({ runId, orgId }) => {
+      await projectorThreadStorage.bumpProgress(runId, orgId);
+    },
+    recordCompleted: async ({ runId, orgId, distinctId, usage }) => {
+      posthog.capture({
+        distinctId,
+        event: "chat_message_completed",
+        groups: { organization: orgId },
+        properties: {
+          organization_id: orgId,
+          thread_id: runId,
+          transport: "projector",
+          input_tokens: usage.inputTokens,
+          output_tokens: usage.outputTokens,
+          total_tokens: usage.totalTokens,
+        },
+      });
+    },
+    recordFailed: async ({ runId, orgId, distinctId, reason, kind }) => {
+      posthog.capture({
+        distinctId,
+        event: "chat_message_failed",
+        groups: { organization: orgId },
+        properties: {
+          organization_id: orgId,
+          thread_id: runId,
+          transport: "projector",
+          error_category: kind,
+          error_message: reason,
+        },
+      });
+    },
+    // Cleanup is owned by the workflow's success path now (after the run is
+    // projected + completed). The fence token is part of the runtime contract
+    // but unused here — the stream subject is keyed by runId only.
+    purgeRun: async (runId) => {
+      streamBuffer.purge(runId);
+    },
+  });
+
+  // Background-tool jobs reuse the same mesh-context factory to rebuild the
+  // org context + re-resolve models on whatever pod runs the job. Wired before
+  // DBOS.launch() like the others (module-level pointer, no DBOS API calls).
+  setBackgroundToolRuntime({
+    meshContextFactory: automationContextFactory,
+    systemDatabaseUrl: withSslmode(
+      getSettings().databaseUrl,
+      getSettings().databasePgSsl,
+    ),
+    // A backgrounded subtask publishes its live run to `decopilot.stream.<jobId>`
+    // through this buffer (off the thread's own stream).
+    streamBuffer,
   });
 
   // Must run before DBOS.launch() (which fires in index.ts after createApp).
   registerMonitoringRetentionWorkflow();
+  registerPublicSetsSyncWorkflow();
 
-  const automationRunner: MeshContext["automationRunner"] = async (
+  const automationRunner: StudioContext["automationRunner"] = async (
     automationId,
     orgId,
     _userId,
@@ -1189,7 +1570,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   };
 
   // ============================================================================
-  // Automation Event Dispatcher — wire automations into the event bus
+  // Automation Event Dispatcher — fires automations from trigger callbacks
   // ============================================================================
 
   const automationEventDispatcher = new AutomationEventDispatcher(
@@ -1206,121 +1587,11 @@ export async function createApp(options: CreateAppOptions = {}) {
       ),
   );
 
-  // Inject into the event bus worker so processed events trigger automations.
-  // The cast is needed because the EventBus interface doesn't expose this
-  // integration point — it lives on the concrete implementation only.
-  if ("setAutomationEventDispatcher" in eventBus) {
-    (
-      eventBus as unknown as {
-        setAutomationEventDispatcher: (
-          dispatcher: AutomationEventDispatcher,
-        ) => void;
-      }
-    ).setAutomationEventDispatcher(automationEventDispatcher);
-  }
-
-  // ============================================================================
-  // Crash Recovery — resume orphaned automation runs after rolling deploy
-  // ============================================================================
-
-  /** Shared resume function for both startup recovery and pod-death watcher. */
-  const resumeOrphanedThread = async (thread: Thread) => {
-    const parsed = PersistedRunConfigSchema.safeParse(thread.run_config);
-    if (!parsed.success) {
-      console.warn(
-        `[recovery] Invalid run_config for ${thread.id}, force-failing`,
-      );
-      await threadStorage.forceFailIfInProgress(
-        thread.id,
-        thread.organization_id,
-      );
-      return;
-    }
-    const config = parsed.data;
-
-    // Build context for the original user
-    const resumeCtx = await automationContextFactory(
-      thread.organization_id,
-      thread.created_by,
-    );
-    if (!resumeCtx) {
-      console.warn(
-        `[recovery] Cannot build context for ${thread.id}, force-failing`,
-      );
-      await threadStorage.forceFailIfInProgress(
-        thread.id,
-        thread.organization_id,
-      );
-      return;
-    }
-
-    // Audit trail: record that this run was auto-resumed
-    const now = new Date().toISOString();
-    await threadStorage.saveMessages(
-      [
-        {
-          id: crypto.randomUUID(),
-          thread_id: thread.id,
-          role: "system",
-          parts: [
-            {
-              type: "text",
-              text: "Run resumed automatically after infrastructure restart.",
-            },
-          ],
-          metadata: undefined,
-          created_at: now,
-          updated_at: now,
-        },
-      ],
-      thread.organization_id,
-    );
-
-    // Pod-death recovery: a different pod's run was claimed by us. Drain
-    // synchronously to know when the run completes server-side. We
-    // deliberately don't pass a streamBuffer here — this background
-    // recovery is the safety net for threads no DBOS replay or attached
-    // client picks up; clients reconnecting via /stream see the run via
-    // the workflow's own JetStream pump on the pod that DBOS replayed it
-    // onto.
-    await dispatchRunAndWait(
-      {
-        messages: [],
-        models: toModelsConfig(config.models),
-        agent: config.agent,
-        temperature: config.temperature,
-        toolApprovalLevel: config.toolApprovalLevel,
-        mode: config.mode,
-        organizationId: thread.organization_id,
-        userId: thread.created_by,
-        taskId: thread.id,
-        windowSize: config.windowSize,
-        isResume: true,
-      },
-      resumeCtx,
-      { runRegistry, cancelBroadcast },
-    );
-  };
-
-  // Wire pod death watcher → orphan recovery
-  if (podHeartbeat) {
-    podHeartbeat.onPodDeath((deadPodId) => {
-      runRegistry
-        .handlePodDeath(deadPodId, resumeOrphanedThread, cancelBroadcast)
-        .catch((err) => {
-          console.error(
-            `[Decopilot] Pod death recovery failed for ${deadPodId}:`,
-            err,
-          );
-        });
-    });
-  }
-
-  setTimeout(() => {
-    runRegistry.recoverOrphanedRuns(resumeOrphanedThread).catch((err) => {
-      console.error("[recovery] Orphan recovery failed:", err);
-    });
-  }, 10_000); // 10s grace for rolling deploys
+  // Orphan/crash recovery is owned by the external DBOS Conductor now: it
+  // recovers a dead executor's PENDING workflows (incl. the thread-gate
+  // workflows backing decopilot runs) onto a live executor. Mesh no longer
+  // runs its own boot sweep or pod-death recovery. The reaper (RunRegistry)
+  // still force-fails runs with no progress as a zombie backstop.
 
   // NDJSON monitoring retention cleanup runs as a DBOS scheduled workflow
   // (see `initDbos` below). Kick off a single eager sweep at boot so a fresh
@@ -1349,10 +1620,10 @@ export async function createApp(options: CreateAppOptions = {}) {
   cleanupExpiredApiKeys();
   setInterval(cleanupExpiredApiKeys, 24 * 60 * 60 * 1000).unref();
 
-  // Inject MeshContext into requests
-  // Skip auth routes, static files, health check, and metrics - they don't need MeshContext
+  // Inject StudioContext into requests
+  // Skip auth routes, static files, health check, and metrics - they don't need StudioContext
   app.use("*", async (c, next) => {
-    if (shouldSkipMeshContext(c.req.path)) {
+    if (shouldSkipStudioContext(c.req.path)) {
       return next();
     }
 
@@ -1421,7 +1692,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       return next();
     }
 
-    const ctx = c.get("meshContext") as MeshContext | undefined;
+    const ctx = c.get("meshContext") as StudioContext | undefined;
     if (!ctx?.organization?.id || !ctx?.auth?.user?.id) {
       return next();
     }
@@ -1451,7 +1722,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // Legacy mount at /api/org-sso with deprecation log; the new
   // /api/:org/org-sso mount is wired in a later task.
   const legacyOrgSso = new Hono<{
-    Variables: { meshContext: MeshContext };
+    Variables: { meshContext: StudioContext };
   }>();
   legacyOrgSso.use(
     "*",
@@ -1546,17 +1817,77 @@ export async function createApp(options: CreateAppOptions = {}) {
     cancelBroadcast,
     streamBuffer,
     runRegistry,
+    linkStatusProbe,
   });
   app.route("/api", decopilotRoutes);
 
-  // Stable file redirect endpoint (resolves mesh-storage: URIs to presigned URLs)
+  // Tunnel reverse-proxy DispatchFn. `buildDesktopProvider` injects it as the
+  // desktop transport for sandbox lifecycle, vm-events, and vm-tools traffic.
+  if (natsProvider != null) {
+    sharedProxyDispatch = createTunnelDispatch({
+      getConnection: () => natsProvider?.getConnection() ?? null,
+    });
+  }
+
+  app.route("/api", createLinkSessionRoutes());
+
+  // GET /api/links/me — presence-read for the current user's link claim.
+  // Used by the `deco link` CLI preflight and by presence checks.
+  // Dual-auth: Bearer token (CLI — OAuth MCP session or a Better Auth API key)
+  // or the session cookie (browser/e2e via meshContext).
+  app.get("/api/links/me", async (c) => {
+    try {
+      const authHeader = c.req.header("authorization") ?? "";
+      const match = /^Bearer\s+(.+)$/i.exec(authHeader);
+      let userSub: string | null = null;
+      if (match) {
+        const token = (match[1] ?? "").trim();
+        // Shared dual-auth resolver (MCP OAuth session → Better Auth API key
+        // fallback).
+        userSub = await resolveLinkBearer(
+          token,
+          auth.api as unknown as LinkBearerAuthApi,
+        );
+      } else {
+        const ctx = (c.get as (key: string) => unknown)("meshContext") as
+          | { auth?: { user?: { id?: string } } }
+          | undefined;
+        userSub = ctx?.auth?.user?.id ?? null;
+      }
+      if (!userSub) return c.json({ error: "unauthorized" }, 401);
+      const status: LinkStatus = linkStatusProbe
+        ? await linkStatusProbe(userSub)
+        : { online: false, capabilities: [] };
+      if (!status.online) return c.json(null);
+      return c.json({
+        hostname: status.hostname,
+        cliVersion: status.cliVersion,
+      });
+    } catch (err) {
+      // Presence is best-effort: a failing probe / bearer-resolver / transport
+      // must read as "no link" (200 null), never a 500. The bearer path
+      // already degrades to null when offline; this keeps the cookie path
+      // (whose org-scoped meshContext can surface transient failures) in lock-
+      // step instead of bubbling an empty-body 500 to the UI poller.
+      console.error(
+        "[links/me] presence probe failed; reporting offline:",
+        err instanceof Error ? err.message : String(err),
+      );
+      return c.json(null);
+    }
+  });
+
+  // Stable file redirect endpoint (resolves mesh-storage: URIs to presigned URLs).
+  // Resolve the org from the URL before serving so the stable URL cannot drift
+  // to the session-active org when the path targets a different org.
+  app.use("/api/:org/files/*", resolveOrgFromPath);
   app.route("/api", filesRoutes);
 
   // Thread outputs (model-shared files surfaced as download chips in the chat)
   // Legacy mount at /api/* with deprecation log; the new /api/:org/* mount
   // is wired in a later task.
   const legacyThreadOutputsRoutes = new Hono<{
-    Variables: { meshContext: MeshContext };
+    Variables: { meshContext: StudioContext };
   }>();
   legacyThreadOutputsRoutes.use(
     "*",
@@ -1572,7 +1903,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // Legacy mount at /api/trigger-callback with deprecation log; the new
   // /api/:org/trigger-callback mount is wired in a later task.
   const legacyTriggerCallback = new Hono<{
-    Variables: { meshContext: MeshContext };
+    Variables: { meshContext: StudioContext };
   }>();
   legacyTriggerCallback.use(
     "*",
@@ -1587,27 +1918,18 @@ export async function createApp(options: CreateAppOptions = {}) {
   );
   app.route("/api", legacyTriggerCallback);
 
-  // KV store (org-scoped, for external MCPs to persist state)
-  // Legacy mount at /api/* with deprecation log; the new /api/:org/* mount
-  // is wired in a later task.
+  // KV store — org-scoped only. The legacy unscoped mount at /api/kv/:key was
+  // removed because it lacked resolveOrgFromPath middleware, allowing multi-org
+  // users to read/write KV data from an unintended org (non-deterministic org
+  // resolution via .executeTakeFirst() without ORDER BY). All callers must use
+  // the org-scoped route: /api/:org/kv/:key.
   const kvStorage = new KyselyKVStorage(database.db);
-  const legacyKVRoutes = new Hono<{
-    Variables: { meshContext: MeshContext };
-  }>();
-  legacyKVRoutes.use("*", createLogDeprecatedRoute({ mountPath: "/api" }));
-  legacyKVRoutes.route("/", createKVRoutes({ kvStorage }));
-  app.route("/api", legacyKVRoutes);
-
-  // Public Events endpoint — legacy mount with deprecation log. New mount
-  // lives at `POST /api/:org/events/:type` (registered via createOrgScopedApi).
-  app.use("/org/:organizationId/events/:type", logDeprecatedRoute);
-  app.post("/org/:organizationId/events/:type", eventsHandler);
 
   // Downstream token management routes
   // Legacy mount at /api/* with deprecation log; the new /api/:org/* mount
   // is wired in a later task.
   const legacyDownstreamTokenRoutes = new Hono<{
-    Variables: { meshContext: MeshContext };
+    Variables: { meshContext: StudioContext };
   }>();
   legacyDownstreamTokenRoutes.use(
     "*",
@@ -1620,12 +1942,13 @@ export async function createApp(options: CreateAppOptions = {}) {
   // /profile is user-scoped (no org), stays mounted permanently — no
   // deprecation log.
   app.route("/api/deco-sites", createDecoSitesUserRoutes());
+  app.route("/api/deco-apps", createDecoAppsRoutes());
 
   // Org-scoped deco-sites routes (GET /, POST /connection). Currently mounted
   // at /api/deco-sites with a deprecation log; the new /api/:org/deco-sites
   // mount is wired in a later task.
   const legacyDecoSitesOrg = new Hono<{
-    Variables: { meshContext: MeshContext };
+    Variables: { meshContext: StudioContext };
   }>();
   legacyDecoSitesOrg.use(
     "*",
@@ -1635,13 +1958,13 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.route("/api/deco-sites", legacyDecoSitesOrg);
 
   // Unified VM events SSE — single auth-gated stream that emits pre-Ready
-  // lifecycle phases, then proxies the daemon's `/_decopilot_vm/events` once
+  // lifecycle phases, then proxies the daemon's `/_sandbox/events` once
   // the sandbox is up. Replaces the prior split between `/api/vm-lifecycle`
   // and the browser's direct daemon EventSource.
   // Legacy mount at /api/vm-events with deprecation log; the new
   // /api/:org/vm-events mount is wired in a later task.
   const legacyVmEvents = new Hono<{
-    Variables: { meshContext: MeshContext };
+    Variables: { meshContext: StudioContext };
   }>();
   legacyVmEvents.use(
     "*",
@@ -1687,29 +2010,20 @@ export async function createApp(options: CreateAppOptions = {}) {
   // PR removes them after the deprecation window.
   const orgScopedApi = createOrgScopedApi({
     kvStorage,
+    runRegistry,
+    streamBuffer,
+    sseHub,
+    cancelBroadcast,
     tokenStorage: triggerCallbackTokenStorage,
     automationEventDispatcher,
     mountDevAssets: usesLocalObjectStorage(),
     mcpAuth,
     oauthProxyHandler,
-    eventsHandler,
     watchHandler,
     betterAuthProtectedResourceHandler,
+    getNatsConnection: () => natsProvider?.getConnection() ?? null,
   });
   app.route("/api/:org", orgScopedApi);
-
-  // ============================================================================
-  // Server Plugin Routes
-  // ============================================================================
-
-  // Mount routes from registered server plugins
-  // - Public routes are mounted at root level (e.g., /connect/:sessionId)
-  // - Authenticated routes are mounted at /api/plugins/:pluginId/*
-  // Note: vault and initializePluginStorage are called earlier (before eventBus.start)
-  // to avoid race conditions with plugin onStartup hooks.
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  mountPluginRoutes(app, { db: database.db as any, vault });
 
   // ============================================================================
   // 404 Handler
@@ -1723,20 +2037,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   // Error Handler
   // ============================================================================
 
-  app.onError((err, c) => {
-    console.error("Server error :", err);
-
-    // If error is Error, provide message
-    const message = err instanceof Error ? err.message : "Unknown error";
-
-    return c.json(
-      {
-        error: "Internal Server Error",
-        message,
-      },
-      500,
-    );
-  });
+  app.onError(handleApiError);
 
   const markShuttingDown = () => {
     isShuttingDown = true;
@@ -1747,7 +2048,6 @@ export async function createApp(options: CreateAppOptions = {}) {
 
     // Phase 1: Stop all workers/consumers in parallel (independent of each other)
     await Promise.allSettled([
-      eventBus.isRunning() ? eventBus.stop() : Promise.resolve(),
       sseHub.stop(),
       currentDecopilotCleanup
         ? Promise.resolve(currentDecopilotCleanup()).finally(() => {
@@ -1755,17 +2055,6 @@ export async function createApp(options: CreateAppOptions = {}) {
           })
         : Promise.resolve(),
     ]);
-
-    // Sweep sandbox containers — Docker only. Other runners' sandboxes
-    // outlive mesh by design, so a generic sweep would nuke active user VMs.
-    // Must run before NATS/DB close (sweep writes state).
-    const dockerRunner = asDockerRunner(getSharedRunnerIfInit());
-    if (dockerRunner) {
-      const { sweepDockerOrphansOnShutdown } = await import(
-        "@decocms/sandbox/runner"
-      );
-      await sweepDockerOrphansOnShutdown(dockerRunner);
-    }
 
     // Phase 3: Drain NATS (after all consumers stopped)
     if (natsProvider) {
@@ -1802,21 +2091,16 @@ export async function createApp(options: CreateAppOptions = {}) {
    * — they don't need any setup here.
    */
   const initDbos = async () => {
-    // Three-level queue: per-org cap (lazily created per-org via
-    // `ensureOrgQueue` at fire time, mutable at runtime via UI/tools) →
-    // per-automation cap (shared partitioned queue) → global cap
-    // (pg-pool protection). All three caps apply to both cron and
-    // event-triggered fires since both paths enter via orgGateWorkflow.
-    //
-    // The per-org queues are NOT registered here — they are created on
-    // demand by `ensureOrgQueue` and auto-discovered by every replica's
-    // dispatcher via `wfQueueRunner.discoverAndLaunchDbQueues`.
-    await DBOS.registerQueue(AUTOMATIONS_GATE_QUEUE, {
+    // Automation fires run on ONE partitioned queue, partitioned by orgId.
+    // Per-partition concurrency gives each org its own fairness cap (a
+    // saturated org blocks only its own partition), while a single queue
+    // means one dequeue-polling loop per replica instead of one per org —
+    // and DBOS only polls partitions with ENQUEUED work, so idle poll cost
+    // is flat regardless of org count.
+    await DBOS.registerQueue(AUTOMATIONS_QUEUE, {
       partitionQueue: true,
-      concurrency: AUTOMATIONS_GATE_PARTITION_CONCURRENCY,
-    });
-    await DBOS.registerQueue(AUTOMATIONS_GLOBAL_QUEUE, {
-      concurrency: AUTOMATIONS_GLOBAL_CONCURRENCY,
+      concurrency: AUTOMATIONS_PARTITION_CONCURRENCY,
+      minPollingIntervalMs: AUTOMATIONS_POLL_INTERVAL_MS,
     });
     // Per-thread agent-run gate. Partition key = threadId, concurrency=1,
     // so messages on the same thread serialize behind the active run while
@@ -1826,51 +2110,48 @@ export async function createApp(options: CreateAppOptions = {}) {
       partitionQueue: true,
       concurrency: THREAD_GATE_PARTITION_CONCURRENCY,
     });
-    await reconcileAutomationSchedules(automationsStorage);
-  };
-
-  // Fire-and-forget backfill of the Studio Pack for every org.
-  // `installStudioPack` is idempotent (skip-if-exists), so this is a near
-  // no-op in steady state; first-boot after the Store Manager ships, it
-  // installs the missing manager for every existing org without a migration.
-  {
-    const { installStudioPack } = await import("@/tools/virtual/studio-pack");
-    const { ensureStudioPackForAllOrgs } = await import(
-      "@/tools/virtual/ensure-studio-pack"
-    );
-    const { VirtualMCPStorage } = await import("@/storage/virtual");
-    const virtualMcpStorage = new VirtualMCPStorage(database.db);
-    ensureStudioPackForAllOrgs({
-      listOrgs: async () => {
-        const rows = await database.db
-          .selectFrom("organization")
-          .select(["id"])
-          .execute();
-        // Pick a deterministic createdBy per org: first owner from member
-        // table. Fall back to "system" if none — installStudioPack only
-        // uses createdBy as audit metadata, not for auth.
-        return Promise.all(
-          rows.map(async (org) => {
-            const owner = await database.db
-              .selectFrom("member")
-              .select(["userId"])
-              .where("organizationId", "=", org.id)
-              .where("role", "=", "owner")
-              .limit(1)
-              .executeTakeFirst();
-            return {
-              id: org.id,
-              createdBy: owner?.userId ?? "system",
-            };
-          }),
-        );
-      },
-      installer: installStudioPack,
-      virtualMcpStorage,
-    }).catch((error) => {
-      console.error("[studio-pack] backfill driver failed:", error);
+    // Hosted-harness child workflow queue. Partition key = threadId, concurrency 1
+    // (mirrors THREAD_GATE_QUEUE: one active run per thread, different threads
+    // progress in parallel). Worker pods dequeue this alongside the parent gate.
+    await DBOS.registerQueue(HOSTED_HARNESS_QUEUE, {
+      partitionQueue: true,
+      concurrency: HOSTED_HARNESS_PARTITION_CONCURRENCY,
     });
-  }
+    // Slow backgroundable built-ins (generate_image) run here, partitioned by
+    // orgId for per-org fairness. The reaction turn hops to the thread-gate.
+    await DBOS.registerQueue(BACKGROUND_TOOLS_QUEUE, {
+      partitionQueue: true,
+      concurrency: BACKGROUND_TOOLS_PARTITION_CONCURRENCY,
+    });
+    await reconcileAutomationSchedules(automationsStorage);
+
+    // One-time cleanup of the retired per-automation/global gate queues.
+    // Fires now run on the partitioned queue, so these rows are orphaned;
+    // deleteQueue is a no-op once they're gone. Stale gate workflows still
+    // ENQUEUED from a previous version are cancelled by the reconciler.
+    await Promise.allSettled(
+      ["automations-gate", "automations-global"].map((q) =>
+        DBOS.deleteQueue(q),
+      ),
+    );
+    // MIGRATION: drop the retired per-org `automations-org-<orgId>` queue rows
+    // (empty ones only) so DBOS stops launching a dequeue loop for each. Runs
+    // every boot; idempotent. Remove once prod shows zero such rows.
+    await cleanupOrphanedOrgQueues(database.pool);
+
+    // Fire-and-forget backfill of studio pack agents for every org. Safe
+    // to skip awaiting — the workflow IDs are deterministic per-org, so
+    // replicas/workers all enqueueing in parallel collapse via OAOO.
+    backfillStudioPackForAllOrgs().catch((err) => {
+      console.error("[studio-pack-backfill] failed:", err);
+    });
+
+    // Fire-and-forget immediate public-sets sync (hour-bucketed workflow ID,
+    // so parallel-booting replicas collapse via OAOO).
+    kickPublicSetsBootSync().catch((err) => {
+      console.error("[org-fs] public-sets boot sync kick failed:", err);
+    });
+  };
 
   return Object.assign(app, { markShuttingDown, shutdown, initDbos });
 }

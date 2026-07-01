@@ -9,20 +9,133 @@
  */
 
 import { Suspense, lazy } from "react";
-import { Loading01 } from "@untitledui/icons";
 import { useMainPanelTabs } from "./use-main-panel-tabs";
 import { SettingsTab } from "./settings-tab";
 import { GitTab } from "@/web/components/thread/github/git-tab";
 import { PreviewTab } from "./preview-tab";
+import { ContentTab } from "./content-tab";
 import { AutomationTab } from "./automation-tab";
 import { AutomationsListTab } from "./automations-list-tab";
-import { isLegacySettingsTab, parsePinnedViewTabId } from "./tab-id";
+import { FileTab } from "./file-tab";
+import { DeckTab } from "./deck-tab";
+import { LibraryFileTab } from "./library-file-tab";
+import { MainPanelLoading } from "./main-panel-loading";
+import {
+  isLegacySettingsTab,
+  parseDeckTabId,
+  parseFileTabId,
+  parseLibraryFileTabId,
+  parsePinnedViewTabId,
+} from "./tab-id";
+import { ErrorBoundary } from "@/web/components/error-boundary";
 
 const AppViewContent = lazy(() =>
   import("@/web/routes/project-app-view").then((m) => ({
     default: m.AppViewContent,
   })),
 );
+
+function TabBody({
+  activeTab,
+  virtualMcpId,
+  taskId,
+  layoutTabs,
+  expandedTools,
+  automationTabParsed,
+}: {
+  activeTab: string;
+  virtualMcpId: string;
+  taskId: string;
+  layoutTabs: ReturnType<typeof useMainPanelTabs>["layoutTabs"];
+  expandedTools: ReturnType<typeof useMainPanelTabs>["expandedTools"];
+  automationTabParsed: ReturnType<
+    typeof useMainPanelTabs
+  >["automationTabParsed"];
+}) {
+  // Test hook: e2e tests set window.__forceTabError = <activeTab> to deliberately
+  // crash the active tab and exercise the ErrorBoundary recovery flow.
+  // Dev-only — the guard ensures this code path is dead-stripped in production
+  // builds (Vite tree-shakes blocks guarded by `import.meta.env.DEV`).
+  if (
+    import.meta.env.DEV &&
+    typeof window !== "undefined" &&
+    (window as unknown as { __forceTabError?: string }).__forceTabError ===
+      activeTab
+  ) {
+    throw new Error(`forced tab error: ${activeTab}`);
+  }
+
+  if (isLegacySettingsTab(activeTab)) {
+    return <SettingsTab virtualMcpId={virtualMcpId} />;
+  }
+  if (activeTab === "git") {
+    return <GitTab virtualMcpId={virtualMcpId} />;
+  }
+  if (activeTab === "automations") {
+    return <AutomationsListTab virtualMcpId={virtualMcpId} />;
+  }
+  if (activeTab === "preview") {
+    return <PreviewTab virtualMcpId={virtualMcpId} />;
+  }
+  if (activeTab === "content") {
+    return <ContentTab virtualMcpId={virtualMcpId} />;
+  }
+  if (automationTabParsed) {
+    return <AutomationTab tabId={activeTab} />;
+  }
+
+  const deckTab = parseDeckTabId(activeTab);
+  if (deckTab) {
+    return <DeckTab key={deckTab.path} path={deckTab.path} />;
+  }
+
+  const fileTab = parseFileTabId(activeTab);
+  if (fileTab) {
+    return <FileTab fileKey={fileTab.key} taskId={taskId} />;
+  }
+
+  const libraryFileTab = parseLibraryFileTabId(activeTab);
+  if (libraryFileTab) {
+    return (
+      <LibraryFileTab key={libraryFileTab.path} path={libraryFileTab.path} />
+    );
+  }
+
+  const pinnedView = parsePinnedViewTabId(activeTab);
+  if (pinnedView) {
+    const expandedTool = expandedTools.find(
+      (t) =>
+        t.appId === pinnedView.connectionId &&
+        t.toolName === pinnedView.toolName,
+    );
+    return (
+      <Suspense fallback={<MainPanelLoading />}>
+        <AppViewContent
+          key={activeTab}
+          connectionId={pinnedView.connectionId}
+          toolName={pinnedView.toolName}
+          args={expandedTool?.args}
+        />
+      </Suspense>
+    );
+  }
+
+  const agentTab = layoutTabs.find((t) => t.id === activeTab);
+  if (agentTab) {
+    return (
+      <Suspense fallback={<MainPanelLoading />}>
+        <AppViewContent
+          key={activeTab}
+          connectionId={agentTab.view.appId}
+          toolName={agentTab.id}
+          args={agentTab.view.args}
+        />
+      </Suspense>
+    );
+  }
+
+  return <SettingsTab virtualMcpId={virtualMcpId} />;
+}
 
 export function MainPanelContent({
   taskId,
@@ -37,72 +150,18 @@ export function MainPanelContent({
       taskId,
     });
 
-  if (isLegacySettingsTab(activeTab)) {
-    return <SettingsTab virtualMcpId={virtualMcpId} />;
-  }
-  if (activeTab === "git") {
-    return <GitTab virtualMcpId={virtualMcpId} />;
-  }
-  if (activeTab === "automations") {
-    return <AutomationsListTab virtualMcpId={virtualMcpId} />;
-  }
-  if (activeTab === "preview") {
-    return <PreviewTab virtualMcpId={virtualMcpId} />;
-  }
-  if (automationTabParsed) {
-    return <AutomationTab tabId={activeTab} />;
-  }
-
-  const pinnedView = parsePinnedViewTabId(activeTab);
-  if (pinnedView) {
-    const expandedTool = expandedTools.find(
-      (t) =>
-        t.appId === pinnedView.connectionId &&
-        t.toolName === pinnedView.toolName,
-    );
-    return (
-      <Suspense
-        fallback={
-          <div className="h-full w-full flex items-center justify-center">
-            <Loading01
-              size={20}
-              className="animate-spin text-muted-foreground"
-            />
-          </div>
-        }
-      >
-        <AppViewContent
-          key={activeTab}
-          connectionId={pinnedView.connectionId}
-          toolName={pinnedView.toolName}
-          args={expandedTool?.args}
+  return (
+    <ErrorBoundary key={activeTab}>
+      <Suspense fallback={<MainPanelLoading />}>
+        <TabBody
+          activeTab={activeTab}
+          virtualMcpId={virtualMcpId}
+          taskId={taskId}
+          layoutTabs={layoutTabs}
+          expandedTools={expandedTools}
+          automationTabParsed={automationTabParsed}
         />
       </Suspense>
-    );
-  }
-
-  const agentTab = layoutTabs.find((t) => t.id === activeTab);
-  if (agentTab) {
-    return (
-      <Suspense
-        fallback={
-          <div className="h-full w-full flex items-center justify-center">
-            <Loading01
-              size={20}
-              className="animate-spin text-muted-foreground"
-            />
-          </div>
-        }
-      >
-        <AppViewContent
-          key={activeTab}
-          connectionId={agentTab.view.appId}
-          toolName={agentTab.id}
-          args={agentTab.view.args}
-        />
-      </Suspense>
-    );
-  }
-
-  return <SettingsTab virtualMcpId={virtualMcpId} />;
+    </ErrorBoundary>
+  );
 }

@@ -1,17 +1,23 @@
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import { OrgAccessGate } from "@/web/components/org-access-gate";
 import { SplashScreen } from "@/web/components/splash-screen";
+import { FloatingReleaseCard } from "@/web/components/release-channel/floating-release-card";
 import { KeyboardShortcutsDialog } from "@/web/components/keyboard-shortcuts-dialog";
 import { isModKey } from "@/web/lib/keyboard-shortcuts";
 import RequiredAuthLayout from "@/web/layouts/required-auth-layout";
 import { authClient } from "@/web/lib/auth-client";
+import { AUTOSEND_QUERY_VALUE } from "@/web/lib/autosend";
 import { LOCALSTORAGE_KEYS } from "@/web/lib/localstorage-keys";
+import { readCachedOrg, writeCachedOrg } from "@/web/lib/query-persist";
 import { PostHogGroupSync } from "@/web/providers/posthog-group-sync";
 import {
   getWellKnownDecopilotVirtualMCP,
+  mcpClientQueryOptions,
   ProjectContextProvider,
+  SELF_MCP_ALIAS_ID,
   useProjectContext,
 } from "@decocms/mesh-sdk";
-import { useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
+import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
 import {
   Outlet,
   useMatch,
@@ -21,11 +27,14 @@ import {
 } from "@tanstack/react-router";
 import { KEYS } from "../lib/query-keys";
 import { readCachedTaskBranch } from "../lib/read-cached-task-branch";
-import { useThreadActions } from "@/web/components/chat/task";
-import { useOrganizationSettingsSuspense } from "../hooks/use-organization-settings";
+import { useOptionalThreadManager } from "@/web/components/chat/store/hooks";
+import { isPerThreadTab } from "@/web/layouts/main-panel-tabs/tab-id";
+import { useOrganizationSettingsNonBlocking } from "../hooks/use-organization-settings";
+import { homeNextActionsQueryOptions } from "../hooks/use-home-next-actions";
 import { useOrgSsoStatus } from "../hooks/use-org-sso";
 import { SsoRequiredScreen } from "../components/sso-required-screen";
 import { ArchivedOrgScreen } from "../components/archived-org-screen";
+import { isOrgArchived } from "@/core/org-archived";
 
 // ---------------------------------------------------------------------------
 // ShellProjectProvider — fetches org settings and provides project context.
@@ -44,7 +53,7 @@ function ShellProjectProvider({
   org: NonNullable<Parameters<typeof ProjectContextProvider>[0]["org"]>;
   children: React.ReactNode;
 }) {
-  const orgSettings = useOrganizationSettingsSuspense(org.id, org.slug);
+  const orgSettings = useOrganizationSettingsNonBlocking(org.id, org.slug);
 
   const project = {
     id: org.id,
@@ -70,8 +79,9 @@ function ShellProjectProvider({
 
 export function usePanelActions() {
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
-  const taskActions = useThreadActions();
+  // Optional: the settings route tree has no ThreadManagerProvider, so this is
+  // null there. Navigation actions work regardless; only createNewTask needs it.
+  const manager = useOptionalThreadManager();
   const { org, locator } = useProjectContext();
 
   const params = useParams({ strict: false }) as {
@@ -102,40 +112,65 @@ export function usePanelActions() {
   const setChatOpen = (open: boolean) =>
     nav((prev) => ({ ...prev, chat: open ? 1 : 0 }));
 
-  const setTasksOpen = (open: boolean) =>
-    nav((prev) => ({ ...prev, tasks: open ? 1 : 0 }));
-
-  const setTaskId = (id: string, virtualMcpId?: string) =>
+  const setTaskId = (
+    id: string,
+    virtualMcpId?: string,
+    opts?: { autosend?: boolean; main?: string },
+  ) =>
     navWith(
       id,
       (prev) => {
         const next: Record<string, unknown> = { chat: 1 };
         if (virtualMcpId) next.virtualmcpid = virtualMcpId;
         else if (prev.virtualmcpid) next.virtualmcpid = prev.virtualmcpid;
-        if (prev.tasks) next.tasks = prev.tasks;
-        // Preserve the main panel tab (git / preview / env / …) so that
-        // switching tasks keeps the user's current view.
-        if (prev.main) next.main = prev.main;
+        // Explicit main tab takes priority (e.g. home tile → pinned view).
+        if (opts?.main) {
+          next.main = opts.main;
+        } else {
+          // Preserve system-level panel tabs (git, preview, settings, …) across
+          // thread switches, but drop per-thread tabs (expanded tool views,
+          // web-page previews, automation details) that are specific to the
+          // previous task.
+          const prevMain = prev.main;
+          if (
+            prevMain &&
+            typeof prevMain === "string" &&
+            !isPerThreadTab(prevMain)
+          ) {
+            next.main = prevMain;
+          }
+        }
+        if (opts?.autosend) next.autosend = AUTOSEND_QUERY_VALUE;
         return next;
       },
       false,
     );
 
   // Create a new task carrying the current task's branch (if any) so the
-  // new thread lands on the same warm sandbox. Server picks from vmMap when
+  // new thread lands on the same warm sandbox. Server picks from sandboxMap when
   // no branch is provided. Awaiting the create avoids the route loader's
   // create-on-404 fallback firing without a branch hint.
   //
-  // virtual_mcp_id is required by COLLECTION_THREADS_CREATE. Fall back to the
-  // well-known Decopilot agent when the URL doesn't carry ?virtualmcpid= —
-  // matches the same fallback in agent-shell-layout's createNewTask.
-  const createNewTask = async () => {
+  // `virtualMcpId` lets callers (e.g. the per-group "+" in the sidebar) pin
+  // the thread to a specific agent regardless of the current URL. When
+  // omitted, falls back to the URL's `virtualmcpid`, then to the well-known
+  // Decopilot agent. The current branch is only carried when we're staying
+  // on the same vMCP as the URL — switching agents would land on the wrong
+  // sandbox otherwise.
+  const createNewTask = async (virtualMcpId?: string) => {
     const newId = crypto.randomUUID();
-    const branch = readCachedTaskBranch(queryClient, locator, currentTaskId);
     const targetVmcp =
-      search.virtualmcpid ?? getWellKnownDecopilotVirtualMCP(org.id).id;
+      virtualMcpId ??
+      search.virtualmcpid ??
+      getWellKnownDecopilotVirtualMCP(org.id).id;
+    const carryBranch = targetVmcp === search.virtualmcpid;
+    const branch = carryBranch
+      ? readCachedTaskBranch(org.slug, locator, currentTaskId)
+      : null;
     try {
-      await taskActions.create.mutateAsync({
+      // No manager (settings tree): skip the eager create and let the
+      // /$org/$taskId route loader's ensure-fallback create the thread.
+      await manager?.create({
         id: newId,
         virtual_mcp_id: targetVmcp,
         ...(branch ? { branch } : {}),
@@ -144,7 +179,7 @@ export function usePanelActions() {
       // Toast already fired by useCollectionActions; navigate anyway so the
       // route loader's ensure-fallback can retry.
     }
-    setTaskId(newId);
+    setTaskId(newId, targetVmcp);
   };
 
   const openTab = (tabId: string) =>
@@ -166,7 +201,6 @@ export function usePanelActions() {
 
   return {
     setChatOpen,
-    setTasksOpen,
     setTaskId,
     createNewTask,
     openTab,
@@ -182,7 +216,19 @@ export function usePanelActions() {
 function ShellLayoutContent() {
   const orgMatch = useMatch({ from: "/shell/$org", shouldThrow: false });
   const org = orgMatch?.params.org;
+  const { taskId } = useParams({ strict: false }) as { taskId?: string };
   const [shortcutsDialogOpen, setShortcutsDialogOpen] = useState(false);
+
+  useQuery({
+    ...homeNextActionsQueryOptions(org ?? ""),
+    enabled: !!org && !taskId,
+  });
+
+  // Session is guaranteed present here (this renders inside <SignedIn>), so the
+  // user id is available synchronously to scope the org cache by principal.
+  const { data: session } = authClient.useSession();
+  const userId = session?.user?.id;
+  const cachedOrg = org && userId ? readCachedOrg(userId, org) : null;
 
   // oxlint-disable-next-line ban-use-effect/ban-use-effect — subscribes to document keydown for ⌘K shortcuts dialog; DOM event listener has no React 19 alternative
   useEffect(() => {
@@ -208,14 +254,23 @@ function ShellLayoutContent() {
       // session breaks multi-tab usage because the session row is shared
       // across tabs. We rely on the URL slug (mounted under /api/:org/...)
       // for org resolution instead.
-      const { data } = await authClient.organization.getFullOrganization({
-        query: { organizationSlug: org },
-      });
+      // Marked for the perf_app_bootstrap timing event (see posthog-client).
+      performance.mark("mesh:active-org-fetch:start");
+      const { data } = await authClient.organization
+        .getFullOrganization({
+          query: { organizationSlug: org },
+        })
+        .finally(() => {
+          performance.mark("mesh:active-org-fetch:end");
+          performance.measure(
+            "mesh:active-org-fetch",
+            "mesh:active-org-fetch:start",
+            "mesh:active-org-fetch:end",
+          );
+        });
 
       // Don't persist archived orgs — homeRoute would just redirect off them again
-      const isArchived =
-        (data as { metadata?: { archived?: boolean } } | null)?.metadata
-          ?.archived === true;
+      const isArchived = isOrgArchived(data);
 
       // Persist for fast redirect on next login (read by homeRoute beforeLoad)
       // Only write on success and only for active (non-archived) orgs
@@ -223,8 +278,22 @@ function ShellLayoutContent() {
         localStorage.setItem(LOCALSTORAGE_KEYS.lastOrgSlug(), org);
       }
 
+      // Seed the user-scoped cache so the next refresh renders instantly.
+      if (userId && data) {
+        writeCachedOrg(userId, org, data);
+      }
+
       return data;
     },
+    // Hydrate from the user-scoped cache so the shell paints without waiting on
+    // the network; the stale `initialDataUpdatedAt` triggers a background
+    // refetch that flips to the access gate if membership was revoked.
+    initialData: cachedOrg
+      ? (cachedOrg.data as Awaited<
+          ReturnType<typeof authClient.organization.getFullOrganization>
+        >["data"])
+      : undefined,
+    initialDataUpdatedAt: cachedOrg?.updatedAt,
     gcTime: Infinity,
     refetchOnWindowFocus: false,
   });
@@ -234,13 +303,33 @@ function ShellLayoutContent() {
   const orgSlug = activeOrg?.slug;
   const { data: ssoStatus } = useOrgSsoStatus(orgId, orgSlug);
 
+  // Warm the self-MCP connection in parallel with the rest of shell bootstrap,
+  // so the home's useMCPClient resolves without waiting on a fresh connect()
+  // round-trip after it mounts. Non-suspense (useQuery) — this only pre-warms
+  // the shared cache entry (same key as useMCPClient via mcpClientQueryOptions);
+  // it never blocks paint, and no-ops if the connect doesn't finish first.
+  useQuery({
+    ...mcpClientQueryOptions({
+      connectionId: SELF_MCP_ALIAS_ID,
+      orgId: orgId ?? "",
+      orgSlug: orgSlug ?? "",
+    }),
+    enabled: !!orgId && !!orgSlug,
+  });
+
   if (!activeOrg) {
-    return <SplashScreen />;
+    // Not a member: figure out which screen to show (no-access / pending
+    // invite / auto-domain-join / not-found). Wrapped in Suspense so the
+    // brief access-status fetch shows the splash instead of throwing back to
+    // the parent suspense boundary.
+    return (
+      <Suspense fallback={<SplashScreen />}>
+        <OrgAccessGate orgSlug={org!} />
+      </Suspense>
+    );
   }
 
-  const isArchivedOrg =
-    (activeOrg as { metadata?: { archived?: boolean } }).metadata?.archived ===
-    true;
+  const isArchivedOrg = isOrgArchived(activeOrg);
   if (isArchivedOrg) {
     // Clear stale slug so /home redirect doesn't bounce the user back here
     if (localStorage.getItem(LOCALSTORAGE_KEYS.lastOrgSlug()) === org) {
@@ -264,6 +353,8 @@ function ShellLayoutContent() {
     <ShellProjectProvider org={{ ...activeOrg, logo: activeOrg.logo ?? null }}>
       <PostHogGroupSync activeOrg={activeOrg} />
       <Outlet />
+
+      <FloatingReleaseCard />
 
       {/* Keyboard Shortcuts Dialog */}
       <KeyboardShortcutsDialog

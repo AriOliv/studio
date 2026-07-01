@@ -2,9 +2,12 @@ import { useState } from "react";
 import {
   authenticateMcp,
   isConnectionAuthenticated,
+  UI_RESOURCE_HTML_KEY,
   useProjectContext,
 } from "@decocms/mesh-sdk";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { clearHtmlResourceCacheForConnection } from "@/web/lib/html-resource-persist";
+import { useStudioTools } from "@/web/lib/studio-tools";
 import { Badge } from "@deco/ui/components/badge.tsx";
 import { Button } from "@deco/ui/components/button.tsx";
 import { Card } from "@deco/ui/components/card.tsx";
@@ -74,6 +77,8 @@ function ConnectionRow({
   const updateAuth = useUpdateMonitorConnectionAuth();
   const { updateMutation } = useRegistryMutations();
   const { org } = useProjectContext();
+  const studio = useStudioTools();
+  const queryClient = useQueryClient();
   const connectionId = entry.mapping.connection_id;
   const authStatus = entry.mapping.auth_status;
   const title = entry.item?.title ?? entry.mapping.item_id;
@@ -208,26 +213,10 @@ function ConnectionRow({
   };
 
   const saveTokenInternal = async (token: string) => {
-    const res = await fetch(`/api/${org.slug}/mcp/self`, {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: {
-          name: "COLLECTION_CONNECTIONS_UPDATE",
-          arguments: {
-            id: connectionId,
-            data: { connection_token: token },
-          },
-        },
-      }),
+    await studio.call("COLLECTION_CONNECTIONS_UPDATE", {
+      id: connectionId,
+      data: { connection_token: token },
     });
-    if (!res.ok) {
-      throw new Error("Failed to save token");
-    }
   };
 
   const handleSaveToken = async () => {
@@ -242,6 +231,14 @@ function ConnectionRow({
       setIsReplacingToken(false);
       setTokenValue("");
       markAuthenticated();
+      // Auth changed → upstream may return different content; drop cached UI
+      // HTML for this connection (IDB + in-memory query) so it re-reads fresh.
+      void clearHtmlResourceCacheForConnection(connectionId);
+      queryClient.invalidateQueries({
+        predicate: (query) =>
+          query.queryKey[1] === UI_RESOURCE_HTML_KEY &&
+          query.queryKey[3] === connectionId,
+      });
       await probeQuery.refetch();
     } catch (err) {
       toast.error(

@@ -31,6 +31,13 @@ import {
   isDecopilot,
 } from "@decocms/mesh-sdk";
 import { getConnectionSlug } from "@/shared/utils/connection-slug";
+import { CONNECTION_DECRYPT_DISABLE_THRESHOLD } from "../core/constants";
+import {
+  isDecryptDisabled,
+  markDecryptDisabled,
+  recordDecryptFailure,
+  recordDecryptSuccess,
+} from "./decrypt-failure-tracker";
 import type { ConnectionStoragePort } from "./ports";
 import type { Database } from "./types";
 
@@ -217,6 +224,43 @@ export class ConnectionStorage implements ConnectionStoragePort {
       .insertInto("connections")
       .values(serialized as Insertable<Database["connections"]>)
       .execute();
+
+    const connection = await this.findById(id);
+    if (!connection) {
+      throw new Error(`Failed to create connection with id: ${id}`);
+    }
+
+    return connection;
+  }
+
+  async createNew(data: Partial<ConnectionEntity>): Promise<ConnectionEntity> {
+    const id = data.id ?? generatePrefixedId("conn");
+    const now = new Date().toISOString();
+    const slug = getConnectionSlug(data);
+    const serialized = await this.serializeConnection({
+      ...data,
+      id,
+      slug,
+      status: "active",
+      created_at: now,
+      updated_at: now,
+    });
+
+    try {
+      await this.db
+        .insertInto("connections")
+        .values(serialized as Insertable<Database["connections"]>)
+        .execute();
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.message.includes("duplicate key") ||
+          error.message.includes("unique constraint"))
+      ) {
+        throw new Error("Connection ID already exists");
+      }
+      throw error;
+    }
 
     const connection = await this.findById(id);
     if (!connection) {
@@ -473,20 +517,72 @@ export class ConnectionStorage implements ConnectionStoragePort {
   }
 
   /**
+   * Handle one or more credential-decryption failures for a connection.
+   *
+   * Logs each failure until CONNECTION_DECRYPT_DISABLE_THRESHOLD consecutive
+   * failures are reached, then durably disables the connection (status="error")
+   * and suppresses further logs. Already-disabled connections (this replica or a
+   * non-active DB status from a prior disable) are suppressed immediately.
+   */
+  private async handleDecryptFailures(
+    row: RawConnectionRow,
+    failures: Array<{ label: string; error: unknown }>,
+  ): Promise<void> {
+    const context = `connection ${row.id} (org: ${row.organization_id}, type: ${row.connection_type}, title: ${row.title})`;
+
+    // Already disabled in this replica — stay quiet.
+    if (isDecryptDisabled(row.id)) return;
+
+    // Disabled in a prior run (or paused by a user): sync local state and suppress.
+    if (row.status !== "active") {
+      markDecryptDisabled(row.id);
+      return;
+    }
+
+    const { thresholdCrossed } = recordDecryptFailure(row.id);
+
+    if (!thresholdCrossed) {
+      for (const { label, error } of failures) {
+        console.error(`Failed to decrypt ${label} for ${context}:`, error);
+      }
+      return;
+    }
+
+    // Threshold reached — disable durably, then mark suppressed only on success
+    // so a failed write is retried on the next read instead of silently dropped.
+    try {
+      await this.db
+        .updateTable("connections")
+        .set({ status: "error" })
+        .where("id", "=", row.id)
+        .execute();
+      markDecryptDisabled(row.id);
+      console.error(
+        `Disabled ${context} after ${CONNECTION_DECRYPT_DISABLE_THRESHOLD} consecutive decryption failures.`,
+        failures[0]?.error,
+      );
+    } catch (err) {
+      console.error(
+        `Failed to disable ${context} after decryption failures:`,
+        err,
+      );
+    }
+  }
+
+  /**
    * Deserialize database row to entity
    */
   private async deserializeConnection(
     row: RawConnectionRow,
   ): Promise<ConnectionEntity> {
+    const decryptErrors: Array<{ label: string; error: unknown }> = [];
+
     let decryptedToken: string | null = null;
     if (row.connection_token) {
       try {
         decryptedToken = await this.vault.decrypt(row.connection_token);
       } catch (error) {
-        console.error(
-          `Failed to decrypt connection token for connection ${row.id} (org: ${row.organization_id}, type: ${row.connection_type}, title: ${row.title}):`,
-          error,
-        );
+        decryptErrors.push({ label: "connection token", error });
       }
     }
 
@@ -497,11 +593,14 @@ export class ConnectionStorage implements ConnectionStoragePort {
         const decryptedJson = await this.vault.decrypt(row.configuration_state);
         decryptedConfigState = JSON.parse(decryptedJson);
       } catch (error) {
-        console.error(
-          `Failed to decrypt configuration state for connection ${row.id} (org: ${row.organization_id}, type: ${row.connection_type}, title: ${row.title}):`,
-          error,
-        );
+        decryptErrors.push({ label: "configuration state", error });
       }
+    }
+
+    if (decryptErrors.length > 0) {
+      await this.handleDecryptFailures(row, decryptErrors);
+    } else if (row.connection_token || row.configuration_state) {
+      recordDecryptSuccess(row.id);
     }
 
     // Parse and decrypt connection_headers

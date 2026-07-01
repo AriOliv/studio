@@ -14,8 +14,9 @@ import {
 } from "@decocms/mesh-sdk";
 import { useNavigate } from "@tanstack/react-router";
 import { track } from "@/web/lib/posthog-client";
+import { RequireCapability } from "@/web/components/require-capability";
 
-export default function SettingsAutomationsPage() {
+function SettingsAutomationsPage() {
   const { org } = useProjectContext();
   const { data: automations = [] } = useAutomations(undefined);
   const agents = useVirtualMCPs();
@@ -29,15 +30,18 @@ export default function SettingsAutomationsPage() {
   const filtered = automations.filter((a) => {
     if (!lowerSearch) return true;
     if (a.name.toLowerCase().includes(lowerSearch)) return true;
-    const agent = agentMap.get(a.virtual_mcp_id);
-    if (agent && agent.title.toLowerCase().includes(lowerSearch)) return true;
+    if (a.virtual_mcp_id) {
+      const agent = agentMap.get(a.virtual_mcp_id);
+      if (agent && agent.title.toLowerCase().includes(lowerSearch)) return true;
+    }
     return false;
   });
 
-  const handleRowClick = (automationId: string, agentId: string) => {
-    // Fall back to Decopilot when the automation's virtual_mcp_id no longer
-    // resolves (orphaned reference); otherwise the detail panel can't mount.
-    const target = agentMap.has(agentId) ? agentId : getDecopilotId(org.id);
+  const handleRowClick = (automationId: string, agentId: string | null) => {
+    // Agent-kind rows whose virtual_mcp_id no longer resolves are orphaned;
+    // fall back to Decopilot so the detail panel still has a host shell.
+    const target =
+      agentId && agentMap.has(agentId) ? agentId : getDecopilotId(org.id);
     track("automations_list_row_clicked", {
       automation_id: automationId,
       agent_id: target,
@@ -106,5 +110,13 @@ export default function SettingsAutomationsPage() {
         </Page.Body>
       </Page.Content>
     </Page>
+  );
+}
+
+export default function SettingsAutomationsRoute() {
+  return (
+    <RequireCapability capability="automations:manage" area="automations">
+      <SettingsAutomationsPage />
+    </RequireCapability>
   );
 }

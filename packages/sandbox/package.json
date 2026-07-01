@@ -1,32 +1,38 @@
 {
   "name": "@decocms/sandbox",
-  "version": "0.5.2",
+  "version": "1.7.0",
   "type": "module",
   "description": "Sandbox runner for isolated per-user containerised tool execution",
   "scripts": {
     "check": "tsc --noEmit",
     "test": "bun test",
-    "build": "bun build daemon/entry.ts --target=bun --outfile=daemon/dist/daemon.js --external node-pty",
+    "build": "bun build daemon/entry.ts --target=bun --outfile=daemon/dist/daemon.js --external node-pty && bun run daemon/strip-bun-pragma.ts",
     "dev:daemon": "bun run --watch daemon/entry.ts"
   },
   "exports": {
     "./shared": "./shared.ts",
-    "./runner": "./server/runner/index.ts",
-    "./runner/agent-sandbox": "./server/runner/agent-sandbox/index.ts",
-    "./runner/freestyle": "./server/runner/freestyle/index.ts"
+    "./provider": "./server/provider/index.ts",
+    "./provider/agent-sandbox": "./server/provider/agent-sandbox/index.ts",
+    "./daemon-spawn": "./server/daemon-spawn.ts",
+    "./provider/desktop": "./server/provider/desktop/index.ts",
+    "./daemon-client": "./server/daemon-client.ts",
+    "./daemon/routes/dispatch": "./daemon/routes/dispatch.ts",
+    "./dispatch": "./dispatch/index.ts",
+    "./dispatch/*": "./dispatch/*.ts",
+    "./proxy/http": "./proxy/http.ts",
+    "./proxy/websocket": "./proxy/websocket.ts"
   },
   "dependencies": {
+    "@decocms/harness": "workspace:*",
+    "@decocms/std": "workspace:*",
     "@kubernetes/client-node": "^1.4.0",
     "@opentelemetry/api": "^1.9.0",
-    "node-pty": "^1.0.0"
-  },
-  "optionalDependencies": {
-    "@freestyle-sh/with-bun": "^0.2.12",
-    "@freestyle-sh/with-deno": "^0.0.4",
-    "@freestyle-sh/with-nodejs": "^0.2.9",
-    "freestyle-sandboxes": "^0.1.46"
+    "node-pty": "^1.0.0",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/nats-core": "3.4.0",
     "@types/bun": "latest",
     "typescript": "^5.8.3"
   }

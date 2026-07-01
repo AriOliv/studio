@@ -33,10 +33,16 @@ import {
 } from "@untitledui/icons";
 import { useAutoInstallGitHub } from "@/web/hooks/use-auto-install-github";
 import { useNavigateToAgent } from "@/web/hooks/use-navigate-to-agent";
-import { usePreferences } from "@/web/hooks/use-preferences.ts";
 import { GitHubIcon } from "@/web/components/icons/github-icon";
+import {
+  STOREFRONT_GITHUB_AUTOMATIONS,
+  setupStorefrontGithubAutomations,
+} from "@/tools/virtual/storefront-github-automations";
+import { fetchGithubInstallations } from "@/web/lib/github-installations";
+import { getOrgGithubConnections } from "@/shared/github-repo-scope";
+import { provisionRepoScopedGithubConnection } from "@/web/lib/provision-repo-scoped-github-connection";
 
-interface GitHubInstallation {
+export interface GitHubInstallation {
   installationId: number;
   login: string;
   avatarUrl: string;
@@ -72,13 +78,8 @@ export function GitHubRepoPicker({
   hideAutoRespondCheckbox?: boolean;
   onImportComplete?: (payload: GitHubImportPayload) => void;
 }) {
-  const [preferences] = usePreferences();
   const [selectedInstallation, setSelectedInstallation] =
     useState<GitHubInstallation | null>(null);
-
-  if (!preferences.experimental_vibecode) {
-    return null;
-  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -127,6 +128,7 @@ export function GitHubRepoPicker({
             }
           >
             <PickerContent
+              open={open}
               onComplete={() => onOpenChange(false)}
               selectedInstallation={selectedInstallation}
               onSelectInstallation={setSelectedInstallation}
@@ -141,12 +143,14 @@ export function GitHubRepoPicker({
 }
 
 function PickerContent({
+  open,
   onComplete,
   selectedInstallation,
   onSelectInstallation,
   hideAutoRespondCheckbox,
   onImportComplete,
 }: {
+  open: boolean;
   onComplete: () => void;
   selectedInstallation: GitHubInstallation | null;
   onSelectInstallation: (inst: GitHubInstallation | null) => void;
@@ -158,20 +162,36 @@ function PickerContent({
   const navigateToAgent = useNavigateToAgent();
   const [selectedConnection, setSelectedConnection] =
     useState<ConnectionEntity | null>(null);
-  const [autoRespondToIssues, setAutoRespondToIssues] = useState(true);
-  const effectiveAutoRespond = hideAutoRespondCheckbox
-    ? true
-    : autoRespondToIssues;
+  const [autoRespondEnabled, setAutoRespondEnabled] = useState(true);
+  const [selectedAutomationKeys, setSelectedAutomationKeys] = useState<
+    Set<string>
+  >(
+    () =>
+      new Set(
+        STOREFRONT_GITHUB_AUTOMATIONS.filter((s) => s.defaultEnabled).map(
+          (s) => s.key,
+        ),
+      ),
+  );
+  const defaultEnabledKeys = STOREFRONT_GITHUB_AUTOMATIONS.filter(
+    (s) => s.defaultEnabled,
+  ).map((s) => s.key);
+  const effectiveSelectedKeys = hideAutoRespondCheckbox
+    ? new Set(defaultEnabledKeys)
+    : autoRespondEnabled
+      ? selectedAutomationKeys
+      : new Set<string>();
 
-  const githubConnections = useConnections({ slug: "mcp-github" });
+  const allGithubConnections = useConnections({ slug: "mcp-github" });
+  const orgGithubConnections = getOrgGithubConnections(allGithubConnections);
 
   const autoInstall = useAutoInstallGitHub({
-    enabled: githubConnections.length === 0,
+    enabled: open && orgGithubConnections.length === 0,
   });
 
   const effectiveConnection =
-    githubConnections.length === 1
-      ? (githubConnections[0] ?? null)
+    orgGithubConnections.length === 1
+      ? (orgGithubConnections[0] ?? null)
       : selectedConnection;
 
   const githubClient = useMCPClient({
@@ -217,9 +237,9 @@ function PickerContent({
     }
   };
 
-  // Runtime detection moved server-side into VM_START (see
+  // Runtime detection moved server-side into SANDBOX_START (see
   // github-runtime-detect.ts). Here we only pull AGENTS.md / CLAUDE.md so the
-  // agent has instructions ready even before the first VM boots.
+  // agent has instructions ready even before the first sandbox boots.
   const detectRepoFiles = (virtualMcpId: string, repo: Repo) => {
     Promise.all([
       getFileContent(repo, "AGENTS.md"),
@@ -242,88 +262,30 @@ function PickerContent({
       });
   };
 
-  const setupIssueAutomation = async ({
+  const setupGithubAutomations = async ({
     virtualMcpId,
     repo,
     connectionId,
+    selectedKeys,
   }: {
     virtualMcpId: string;
     repo: Repo;
     connectionId: string;
+    selectedKeys: Set<string>;
   }) => {
-    const triggerListResult = (await githubClient.callTool({
-      name: "TRIGGER_LIST",
-      arguments: {},
-    })) as { structuredContent?: unknown };
-
-    const triggerPayload = (triggerListResult.structuredContent ??
-      triggerListResult) as {
-      triggers?: Array<{
-        type: string;
-        params?: Array<{ name: string }> | Record<string, unknown>;
-        paramsSchema?: Record<string, unknown>;
-      }>;
-    };
-
-    const issueTrigger =
-      triggerPayload.triggers?.find((t) => t.type === "github.issues.opened") ??
-      triggerPayload.triggers?.find((t) => {
-        const type = t.type.toLowerCase();
-        return (
-          /\bissues?\./.test(type) &&
-          (type.endsWith(".opened") || type.endsWith(".created"))
-        );
-      });
-
-    if (!issueTrigger) {
-      throw new Error("No issue-created trigger exposed by GitHub connection");
-    }
-
-    const paramNames = new Set<string>();
-    if (Array.isArray(issueTrigger.params)) {
-      for (const p of issueTrigger.params) paramNames.add(p.name);
-    } else if (issueTrigger.params && typeof issueTrigger.params === "object") {
-      for (const k of Object.keys(issueTrigger.params)) paramNames.add(k);
-    }
-    if (issueTrigger.paramsSchema) {
-      for (const k of Object.keys(issueTrigger.paramsSchema)) paramNames.add(k);
-    }
-
-    const params: Record<string, string> = {};
-    if (paramNames.has("repo")) {
-      params.repo = `${repo.owner}/${repo.name}`;
-    } else {
-      if (paramNames.has("owner")) params.owner = repo.owner;
-      if (paramNames.has("name")) params.name = repo.name;
-      if (paramNames.has("repository"))
-        params.repository = `${repo.owner}/${repo.name}`;
-    }
-
-    const automationInstructions = `A new GitHub issue has been opened in ${repo.owner}/${repo.name}. Read the issue details, explore the relevant code in the repository, create a new branch, implement the fix or feature requested, and open a pull request that resolves the issue. Reference the issue number in the PR description.`;
-
-    const automationResult = (await selfClient.callTool({
-      name: "AUTOMATION_CREATE",
-      arguments: {
-        name: `${repo.name}: auto-respond to issues`,
-        virtual_mcp_id: virtualMcpId,
-        messages: automationInstructions,
-        active: true,
-      },
-    })) as { structuredContent?: unknown };
-
-    const automationPayload = (automationResult.structuredContent ??
-      automationResult) as { id: string };
-
-    await selfClient.callTool({
-      name: "AUTOMATION_TRIGGER_ADD",
-      arguments: {
-        automation_id: automationPayload.id,
-        type: "event",
-        connection_id: connectionId,
-        event_type: issueTrigger.type,
-        params,
-      },
+    const { total, failed } = await setupStorefrontGithubAutomations({
+      githubCallTool: (req) => githubClient.callTool(req),
+      selfCallTool: (req) => selfClient.callTool(req),
+      virtualMcpId,
+      repo,
+      connectionId,
+      selectedKeys,
     });
+    if (failed > 0) {
+      toast.warning(
+        `Set up ${total - failed}/${total} GitHub automations. Add the rest from the automations view.`,
+      );
+    }
   };
 
   const importMutation = useMutation({
@@ -332,68 +294,106 @@ function PickerContent({
         throw new Error("No GitHub connection or installation");
       }
 
-      const connectionId = effectiveConnection.id;
+      const installationId = selectedInstallation.installationId;
 
-      const result = (await selfClient.callTool({
-        name: "COLLECTION_VIRTUAL_MCP_CREATE",
-        arguments: {
-          data: {
-            title: repo.name,
-            description: repo.description || "Imported from GitHub",
-            pinned: true,
-            icon: null,
-            metadata: {
-              githubRepo: {
-                owner: repo.owner,
-                name: repo.name,
-                url: repo.url,
-                installationId: selectedInstallation.installationId,
-                connectionId,
-              },
-              instructions: null,
-              // runtime is resolved server-side inside VM_START's lockfile
-              // probe (github-runtime-detect.ts). Writing a client-side
-              // sentinel here only re-created the race the probe fixed.
-              ui: {
-                pinnedViews: null,
-                layout: {
-                  defaultMainView: {
-                    type: "preview",
+      const { childConnectionId } = await provisionRepoScopedGithubConnection({
+        orgSlug: org.slug,
+        sourceConnection: effectiveConnection,
+        installationId,
+        owner: repo.owner,
+        repo: repo.name,
+        githubCallTool: (req) => githubClient.callTool(req),
+        selfCallTool: (req) => selfClient.callTool(req),
+      });
+
+      let createdAgentId: string | null = null;
+
+      try {
+        // Create the agent wired to the CHILD connection (not the org one).
+        const result = (await selfClient.callTool({
+          name: "COLLECTION_VIRTUAL_MCP_CREATE",
+          arguments: {
+            data: {
+              title: repo.name,
+              description: repo.description || "Imported from GitHub",
+              pinned: false,
+              icon: null,
+              metadata: {
+                githubRepo: {
+                  owner: repo.owner,
+                  name: repo.name,
+                  url: repo.url,
+                  installationId,
+                  connectionId: childConnectionId,
+                },
+                instructions: null,
+                // runtime is resolved server-side inside SANDBOX_START's
+                // lockfile probe (github-runtime-detect.ts). Writing a
+                // client-side sentinel here only re-created the race the probe
+                // fixed.
+                ui: {
+                  pinnedViews: null,
+                  layout: {
+                    defaultMainView: { type: "preview" },
+                    chatDefaultOpen: true,
                   },
-                  chatDefaultOpen: true,
                 },
               },
+              connections: [{ connection_id: childConnectionId }],
             },
-            connections: [{ connection_id: connectionId }],
           },
-        },
-      })) as { structuredContent?: unknown };
+        })) as { structuredContent?: unknown };
 
-      const payload = (result.structuredContent ?? result) as {
-        item: { id: string; title: string };
-      };
+        const payload = (result.structuredContent ?? result) as {
+          item?: { id: string; title: string };
+        };
+        const virtualMcpId = payload.item?.id;
+        if (!payload.item || !virtualMcpId) {
+          throw new Error("Failed to create the imported agent");
+        }
+        createdAgentId = virtualMcpId;
 
-      const virtualMcpId = payload.item.id;
+        // 5. Repoint automations at the per-agent child connection.
+        if (effectiveSelectedKeys.size > 0) {
+          await setupGithubAutomations({
+            virtualMcpId,
+            repo,
+            connectionId: childConnectionId,
+            selectedKeys: effectiveSelectedKeys,
+          }).catch((err) => {
+            console.error("Failed to set up GitHub automations:", err);
+            toast.warning(
+              "Imported repo, but failed to set up GitHub automations. You can add triggers manually from the automations view.",
+            );
+          });
+        }
 
-      if (effectiveAutoRespond) {
-        await setupIssueAutomation({
+        return {
           virtualMcpId,
           repo,
-          connectionId,
-        }).catch((err) => {
-          console.error("Failed to set up issue automation:", err);
-          toast.warning(
-            "Imported repo, but failed to set up issue auto-response. You can add the trigger manually from the automations view.",
-          );
-        });
+          connectionId: childConnectionId,
+          item: payload.item,
+        };
+      } catch (err) {
+        // Rollback: leave nothing behind. If the agent was created, delete it
+        // (which also tears down its repo-scoped child via server-side cleanup);
+        // always attempt the child delete as a harmless belt-and-suspenders.
+        if (createdAgentId) {
+          await selfClient
+            .callTool({
+              name: "COLLECTION_VIRTUAL_MCP_DELETE",
+              arguments: { id: createdAgentId },
+            })
+            .catch(() => {});
+        }
+        await selfClient
+          .callTool({
+            name: "COLLECTION_CONNECTIONS_DELETE",
+            arguments: { id: childConnectionId, force: true },
+          })
+          .catch(() => {});
+        throw err;
       }
-
-      return {
-        virtualMcpId,
-        repo,
-        connectionId,
-        item: payload.item,
-      };
     },
     onSuccess: ({ virtualMcpId, repo, connectionId, item }) => {
       queryClient.setQueryData(
@@ -451,7 +451,7 @@ function PickerContent({
     );
   }
 
-  if (githubConnections.length === 0 && autoInstall.status === "idle") {
+  if (orgGithubConnections.length === 0 && autoInstall.status === "idle") {
     return (
       <AutoInstallGitHubUI
         status="installing"
@@ -461,7 +461,7 @@ function PickerContent({
     );
   }
 
-  if (githubConnections.length > 1 && !effectiveConnection) {
+  if (orgGithubConnections.length > 1 && !effectiveConnection) {
     return (
       <div className="flex flex-col py-2">
         <div className="px-4 py-2">
@@ -469,7 +469,7 @@ function PickerContent({
             Select a connection
           </p>
         </div>
-        {githubConnections.map((conn) => (
+        {orgGithubConnections.map((conn) => (
           <button
             key={conn.id}
             type="button"
@@ -503,7 +503,7 @@ function PickerContent({
         orgId={org.id}
         orgSlug={org.slug}
         onSelect={onSelectInstallation}
-        showBackButton={githubConnections.length > 1}
+        showBackButton={orgGithubConnections.length > 1}
         onBack={() => setSelectedConnection(null)}
       />
     );
@@ -517,8 +517,10 @@ function PickerContent({
       installation={selectedInstallation}
       onSelectRepo={(repo) => importMutation.mutate(repo)}
       isSaving={importMutation.isPending}
-      autoRespondToIssues={autoRespondToIssues}
-      onAutoRespondChange={setAutoRespondToIssues}
+      autoRespondEnabled={autoRespondEnabled}
+      onAutoRespondChange={setAutoRespondEnabled}
+      selectedAutomationKeys={selectedAutomationKeys}
+      onAutomationKeysChange={setSelectedAutomationKeys}
       hideAutoRespondCheckbox={hideAutoRespondCheckbox}
     />
   );
@@ -547,19 +549,8 @@ function InstallationPicker({
 
   const installationsQuery = useQuery({
     queryKey: KEYS.githubUserOrgs(orgId, connectionId),
-    queryFn: async () => {
-      const result = await selfClient.callTool({
-        name: "GITHUB_LIST_USER_ORGS",
-        arguments: { connectionId },
-      });
-      const content = (result as { content?: Array<{ text?: string }> })
-        .content?.[0]?.text;
-      if (!content) throw new Error("No response from GITHUB_LIST_USER_ORGS");
-      return JSON.parse(content) as {
-        installations: GitHubInstallation[];
-        appSlug?: string;
-      };
-    },
+    queryFn: () =>
+      fetchGithubInstallations((req) => selfClient.callTool(req), connectionId),
   });
 
   if (installationsQuery.isLoading) {
@@ -656,8 +647,10 @@ function RepoBrowser({
   installation,
   onSelectRepo,
   isSaving,
-  autoRespondToIssues,
+  autoRespondEnabled,
   onAutoRespondChange,
+  selectedAutomationKeys,
+  onAutomationKeysChange,
   hideAutoRespondCheckbox,
 }: {
   connectionId: string;
@@ -666,8 +659,10 @@ function RepoBrowser({
   installation: GitHubInstallation;
   onSelectRepo: (repo: Repo) => void;
   isSaving: boolean;
-  autoRespondToIssues: boolean;
+  autoRespondEnabled: boolean;
   onAutoRespondChange: (value: boolean) => void;
+  selectedAutomationKeys: Set<string>;
+  onAutomationKeysChange: (next: Set<string>) => void;
   hideAutoRespondCheckbox?: boolean;
 }) {
   const [query, setQuery] = useState("");
@@ -713,15 +708,42 @@ function RepoBrowser({
       </div>
 
       {!hideAutoRespondCheckbox && (
-        <label className="flex items-center gap-2 px-4 py-3 border-t border-border shrink-0 cursor-pointer select-none">
-          <Checkbox
-            checked={autoRespondToIssues}
-            onCheckedChange={(checked) => onAutoRespondChange(checked === true)}
-          />
-          <span className="text-xs text-foreground">
-            Auto-respond to new issues with a PR
-          </span>
-        </label>
+        <div className="border-t border-border shrink-0">
+          <label className="flex items-center gap-2 px-4 py-3 cursor-pointer select-none">
+            <Checkbox
+              checked={autoRespondEnabled}
+              onCheckedChange={(checked) =>
+                onAutoRespondChange(checked === true)
+              }
+            />
+            <span className="text-xs text-foreground">
+              Set up GitHub automations for this repo
+            </span>
+          </label>
+          {autoRespondEnabled && (
+            <div className="px-4 pb-3 pl-9 flex flex-col gap-1.5">
+              {STOREFRONT_GITHUB_AUTOMATIONS.map((spec) => (
+                <label
+                  key={spec.key}
+                  className="flex items-center gap-2 cursor-pointer select-none"
+                >
+                  <Checkbox
+                    checked={selectedAutomationKeys.has(spec.key)}
+                    onCheckedChange={(checked) => {
+                      const next = new Set(selectedAutomationKeys);
+                      if (checked === true) next.add(spec.key);
+                      else next.delete(spec.key);
+                      onAutomationKeysChange(next);
+                    }}
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    {spec.label}
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

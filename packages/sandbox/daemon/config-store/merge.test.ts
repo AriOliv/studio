@@ -33,6 +33,26 @@ describe("deepMerge", () => {
     expect(merged.application?.packageManager?.name).toBe("pnpm");
   });
 
+  it("preserves operator when git patch omits it", () => {
+    const merged = deepMerge(
+      {
+        operator: { userName: "Jane Doe", userEmail: "jane@example.com" },
+        git: { repository: { cloneUrl: "old" } },
+      },
+      {
+        git: {
+          repository: { cloneUrl: "new" },
+          identity: { userName: "Bot", userEmail: "bot@example.com" },
+        },
+      },
+    );
+    expect(merged.operator).toEqual({
+      userName: "Jane Doe",
+      userEmail: "jane@example.com",
+    });
+    expect(merged.git?.repository?.cloneUrl).toBe("new");
+  });
+
   it("absent fields don't overwrite existing ones", () => {
     const current: TenantConfig = {
       application: {
@@ -50,5 +70,36 @@ describe("deepMerge", () => {
     const merged = deepMerge(current, patch);
     expect(merged.application?.port).toBe(3000);
     expect(merged.application?.packageManager?.name).toBe("pnpm");
+  });
+
+  describe("env", () => {
+    it("upserts keys without touching siblings", () => {
+      const merged = deepMerge(
+        { env: { FOO: "1", BAR: "2" } },
+        { env: { FOO: "x" } },
+      );
+      expect(merged.env).toEqual({ FOO: "x", BAR: "2" });
+    });
+
+    it("deletes a key when its value is null", () => {
+      const merged = deepMerge(
+        { env: { FOO: "1", BAR: "2" } },
+        { env: { FOO: null } },
+      );
+      expect(merged.env).toEqual({ BAR: "2" });
+    });
+
+    it("collapses to undefined when all keys are deleted", () => {
+      const merged = deepMerge({ env: { FOO: "1" } }, { env: { FOO: null } });
+      expect(merged.env).toBeUndefined();
+    });
+
+    it("preserves env when patch omits it", () => {
+      const merged = deepMerge(
+        { env: { FOO: "1" } },
+        { application: { runtime: "node" } },
+      );
+      expect(merged.env).toEqual({ FOO: "1" });
+    });
   });
 });

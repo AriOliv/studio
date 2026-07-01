@@ -2,6 +2,8 @@ import { nanoid } from "nanoid";
 
 type IdPrefixes =
   | "conn"
+  | "cwt"
+  | "ccg"
   | "audit"
   | "log"
   | "vir"
@@ -17,7 +19,10 @@ type IdPrefixes =
   | "pc"
   | "dash"
   | "aik"
-  | "vpc";
+  | "sec"
+  | "vpc"
+  | "tile"
+  | "fcfg";
 
 export function generatePrefixedId(prefix: IdPrefixes) {
   return `${prefix}_${nanoid()}`;

@@ -1,9 +1,10 @@
 import type { Context } from "hono";
-import type { ServerPluginContext } from "@decocms/bindings/server-plugin";
+import type { RegistryRouteContext } from "./route-context";
 import { withRuntime } from "@decocms/runtime";
 import { createTool } from "@decocms/runtime/tools";
 import { z } from "zod";
 import { RegistryItemStorage } from "@/storage/registry/registry-item";
+import type { PrivateRegistryListResult } from "@/storage/registry/types";
 import {
   RegistryListInputSchema,
   RegistryListOutputSchema,
@@ -13,6 +14,18 @@ import {
   RegistrySearchInputSchema,
   RegistrySearchOutputSchema,
 } from "@/tools/registry/schema";
+import { createTtlLruCache } from "@/lib/ttl-lru-cache";
+
+const LIST_CACHE_TTL_MS = 60_000 * 60; // 1 hour
+const LIST_CACHE_MAX_ENTRIES = 500;
+
+// Shared across requests: the public list is unauthenticated and read-heavy, so
+// use an access-ordered LRU (reads keep popular queries warm).
+const publicListCache = createTtlLruCache<PrivateRegistryListResult>({
+  ttlMs: LIST_CACHE_TTL_MS,
+  maxSize: LIST_CACHE_MAX_ENTRIES,
+  updateRecencyOnGet: true,
+});
 
 /**
  * Create public MCP tools for the registry
@@ -29,14 +42,21 @@ function createPublicMCPTools(storage: RegistryItemStorage, orgId: string) {
     inputSchema: RegistryListInputSchema,
     outputSchema: RegistryListOutputSchema,
     execute: async ({ context }) => {
-      const result = await storage.listPublic(orgId, {
+      const query = {
         limit: context.limit,
         offset: context.offset,
         cursor: context.cursor,
         tags: context.tags,
         categories: context.categories,
         where: context.where,
-      });
+      };
+      const cacheKey = `${orgId}:${JSON.stringify(query)}`;
+
+      const cached = publicListCache.get(cacheKey);
+      if (cached) return cached;
+
+      const result = await storage.listPublic(orgId, query);
+      publicListCache.set(cacheKey, result);
       return result;
     },
   });
@@ -131,7 +151,7 @@ function createPublicMCPTools(storage: RegistryItemStorage, orgId: string) {
  * inner MCP path, since the legacy and new prefixes differ.
  */
 export function createPublicMCPHandler(
-  ctx: ServerPluginContext,
+  ctx: RegistryRouteContext,
 ): (c: Context) => Promise<Response> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const db = ctx.db as any;

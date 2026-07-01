@@ -22,17 +22,29 @@ image:
 service:
   type: ClusterIP
   port: 80
-  targetPort: 3000
+  # Same-zone endpoint preference (kube-proxy topology hints) to cut cross-zone
+  # traffic. Empty → field omitted (REQUIRED on k8s < 1.31, where it's rejected).
+  # Set "PreferClose" on k8s >= 1.31. Best-effort: needs pods spread across zones
+  # to take effect; falls back to all endpoints otherwise.
+  trafficDistribution: ""
+
+# Prometheus scraping of the app's /metrics endpoint (HTTP request-duration
+# histogram, event-loop delay, runtime metrics). Adds prometheus.io/* pod
+# annotations for vmagent's kubernetes-pods job. Disable if your cluster uses
+# ServiceMonitor CRDs or doesn't scrape pods by annotation.
+metrics:
+  scrape: true
+  path: /metrics
 
 resources:
   requests:
-    memory: "2Gi"
-    cpu: "2000m"
+    cpu: "750m"
+    memory: "1Gi"
   limits:
-    memory: "2Gi"
+    memory: "1Gi"
 
 database:
-  engine: sqlite # sqlite | postgresql
+  engine: postgresql # postgresql required for split API/worker pods
   url: ""        # Required when engine=postgresql
   caCert: ""     # Optional: Specify existing CA certificate in PEM format
 
@@ -51,6 +63,55 @@ autoscaling:
   maxReplicas: 6
   targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: 80
+
+worker:
+  # Worker Deployment for agent/automation run queues. The main Deployment is
+  # API-only behind nginx, so workers are required to dequeue runs. Workers carry
+  # a distinct `app.kubernetes.io/name` (`<name>-worker`), so the main Service
+  # selector does not match them.
+  # When true, render a second Deployment (`<fullname>-worker`) that dequeues
+  # only the agent/automation run queues (MESH_DISPATCH_ROLE=worker). Required
+  # because the main Deployment now runs API-only containers behind nginx.
+  enabled: true
+  replicaCount: 2
+  # Workers are CPU-bound on LLM streams — give headroom and scale on CPU.
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 30
+    targetCPUUtilizationPercentage: 65
+  # Extra env for worker pods only (merged after the shared envFrom).
+  env: []
+
+nginx:
+  image:
+    repository: ghcr.io/decocms/studio/studio-nginx
+    tag: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "128Mi"
+    limits:
+      memory: "256Mi"
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: false
+  preStopSleepSeconds: 15
+  # Labels stamped onto the combo (nginx + API) pods so a front-door
+  # LoadBalancer (e.g. the deco-apps-cd NLB) can select them by a stable label
+  # instead of app.kubernetes.io/name. Applied to the combo deployment ONLY
+  # (never the worker), so the raw-API worker is never registered as a public
+  # target. Empty by default; set e.g. { decocms.com/frontdoor: "true" }.
+  frontDoorLabels: {}
 
 configMap:
   meshConfig:
@@ -73,6 +134,27 @@ secret:
   # If omitted, the server auto-generates a random key on each boot (breaks across restarts).
   # Generate with: openssl rand -base64 32
   ENCRYPTION_KEY: ""
+  # Optional: required for the public NATS link tunnel when using the
+  # chart-managed Secret. Prefer secret.secretName or externalSecret for
+  # production GitOps so these values are not stored in plain values files.
+  # NATS_ACCOUNT_JWT: ""
+  # NATS_ACCOUNT_SIGNING_KEY: ""
+  # NATS_OPERATOR_JWT: ""
+  # NATS_CLUSTER_CREDS: ""
+
+# ExternalSecret — pull all values from AWS Secrets Manager via external-secrets operator.
+# When enabled, creates a namespace-scoped SecretStore and an ExternalSecret using dataFrom
+# so every key in the SM JSON becomes an env var automatically.
+# Requires: external-secrets operator installed on the cluster.
+# Incompatible with: secret.secretName (both reference the same target Secret name).
+externalSecret:
+  enabled: false
+  # secretPath: ""  # Required when enabled. SM secret key path.
+  secretStoreName: "aws-secrets-manager"
+  refreshInterval: "1h"
+  provider:
+    aws:
+      region: "sa-east-1"
 
 volumes: []
 # - name: foo
@@ -122,7 +204,7 @@ readinessProbe:
   timeoutSeconds: 3
   failureThreshold: 4
 
-terminationGracePeriodSeconds: 60
+terminationGracePeriodSeconds: 120
 
 # Optional lifecycle hooks (preStop, postStart)
 # lifecycle: {}
@@ -216,8 +298,29 @@ s3Sync:
 # NATS subchart (https://artifacthub.io/packages/helm/nats/nats)
 # When enabled, NATS_URL is automatically set to nats://<release-name>-nats:4222
 # unless overridden via configMap.meshConfig.NATS_URL
+tunnel:
+  nats:
+    publicUrl: "" # e.g. wss://nats.example.com
+    publicEnabled: false
+    sessionTtlSeconds: 900
+    clusterCreds:
+      # Enable when NATS runs in operator/JWT mode and Studio's internal
+      # NATS_URL connection must authenticate with a creds file.
+      enabled: false
+      # Empty defaults to the same Secret consumed by Studio envFrom
+      # (secret.secretName, externalSecret target, or the chart-managed Secret).
+      secretName: ""
+      secretKey: "NATS_CLUSTER_CREDS"
+      mountDir: "/etc/nats-creds"
+      fileName: "cluster.creds"
+
 nats:
   enabled: true
+  # Native NATS websocket/ingress settings belong to the NATS subchart under
+  # nats.config.websocket and nats.config.websocket.ingress. This chart does
+  # not enable them by default and Helm cannot derive subchart websocket values
+  # from tunnel.nats.*; set both sections explicitly when exposing a public
+  # tunnel.
   config:
     jetstream:
       enabled: true
@@ -230,6 +333,24 @@ nats:
           enabled: true
           size: 10Gi
           storageClassName: ""  # empty = use cluster default StorageClass
+
+# DBOS Conductor — opt-in management service for DBOS workflows.
+# https://docs.dbos.dev/production/conductor
+# When enabled, the app dials wss:// to the conductor URL for workflow
+# recovery, observability, and retention. Disconnects don't affect the
+# request path. Requires outbound egress to the conductor URL.
+dbosConductor:
+  enabled: false
+  # Inline API key — written into the chart-managed Secret as DBOS_CONDUCTOR_KEY.
+  # Leave empty when supplying the key via existingSecret.
+  key: ""
+  # Optional WS URL override. SDK default: wss://cloud.dbos.dev/conductor/v1alpha1
+  url: ""
+  # Pre-existing Secret with the conductor key. When set, the chart skips
+  # writing the key and references this Secret instead. Mutually exclusive
+  # with `key`.
+  existingSecret: ""
+  existingSecretKey: "DBOS_CONDUCTOR_KEY"
 
 # Additional environment variables (merged with existing envs)
 env: []

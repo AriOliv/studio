@@ -4,7 +4,9 @@
  * Contains shared types and the ExpandedLogContent component used by LogRow.
  */
 
-import { useProjectContext } from "@decocms/mesh-sdk";
+import { formatBytes } from "@/web/lib/format-bytes";
+import { useConnections, useProjectContext } from "@decocms/mesh-sdk";
+import { getConnectionSlug } from "@/shared/utils/connection-slug";
 import { Badge } from "@deco/ui/components/badge.tsx";
 import { Button } from "@deco/ui/components/button.tsx";
 import {
@@ -39,7 +41,7 @@ import type {
   MonitoringLog as BaseMonitoringLog,
   MonitoringLogsResponse as BaseMonitoringLogsResponse,
 } from "./monitoring-stats-row.tsx";
-import { MonacoCodeEditor } from "../details/workflow/components/monaco-editor.tsx";
+import { MonacoCodeEditor } from "../monaco-editor.tsx";
 
 // Re-export base types for convenience
 export type { BaseMonitoringLog, BaseMonitoringLogsResponse };
@@ -93,7 +95,7 @@ export interface MonitoringLogsResponse
 
 export interface MonitoringSearchParams {
   // Tab selection
-  tab?: "overview" | "audit" | "dashboards" | "threads";
+  tab?: "overview" | "audit" | "dashboards" | "threads" | "automations";
   // Time range using expressions (from/to)
   from?: string; // e.g., "now-24h", "now-7d", or ISO string
   to?: string; // e.g., "now" or ISO string
@@ -329,12 +331,6 @@ function truncateJsonForDisplay(
   };
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 // ============================================================================
 // Expanded Log Content Component
 // ============================================================================
@@ -348,6 +344,10 @@ export function ExpandedLogContent({ log }: ExpandedLogContentProps) {
   const [copiedOutput, setCopiedOutput] = useState(false);
   const navigate = useNavigate();
   const { org } = useProjectContext();
+  // Reads from the same cache the monitoring page already populated, so this
+  // doesn't trigger an extra fetch — we just need the connection's slug
+  // (the tool detail route keys off $appSlug, not the connection id).
+  const connections = useConnections();
 
   // Process JSON for display (React 19 compiler handles optimization)
   const inputJson = truncateJsonForDisplay(log.input);
@@ -386,16 +386,23 @@ export function ExpandedLogContent({ log }: ExpandedLogContentProps) {
   };
 
   const handleReplay = () => {
+    // The tool detail route resolves connections by slug ($appSlug), not by id,
+    // so map this log's connectionId to its slug before navigating.
+    const connection = connections.find((c) => c.id === log.connectionId);
+    if (!connection) {
+      toast.error("Could not find the connection for this tool call");
+      return;
+    }
     // Generate unique replay ID
     const replayId = crypto.randomUUID();
     // Store input in sessionStorage
     sessionStorage.setItem(`replay-${replayId}`, JSON.stringify(log.input));
     // Navigate to tool page with replayId
     navigate({
-      to: "/$org/settings/connections/$connectionId/$collectionName/$itemId",
+      to: "/$org/settings/connections/$appSlug/$collectionName/$itemId",
       params: {
         org: org.slug,
-        connectionId: log.connectionId,
+        appSlug: getConnectionSlug(connection),
         collectionName: "tools",
         itemId: encodeURIComponent(log.toolName),
       },

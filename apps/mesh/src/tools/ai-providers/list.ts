@@ -1,6 +1,6 @@
 import z from "zod";
 import { defineTool } from "../../core/define-tool";
-import { requireAuth, requireOrganization } from "../../core/mesh-context";
+import { requireAuth, requireOrganization } from "../../core/studio-context";
 import { getProviders } from "@/ai-providers/registry";
 
 export const AI_PROVIDERS_LIST = defineTool({
@@ -19,9 +19,7 @@ export const AI_PROVIDERS_LIST = defineTool({
         name: z.string(),
         description: z.string(),
         logo: z.string().optional(),
-        supportedMethods: z.array(
-          z.enum(["api-key", "oauth-pkce", "cli-activate"]),
-        ),
+        supportedMethods: z.array(z.enum(["api-key", "oauth-pkce"])),
         supportsTopUp: z.boolean().optional(),
         supportsCredits: z.boolean().optional(),
         supportsProvision: z.boolean().optional(),

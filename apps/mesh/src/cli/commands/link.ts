@@ -1,252 +1,256 @@
-import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { readFile } from "node:fs/promises";
+/**
+ * `deco link` — start the desktop-side link daemon.
+ *
+ * Uses the NATS tunnel transport for cluster-to-desktop sandbox and daemon
+ * commands. Presence is maintained via a 60 s NATS-KV TTL re-armed by the
+ * tunnel session. Also runs a local ingress on
+ * `--port` for `<handle>.localhost` sandbox previews.
+ *
+ * Auth: calls `ensureSession` first (with normal console output so the OAuth
+ * login flow is visible). With a TTY (and no `--no-tui`), renders the Ink
+ * task-manager view; otherwise streams plain `console.log` output.
+ */
+import { closeSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
-import { computeAppDomain } from "../lib/app-domain";
-import { copyToClipboard } from "../lib/clipboard";
-import { waitForPort } from "../lib/port-wait";
-import { readSession, type Session } from "../lib/session";
-import { loginCommand } from "./auth/login";
+import { ensureSession } from "../lib/ensure-session";
+import { startLinkDaemon, type LinkDaemonMonitor } from "../../link-daemon";
+import { formatLogLine } from "../format-log-line";
+import {
+  openLinkSandboxRegistry,
+  registryPathForDataDir,
+  type LinkSandboxRecord,
+  type LinkSandboxRegistry,
+} from "../link-sandbox-registry";
 
-export interface TunnelHandle {
-  closed: Promise<void>;
-  close: () => void;
-  // TODO: surface auth failure separately so the caller can show the
-  // "session may be expired" hint described in the spec.
+export interface LinkCommandOptions {
+  port?: number;
+  clusterBaseUrl?: string;
+  dataDir?: string;
+  /** Render the Ink task-manager view. False → plain console.log output. */
+  tui?: boolean;
+  /** Version string for the banner (plain mode). */
+  version?: string;
+  /**
+   * Print the ASCII banner in plain mode. Default true. The managed daemon
+   * spawned by `ensureLink` (dev / npx `--local-sandbox-provider`) sets this
+   * to false so it doesn't render a second banner inside the parent
+   * `dev`/`serve` TUI.
+   */
+  banner?: boolean;
+  /** Hot-reload sandbox daemons spawned by this link process. */
+  hotReload?: boolean;
+  /** Prune safe stale local sandboxes before starting link. */
+  prune?: boolean;
 }
 
-export type TunnelOpener = (params: {
-  domain: string;
-  localAddr: string;
-  apiKey: string;
-  server: string;
-}) => Promise<TunnelHandle>;
-
-/** Minimal spawn signature used by linkCommand — compatible with node:child_process spawn. */
-export type SpawnFn = (
-  command: string,
-  args: string[],
-  options: { stdio: "inherit"; shell: boolean; env: NodeJS.ProcessEnv },
-) => ChildProcess;
-
-export interface LinkOptions {
-  cwd: string;
-  dataDir: string;
-  port: number;
-  env: string;
-  runCommand: string[];
-  /** Injectable: defaults to defaultTunnelOpener (dynamic import of @deco-cx/warp-node). */
-  tunnelOpener?: TunnelOpener;
-  /** Injectable: defaults to waitForPort. */
-  portWaiter?: (port: number) => Promise<string>;
-  /** Injectable: defaults to copyToClipboard. */
-  copyClipboard?: (text: string) => Promise<boolean>;
-  /** Called when no session is present. Returns the new session or null on failure. */
-  ensureSession?: () => Promise<Session | null>;
-  /** Injectable: defaults to node:child_process spawn. */
-  spawn?: SpawnFn;
-  /** Reconnect delay after a tunnel disconnect (default 500ms, matches legacy). */
-  reconnectDelayMs?: number;
-}
-
-export interface LinkRunResult {
-  exit: Promise<number>;
-  cancel: () => Promise<void>;
-}
-
-export function linkCommand(options: LinkOptions): LinkRunResult {
-  let resolveExit!: (n: number) => void;
-  const exit = new Promise<number>((r) => {
-    resolveExit = r;
-  });
-
-  let child: ChildProcess | undefined;
-  let tunnel: TunnelHandle | undefined;
-  let cancelled = false;
-
-  const cancel = async () => {
-    cancelled = true;
-    try {
-      child?.kill("SIGTERM");
-    } catch {}
-    try {
-      tunnel?.close();
-    } catch {}
-    resolveExit(0);
+/**
+ * Redirect the parent process's console away from the terminal so it can't
+ * corrupt the Ink render. When `logFd` is given, `log`/`warn`/`error` lines
+ * are appended to the `deco link` log file; `error` is additionally surfaced
+ * in the TUI footer via `onError`. `--no-tui` is the escape hatch for live
+ * terminal logs (it never installs this interception).
+ */
+function interceptLinkConsole(
+  onError: (msg: string) => void,
+  logFd?: number,
+): () => void {
+  const original = {
+    log: console.log,
+    warn: console.warn,
+    error: console.error,
   };
-
-  void (async () => {
+  const tee = (args: unknown[]): void => {
+    if (logFd === undefined) return;
     try {
-      let session = await readSession(options.dataDir);
-      if (!session) {
-        const ensure =
-          options.ensureSession ?? defaultEnsureSession(options.dataDir);
-        console.log("No session found — opening login...");
-        session = await ensure();
-        if (!session) {
-          console.error("Login failed; cannot open tunnel.");
-          resolveExit(1);
-          return;
-        }
-      }
-
-      const appName = await readPackageName(options.cwd);
-      if (!appName) {
-        console.error(
-          "Could not read `name` from package.json. Run `decocms link` from a project directory.",
-        );
-        resolveExit(1);
-        return;
-      }
-
-      const domain = computeAppDomain(session.user.sub, appName);
-      const publicUrl = `https://${domain}`;
-
-      const spawnImpl: SpawnFn = options.spawn ?? nodeSpawn;
-      if (options.runCommand.length > 0) {
-        const [cmd, ...args] = options.runCommand;
-        if (!cmd) {
-          console.error("runCommand must not be empty");
-          resolveExit(1);
-          return;
-        }
-        console.log(`Starting: ${cmd} ${args.join(" ")}`);
-        const spawned = spawnImpl(cmd, args, {
-          stdio: "inherit",
-          shell: true,
-          env: { ...process.env, [options.env]: publicUrl },
-        });
-        child = spawned;
-        spawned.on("exit", (code) => {
-          if (cancelled) return;
-          cancelled = true;
-          try {
-            tunnel?.close();
-          } catch {}
-          resolveExit(code ?? 0);
-        });
-      } else {
-        console.log(
-          `Tunnel will connect to existing service on port ${options.port}.`,
-        );
-      }
-
-      const wait = options.portWaiter ?? ((p: number) => waitForPort(p));
-      const opener = options.tunnelOpener ?? defaultTunnelOpener;
-      const copy = options.copyClipboard ?? copyToClipboard;
-      const reconnectDelay = options.reconnectDelayMs ?? 500;
-
-      // Loop: open tunnel, wait for it to close, reconnect after a small delay.
-      // Matches legacy behavior — exits only when the user cancels.
-      let firstOpen = true;
-      while (!cancelled) {
-        const host = await wait(options.port);
-        try {
-          tunnel = await opener({
-            domain,
-            localAddr: `http://${host}:${options.port}`,
-            apiKey: session.accessToken,
-            server: `wss://${domain}`,
-          });
-        } catch (err) {
-          console.error(
-            `Tunnel connect failed, retrying: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          await sleep(reconnectDelay);
-          continue;
-        }
-
-        if (firstOpen) {
-          console.log(`Tunnel open: ${publicUrl}`);
-          if (await copy(publicUrl)) {
-            console.log("(URL copied to clipboard)");
-          }
-          firstOpen = false;
-        } else {
-          console.log("Tunnel reconnected.");
-        }
-
-        await tunnel.closed;
-        if (cancelled) break;
-        console.log("Tunnel closed, reconnecting...");
-        await sleep(reconnectDelay);
-      }
-
-      if (!cancelled) resolveExit(0);
-    } catch (err) {
-      console.error(
-        `Link failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      resolveExit(1);
+      writeSync(logFd, `${formatLogLine(args)}\n`);
+    } catch {
+      // Log file unavailable — never let logging break the daemon.
     }
-  })();
-
-  return { exit, cancel };
+  };
+  console.log = (...args: unknown[]) => tee(args);
+  console.warn = (...args: unknown[]) => tee(args);
+  console.error = (...args: unknown[]) => {
+    tee(args);
+    onError(formatLogLine(args));
+  };
+  return () => {
+    console.log = original.log;
+    console.warn = original.warn;
+    console.error = original.error;
+  };
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function readPackageName(cwd: string): Promise<string | null> {
+/**
+ * Fails loudly when the studio rejects the session token (401/403) instead of
+ * letting the daemon's WS reconnect loop retry an invalid token indefinitely
+ * (the WS handshake 401 surfaces only as an abnormal 1006 close, which the
+ * reconnect policy treats as retryable). Network/other errors are ignored —
+ * the connection attempt will surface those itself.
+ */
+async function assertStudioAcceptsToken(
+  clusterBaseUrl: string,
+  token: string,
+): Promise<void> {
+  let res: Response;
   try {
-    const raw = await readFile(join(cwd, "package.json"), "utf8");
-    const parsed = JSON.parse(raw) as { name?: unknown };
-    return typeof parsed.name === "string" && parsed.name.length > 0
-      ? parsed.name
-      : null;
+    res = await fetch(`${clusterBaseUrl}/api/links/me`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10_000),
+    });
   } catch {
-    return null;
+    return; // network / timeout — let the daemon try and report
+  }
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(
+      `Authentication rejected by ${clusterBaseUrl} — the session token was not accepted. ` +
+        `Run \`deco auth login --target ${clusterBaseUrl}\` and try again.`,
+    );
   }
 }
 
-function defaultEnsureSession(dataDir: string): () => Promise<Session | null> {
-  return async () => {
-    const code = await loginCommand({ dataDir });
-    if (code !== 0) return null;
-    return readSession(dataDir);
+export async function runLinkCommand(
+  opts: LinkCommandOptions = {},
+): Promise<number> {
+  const port = opts.port ?? 5174;
+  const dataDir =
+    opts.dataDir ??
+    process.env.DATA_DIR ??
+    process.env.DECOCMS_HOME ??
+    join(homedir(), "deco");
+  const clusterBaseUrl =
+    opts.clusterBaseUrl ??
+    process.env.MESH_CLUSTER_URL ??
+    "https://studio.decocms.com";
+
+  let restoreConsole: (() => void) | undefined;
+  let logFd: number | undefined;
+  let registry: LinkSandboxRegistry | undefined;
+  const closeRegistry = () => {
+    if (registry === undefined) return;
+    try {
+      registry.close();
+    } catch {
+      // already closed
+    } finally {
+      registry = undefined;
+    }
   };
-}
+  try {
+    const sandboxRoot = join(dataDir, "sandboxes");
+    registry = openLinkSandboxRegistry({
+      path: registryPathForDataDir(dataDir),
+      managedSandboxRoot: sandboxRoot,
+    });
 
-// The Warp tunnel server still expects the legacy shared key — it does not
-// yet verify OAuth bearer tokens. Until that lands, fall back to this
-// hardcoded value (overridable via DECO_TUNNEL_SERVER_TOKEN) so `link`
-// works end-to-end. The session's OAuth access token from `params.apiKey`
-// is intentionally ignored here for now; we keep storing it on the
-// session so we can flip the source back in one line once Warp is ready.
-const LEGACY_TUNNEL_TOKEN = "c309424a-2dc4-46fe-bfc7-a7c10df59477";
+    // Login flow (may open a browser / prompt) runs with normal console.
+    // Auth targets the same studio we link against.
+    const session = await ensureSession({
+      dataDir,
+      intent: "Link",
+      target: clusterBaseUrl,
+    });
 
-// If `tunnel.registered` doesn't resolve within this window, the Warp
-// server most likely silently rejected the auth. Surface that as an
-// error instead of hanging indefinitely.
-const REGISTRATION_TIMEOUT_MS = 15_000;
+    // Preflight (interactive / standalone only): confirm the studio accepts
+    // this token before connecting. The managed daemon (dev) skips it — its
+    // failures surface in the parent dev logs, and it authenticates with a
+    // bootstrapped API key rather than a logged-in session.
+    if (process.env.DECOCMS_LINK_MANAGED !== "1") {
+      await assertStudioAcceptsToken(clusterBaseUrl, session.accessToken);
+    }
 
-const defaultTunnelOpener: TunnelOpener = async (params) => {
-  const { connect } = await import("@deco-cx/warp-node");
-  const tunnel = await connect({
-    domain: params.domain,
-    localAddr: params.localAddr,
-    server: params.server,
-    apiKey: process.env.DECO_TUNNEL_SERVER_TOKEN ?? LEGACY_TUNNEL_TOKEN,
-  });
-  await Promise.race([
-    tunnel.registered,
-    new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        reject(
-          new Error(
-            `Tunnel registration timed out after ${REGISTRATION_TIMEOUT_MS / 1000}s — Warp server may have rejected the auth. Try upgrading the CLI.`,
-          ),
+    let persistedRows: LinkSandboxRecord[] = registry.reconcile();
+    if (opts.prune) {
+      const pruneResult = registry.prune({ missing: true, merged: true });
+      if (!opts.tui) {
+        console.log(
+          `Pruned local sandboxes: removed ${pruneResult.removed.length}, skipped ${pruneResult.skipped.length}.`,
         );
-      }, REGISTRATION_TIMEOUT_MS);
-    }),
-  ]);
-  return {
-    // Connected.closed resolves with Error | undefined; we discard the value
-    // to satisfy TunnelHandle.closed: Promise<void>.
-    closed: tunnel.closed.then(() => undefined),
-    close: () => {
-      // @deco-cx/warp-node Connected has no close() method; the connection
-      // closes on its own when the server drops it.
-    },
-  };
-};
+      }
+      persistedRows = registry.reconcile();
+    }
+
+    let monitor: LinkDaemonMonitor | undefined;
+
+    if (opts.tui) {
+      const { render } = await import("ink");
+      const { createElement } = await import("react");
+      const { LinkApp } = await import("../link-app");
+      const {
+        pushSandboxEvent,
+        setCluster,
+        setClusterUrl,
+        setDaemonError,
+        setIngress,
+        setLogPath,
+        setMachine,
+        setPersistedSandboxes,
+      } = await import("../link-store");
+
+      // link.log — the daemon's own intercepted console (cluster connection,
+      // work/control/proxy polls, [user-desktop] lifecycle, dispatch +
+      // chunk-relay diagnostics). The transport log. Opened with "w"
+      // (truncate) — RECREATED every restart; the previous "a" (append) is what
+      // let it balloon to 100+ MB across sessions.
+      //
+      // Each spawned sandbox daemon's (very noisy) stdout/stderr goes to its
+      // OWN `<workdir>/tmp/daemon.log` instead (see `perSandboxLogs` below), so
+      // this file stays a legible transport timeline.
+      mkdirSync(dataDir, { recursive: true });
+      const logPath = join(dataDir, "link.log");
+      logFd = openSync(logPath, "w");
+      setLogPath(logPath);
+
+      setPersistedSandboxes(persistedRows);
+      setClusterUrl(clusterBaseUrl);
+      setCluster("connecting");
+      monitor = {
+        onEvent: (e) => pushSandboxEvent(e),
+        onIngress: (p) => setIngress(p, `http://127.0.0.1:${p}`),
+        onCluster: (s) => setCluster(s),
+        onMachine: (label) => setMachine(label),
+      };
+      restoreConsole = interceptLinkConsole(setDaemonError, logFd);
+      render(createElement(LinkApp), { patchConsole: false });
+    } else if (opts.banner !== false) {
+      const { printBanner } = await import("../banner-art");
+      printBanner(opts.version ?? "0.0.0");
+    }
+
+    closeRegistry();
+
+    // Standalone `deco link` isolates each sandbox daemon's output into its own
+    // `<workdir>/tmp/daemon.log`. The managed/dev daemon leaves it off so its
+    // sandboxes' output streams to the parent `dev`/`serve` process instead.
+    const perSandboxLogs = process.env.DECOCMS_LINK_MANAGED !== "1";
+
+    const handle = await startLinkDaemon({
+      port,
+      clusterBaseUrl,
+      dataDir,
+      session,
+      monitor,
+      logFd,
+      perSandboxLogs,
+      hotReload: opts.hotReload,
+    });
+    return await handle.stopped;
+  } catch (err) {
+    // Restore BEFORE printing so a fatal error is visible on real stderr,
+    // not swallowed into the TUI footer.
+    restoreConsole?.();
+    console.error(err instanceof Error ? err.message : String(err));
+    return 1;
+  } finally {
+    // Backstop: console must never leak patched, regardless of exit path.
+    restoreConsole?.();
+    if (logFd !== undefined) {
+      try {
+        closeSync(logFd);
+      } catch {
+        // already closed
+      }
+    }
+    closeRegistry();
+  }
+}

@@ -16,7 +16,6 @@ import {
   useMCPClient,
   useProjectContext,
 } from "@decocms/mesh-sdk";
-import { usePromptConnectionMap } from "@/web/components/chat/use-prompt-connection-map";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type {
   ListPromptsResult,
@@ -125,15 +124,6 @@ export const SlashMention = ({ editor, virtualMcpId }: SlashMentionProps) => {
     orgId: org.id,
     orgSlug: org.slug,
   });
-  const promptToConnection = usePromptConnectionMap(
-    virtualMcpId,
-    org.id,
-    org.slug,
-  );
-  const promptToConnectionRef = useRef(promptToConnection);
-  // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- TODO: refactor render-time .current access
-  promptToConnectionRef.current = promptToConnection;
-
   const promptsQueryKey = KEYS.virtualMcpPrompts(virtualMcpId, org.id);
   const resourcesQueryKey = KEYS.virtualMcpResources(virtualMcpId, org.id);
   // Combined key for the suggestion dropdown
@@ -151,29 +141,26 @@ export const SlashMention = ({ editor, virtualMcpId }: SlashMentionProps) => {
   );
 
   // Bridge for chip clicks → edit dialog. The storage on the MentionNode
-  // extension is read by `MentionNodeView`; we dispatch through a ref so the
-  // stored callback always uses the latest closure without needing useEffect.
-  const requestEditRef = useRef<(req: EditMentionRequest) => void>(() => {});
-  // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- intentional latest-closure ref pattern from upstream #3384; upstream main currently fails this same line (lint rule landed in #3399 after the chip-edit feature)
-  requestEditRef.current = async (req: EditMentionRequest) => {
-    if (!client) return;
-    try {
-      const prompts = await fetchPrompts(queryClient, promptsQueryKey, client);
-      const prompt = prompts.find((p) => p.name === req.promptId);
-      if (!prompt?.arguments || prompt.arguments.length === 0) return;
-      setEditingMention({ ...req, prompt });
-    } catch (error) {
-      console.error("[slash] Failed to load prompt for editing:", error);
-      toast.error("Failed to load prompt. Please try again.");
-    }
-  };
-  // Reassign the storage dispatcher on every render so that if SlashMention
-  // remounts (Suspense, route change), the new instance's ref is used instead
-  // of the stale one from the previous mount. The closure simply forwards to
-  // the latest `requestEditRef.current`.
+  // extension is read by `MentionNodeView`; we assign the callback directly
+  // on every render so it always closes over the latest `client` / query state.
   const mentionStorage = getMentionStorage(editor);
   if (mentionStorage) {
-    mentionStorage.onEditChip = (req) => requestEditRef.current(req);
+    mentionStorage.onEditChip = async (req: EditMentionRequest) => {
+      if (!client) return;
+      try {
+        const prompts = await fetchPrompts(
+          queryClient,
+          promptsQueryKey,
+          client,
+        );
+        const prompt = prompts.find((p) => p.name === req.promptId);
+        if (!prompt?.arguments || prompt.arguments.length === 0) return;
+        setEditingMention({ ...req, prompt });
+      } catch (error) {
+        console.error("[slash] Failed to load prompt for editing:", error);
+        toast.error("Failed to load prompt. Please try again.");
+      }
+    };
   }
 
   // Track picker open → close outcome so we can measure abandonment.
@@ -288,7 +275,6 @@ export const SlashMention = ({ editor, virtualMcpId }: SlashMentionProps) => {
         name: p.name,
         title: p.title,
         description: p.description,
-        icon: promptToConnectionRef.current.get(p.name)?.icon ?? null,
         kind: "prompt" as const,
         arguments: p.arguments,
         _meta: p._meta,
@@ -320,8 +306,10 @@ export const SlashMention = ({ editor, virtualMcpId }: SlashMentionProps) => {
     activePrompt?.item.kind === "prompt"
       ? ({
           name: activePrompt.item.name,
+          title: activePrompt.item.title,
           arguments: activePrompt.item.arguments,
           description: activePrompt.item.description,
+          _meta: activePrompt.item._meta,
         } as Prompt)
       : null;
 

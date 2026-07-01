@@ -1,7 +1,7 @@
 /**
  * AUTOMATION_CREATE Tool
  *
- * Creates a new automation with instructions, agent, and model configuration.
+ * Creates a new automation that runs an agent thread on trigger fire.
  */
 
 import { z } from "zod";
@@ -11,14 +11,14 @@ import {
   getUserId,
   requireAuth,
   requireOrganization,
-} from "../../core/mesh-context";
+} from "../../core/studio-context";
 import { ChatTierSchema } from "../organization/schema";
 import { normalizeMessages } from "./normalize-messages";
 
 export const AUTOMATION_CREATE = defineTool({
   name: "AUTOMATION_CREATE",
   description:
-    "Create an automation with instructions, agent, and model config. Triggers can be added separately.",
+    "Create an automation that runs an agent thread on trigger fire. Requires virtual_mcp_id + messages.",
   annotations: {
     title: "Create Automation",
     readOnlyHint: false,
@@ -43,9 +43,20 @@ export const AUTOMATION_CREATE = defineTool({
     models: z
       .object({
         tier: ChatTierSchema,
+        // Optional specific-model override. When both are set, the fire path
+        // pins this concrete model instead of resolving the org tier preset.
+        modelId: z.string().optional(),
+        credentialId: z.string().optional(),
       })
       .loose()
       .default({ tier: "smart" }),
+    // Allowlist of model-facing tool names the run is restricted to.
+    // null/omitted = all of the bound agent's tools (default behavior).
+    tools: z.array(z.string()).nullable().optional(),
+    // Parent agent-loop step cap. null/omitted = platform default
+    // (PARENT_STEP_LIMIT). Raise it for automations that legitimately need
+    // more reasoning/tool steps before stopping.
+    maxAgentSteps: z.number().int().min(1).max(100).nullable().optional(),
     temperature: z.number().default(0.5),
     active: z.boolean().default(true),
   }),
@@ -73,6 +84,11 @@ export const AUTOMATION_CREATE = defineTool({
       name: input.name,
       messages: JSON.stringify(normalizedMessages),
       models: JSON.stringify(input.models),
+      tools:
+        input.tools === undefined || input.tools === null
+          ? null
+          : JSON.stringify(input.tools),
+      max_agent_steps: input.maxAgentSteps ?? null,
       temperature: input.temperature,
       active: input.active,
       virtual_mcp_id: input.virtual_mcp_id,

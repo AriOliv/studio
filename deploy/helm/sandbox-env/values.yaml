@@ -40,7 +40,7 @@ image:
   # instead of silently moving with `:latest`. Bump in lockstep with
   # packages/sandbox/package.json — release-studio-sandbox.yaml tags
   # images using that version. NEVER set this to "latest" in prod.
-  tag: "0.2.1"
+  tag: "1.6.1"
   # Override to Never on local kind clusters that load via `kind load`.
   pullPolicy: IfNotPresent
 
@@ -180,19 +180,45 @@ dnsConfig:
     - name: ndots
       value: "1"
 
-# ── sandbox-pod hardening ──────────────────────────────────────────────
-# User namespace remap (`spec.hostUsers: false`): UID 1000 inside the pod
-# maps to a high, unprivileged subordinate UID on the node, so a
-# container escape doesn't land as a real node UID. Requires K8s 1.30+
-# with a containerd/kernel that support userns (EKS default AMIs from
-# late 2024 onward are fine; kind nodes vary).
+# ── org-fs sidecar (organization filesystem mounts) ───────────────────
+# Mandatory, always deployed: a privileged sidecar that FUSE-mounts the org
+# filesystem volumes (skills + outputs + home) at /app/org/* via
+# WebDAV→rclone, propagated into the unprivileged sandbox container
+# (Bidirectional → HostToContainer). The mount config arrives post-bind:
+# mesh POSTs it to the daemon's /_sandbox/orgfs-config, which relays it onto
+# the shared /run/orgfs control volume the sidecar watches (warm-pool claims
+# reject spec.env, so boot env can't carry it).
 #
-# Defaults to the secure path because this chart runs untrusted user
-# code. Override to true (back to host users) ONLY on clusters whose
-# kernel/containerd doesn't support userns — symptoms of unsupported
-# runtime are pod scheduling failures with messages like "user
-# namespaces are not enabled".
-hostUsers: false
+# org-fs is a hard product requirement (skills, uploads, outputs, home all
+# live here), so it is ON by default. When on it forces `hostUsers: true`
+# (no user-namespace remap) — Kubernetes forbids privileged containers +
+# Bidirectional propagation in user-namespaced pods. Security note: only
+# THIS sidecar is privileged; the untrusted agent container keeps drop-ALL
+# caps, no privilege escalation, runAsNonRoot, and seccomp RuntimeDefault
+# (see the sandbox container in templates/sandbox-template.yaml).
+#
+# disableFsSidecar (opt-out, default false): a DEBUG escape hatch — drops
+# the sidecar + its mounts entirely and restores userns remap
+# (hostUsers: false). The mesh side still teaches `org/` paths, so this is
+# for low-level pod/mount debugging, not a supported org-fs-off mode. NOT
+# used in prod. (Mirror the mesh-side DISABLE_ORGFS_MOUNTS flag, which
+# skips minting the mount config without removing the sidecar.)
+disableFsSidecar: false
+
+orgFs:
+  image:
+    repository: ghcr.io/decocms/studio/orgfs-sidecar
+    # Bump to ship a new sidecar image — release-orgfs-sidecar.yaml reads
+    # this field as the single source of truth (netinit pattern).
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 # Read-only root filesystem. When true, /app + /tmp + /home/sandbox are
 # remounted as emptyDirs and `safe.directory '*'` is set so git works
@@ -253,15 +279,36 @@ previewGateway:
   # Wildcard domain for previews — e.g. "preview.decocms.com" yields
   # `*.preview.decocms.com`. Required when enabled=true.
   domain: ""
-  # cert-manager ClusterIssuer that issues the wildcard cert. Required
-  # when enabled=true. The chart does NOT template the ClusterIssuer
-  # itself — that is per-cluster infrastructure (a Cloudflare DNS-01
-  # issuer, for example, needs your API token in a Secret).
+
+  # Where TLS for the wildcard listener terminates:
+  #   gateway      — (default) Envoy terminates TLS on the listener using a
+  #                  cert-manager-issued Secret. Renders an HTTPS listener + a
+  #                  Certificate; requires `clusterIssuer` and cert-manager.
+  #   loadBalancer — the load balancer in front of the Gateway terminates TLS.
+  #                  The listener is plain HTTP on 443 and NO Certificate is
+  #                  rendered; attach the LB-side cert via
+  #                  `infrastructure.annotations`. Keep the LB→Envoy hop on a
+  #                  trusted network (it carries plaintext).
+  tlsTermination: "gateway"
+
+  # cert-manager ClusterIssuer for the wildcard cert. Required when enabled=true
+  # AND tlsTermination=gateway; ignored for loadBalancer. The chart does not
+  # template the ClusterIssuer itself (per-cluster infra; a DNS-01 issuer is
+  # needed for a wildcard SAN).
   clusterIssuer: ""
-  # PEM-format secret name created by cert-manager. Defaults to
-  # `agent-sandbox-preview-<envName>-tls`. Override only if the cert
-  # lives under a name dictated by external tooling.
+  # cert-manager Secret name. Defaults to `agent-sandbox-preview-<envName>-tls`.
+  # Used only when tlsTermination=gateway.
   tlsSecretName: ""
+
+  # Passed through verbatim into the Gateway's `spec.infrastructure`, which the
+  # controller applies to the resources it generates (for Istio: the Deployment
+  # and the LoadBalancer Service). Use it to set provider-specific annotations/
+  # labels on the LB — e.g. to pin a stable DNS name or, with
+  # tlsTermination=loadBalancer, attach the LB's TLS cert. Keys are
+  # controller-specific and not interpreted by this chart.
+  infrastructure:
+    annotations: {}
+    labels: {}
 
 # ── mesh cross-references ──────────────────────────────────────────────
 # Tells this chart where the chart-deco-studio release for THIS

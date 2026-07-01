@@ -111,6 +111,26 @@ describe("BranchStatusMonitor", () => {
       expect(last.workingTreeDirty).toBe(false);
     });
 
+    it("flips dirty=true when a baseline-boot file is edited again", () => {
+      commitFile(repo.repoDir, "tailwind.css", "/* original */");
+      writeFileSync(join(repo.repoDir, "tailwind.css"), "/* regenerated */");
+
+      const m = newMonitor();
+      m.armBaseline();
+      expect(
+        (m.getLast() as { workingTreeDirty: boolean }).workingTreeDirty,
+      ).toBe(false);
+
+      writeFileSync(
+        join(repo.repoDir, "tailwind.css"),
+        "/* user edit after boot */",
+      );
+      m.refresh();
+      expect(
+        (m.getLast() as { workingTreeDirty: boolean }).workingTreeDirty,
+      ).toBe(true);
+    });
+
     it("flips dirty=true when a non-baseline file changes", () => {
       commitFile(repo.repoDir, "tailwind.css", "/* original */");
       commitFile(repo.repoDir, "src.ts", "export const x = 1;");
@@ -148,7 +168,7 @@ describe("BranchStatusMonitor", () => {
   });
 
   // Regression: when appRoot != repoDir AND appRoot is nested inside another
-  // git worktree (e.g. host runner: <project>/.deco/sandboxes/<handle>/repo
+  // git worktree (e.g. host runner: <project>/sandboxes/<handle>/repo
   // sits under the project's own .git), git's parent-directory walk used to
   // hijack the lookup and report the outer repo's branch. The monitor must
   // resolve git from repoDir and refuse to escape it.

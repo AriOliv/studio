@@ -1,5 +1,23 @@
 import { jsonResponse } from "./routes/body-parser";
 
+/**
+ * Bearer-token auth for the daemon's `/_sandbox/*` routes.
+ *
+ * The daemon only ever receives requests over a trusted transport, so a
+ * shared bearer token is the whole auth story:
+ *   - desktop link: loopback from the link daemon's control handler, which
+ *     injects `Authorization: Bearer <daemonToken>` after the cluster
+ *     reached the link daemon over an authenticated WebSocket;
+ *   - in-cluster docker: loopback from decopilot's built-in tools with the
+ *     same per-spawn bearer token.
+ *
+ * (A prior HMAC request-signing scheme protected the old untrusted
+ * Cloudflare tunnel; that transport was replaced by the WS+NATS link in
+ * commit 998fefd33, leaving the HMAC path with no signer — it has been
+ * removed.)
+ *
+ * Returns null on success; an unauthorized Response on failure.
+ */
 export function requireToken(
   req: Request,
   expectedToken: string,
@@ -10,7 +28,9 @@ export function requireToken(
     return jsonResponse({ error: "unauthorized" }, 401);
   }
   const provided = header.slice(prefix.length);
-  if (!constantTimeEqual(provided, expectedToken)) {
+  // An empty expected token must never match — a daemon spawned without a
+  // token rejects everything rather than accepting a blank `Bearer `.
+  if (!expectedToken || !constantTimeEqual(provided, expectedToken)) {
     return jsonResponse({ error: "unauthorized" }, 401);
   }
   return null;

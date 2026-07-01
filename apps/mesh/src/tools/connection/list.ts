@@ -8,7 +8,6 @@
 import {
   type Binder,
   createBindingChecker,
-  EVENT_BUS_BINDING,
   TRIGGER_BINDING,
   BRAND_BINDING,
 } from "@decocms/bindings";
@@ -20,28 +19,38 @@ import {
 import { LANGUAGE_MODEL_BINDING } from "@decocms/bindings/llm";
 import { MCP_BINDING } from "@decocms/bindings/mcp";
 import { OBJECT_STORAGE_BINDING } from "@decocms/bindings/object-storage";
-import {
-  WORKFLOW_BINDING,
-  WORKFLOW_EXECUTION_BINDING,
-} from "@decocms/bindings/workflow";
 import { AI_GATEWAY_BILLING_BINDING } from "@decocms/bindings/ai-gateway";
 import { WellKnownOrgMCPId } from "@decocms/mesh-sdk";
 import { z } from "zod";
 import { defineTool } from "../../core/define-tool";
 import { getBaseUrl } from "../../core/server-constants";
-import { requireOrganization } from "../../core/mesh-context";
+import { requireOrganization } from "../../core/studio-context";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import {
   getMcpListCache,
   fetchWithCache,
+  REVALIDATE_MIN_INTERVAL_MS,
 } from "../../mcp-clients/mcp-list-cache";
-import { clientFromConnection } from "../../mcp-clients";
+import { listToolsWithTimeout } from "../../mcp-clients";
+import { MCP_LIST_TOOLS_TIMEOUT_MS } from "../../core/constants";
 import {
   createDevAssetsConnectionEntity,
   usesLocalObjectStorage,
 } from "./dev-assets";
 import { type ConnectionEntity, ConnectionEntitySchema } from "./schema";
 import { getConnectionSlug } from "@/shared/utils/connection-slug";
+import { connectionMatchesWhere } from "./where-match";
+import { mapWithConcurrency } from "./map-with-concurrency";
+
+/**
+ * Max concurrent live tool probes during binding filtering. Each probe eagerly
+ * connects to a downstream MCP server (transport handshake + a `downstream_tokens`
+ * read), so an unbounded `Promise.all` over a large org fires dozens at once —
+ * saturating the DB pool and blocking the single-threaded event loop while it
+ * parses every tool list. Bounding the fan-out keeps a cold cache from spiking
+ * CPU and tripping the HPA into a needless replica.
+ */
+const BINDING_PROBE_CONCURRENCY = 8;
 
 /**
  * Registry binding: matches connections that expose COLLECTION_REGISTRY_APP_LIST
@@ -62,10 +71,7 @@ const BUILTIN_BINDING_CHECKERS: Record<string, Binder> = {
   ASSISTANTS: ASSISTANTS_BINDING,
   MCP: MCP_BINDING,
   OBJECT_STORAGE: OBJECT_STORAGE_BINDING,
-  WORKFLOW: WORKFLOW_BINDING,
-  WORKFLOW_EXECUTION: WORKFLOW_EXECUTION_BINDING,
   AI_GATEWAY_BILLING: AI_GATEWAY_BILLING_BINDING,
-  EVENT_BUS: EVENT_BUS_BINDING,
   TRIGGER: TRIGGER_BINDING,
   REGISTRY: REGISTRY_BINDING,
   BRAND: BRAND_BINDING,
@@ -177,8 +183,10 @@ export const COLLECTION_CONNECTIONS_LIST = defineTool({
     if (bindingChecker || input.include_tools) {
       const cache = getMcpListCache();
       const selfId = WellKnownOrgMCPId.SELF(organization.id);
-      await Promise.all(
-        connections.map(async (connection) => {
+      await mapWithConcurrency(
+        connections,
+        BINDING_PROBE_CONCURRENCY,
+        async (connection) => {
           if (connection.tools !== null) return;
           // The self MCP requires session auth, so an HTTP round-trip would
           // fail without forwarding cookies. Use in-process transport instead.
@@ -188,29 +196,28 @@ export const COLLECTION_CONNECTIONS_LIST = defineTool({
                   const { listManagementTools } = await import("../../tools");
                   return listManagementTools(ctx) as Promise<unknown[]>;
                 }
-              : async () => {
-                  const client = await clientFromConnection(
+              : () =>
+                  listToolsWithTimeout(
                     connection,
                     ctx,
-                    true,
+                    MCP_LIST_TOOLS_TIMEOUT_MS,
                   );
-                  try {
-                    const result = await client.listTools();
-                    return result.tools;
-                  } finally {
-                    await client.close().catch(() => {});
-                  }
-                };
           const tools = await fetchWithCache(
             "tools",
             connection.id,
             fetchLive,
             cache,
+            // Track background revalidations so the request lifecycle awaits
+            // (and bounds) them instead of leaking a detached MCP handshake per
+            // connection, and throttle them so a polling UI doesn't reconnect to
+            // every downstream on every request. Matches connection/get.ts.
+            (p) => ctx.pendingRevalidations.push(p),
+            REVALIDATE_MIN_INTERVAL_MS,
           );
           if (tools !== null) {
             connection.tools = tools as Tool[];
           }
-        }),
+        },
       );
     }
 
@@ -221,7 +228,11 @@ export const COLLECTION_CONNECTIONS_LIST = defineTool({
       const baseUrl = getBaseUrl();
       const devAssetsId = WellKnownOrgMCPId.DEV_ASSETS(organization.id);
 
-      // Only add if not already in the list and if it matches the slug filter (if any)
+      // Only add it when it isn't already present and when it would satisfy the
+      // caller's filters. The dev-assets row is injected after the SQL query, so
+      // without re-checking the slug and `where` filters here it would bypass
+      // them — e.g. leaking into the agent instance selector's `app_name` filter
+      // and appearing as a selectable instance for every connection.
       if (!connections.some((c) => c.id === devAssetsId)) {
         const devAssetsConnection = createDevAssetsConnectionEntity(
           organization.id,
@@ -229,7 +240,11 @@ export const COLLECTION_CONNECTIONS_LIST = defineTool({
         );
         const slugMatches =
           !input.slug || getConnectionSlug(devAssetsConnection) === input.slug;
-        if (slugMatches) {
+        const whereMatches = connectionMatchesWhere(
+          devAssetsConnection,
+          input.where,
+        );
+        if (slugMatches && whereMatches) {
           connections.unshift(devAssetsConnection);
         }
       }

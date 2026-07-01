@@ -6,7 +6,7 @@ import {
 } from "../constants";
 import type { TaskManager } from "../process/task-manager";
 import { discoverScripts } from "../process/script-discovery";
-import { jsonResponse, parseBase64JsonBody } from "./body-parser";
+import { jsonResponse, parseJsonBody } from "./body-parser";
 import { awaitTaskResponse } from "./tasks";
 
 export type ExecMode = "await" | "background";
@@ -25,15 +25,22 @@ interface ExecBody {
 }
 
 /**
- * POST /_decopilot_vm/exec/<name> — run package-script `<name>` via the
+ * POST /_sandbox/exec/<name> — run package-script `<name>` via the
  * configured package manager, as a Task. Multiple invocations of the same
  * script run concurrently (each gets its own task UUID); the daemon does
  * not coordinate or deduplicate them.
+ *
+ * Dual-serve compat (T11): also accepts the legacy `/_decopilot_vm/exec/<name>`
+ * prefix. Parsing keys off the `/exec/` segment regardless of which prefix
+ * the cluster used, so adding the legacy match in entry.ts is enough — no
+ * branching needed here.
  */
 export function makeExecHandler(deps: ExecDeps) {
   return async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
-    const rawName = url.pathname.slice("/_decopilot_vm/exec/".length);
+    const execIdx = url.pathname.indexOf("/exec/");
+    const rawName =
+      execIdx >= 0 ? url.pathname.slice(execIdx + "/exec/".length) : "";
     if (!rawName) return jsonResponse({ error: "missing script name" }, 400);
     let name: string;
     try {
@@ -70,7 +77,7 @@ export function makeExecHandler(deps: ExecDeps) {
     let body: ExecBody = {};
     if (req.body) {
       try {
-        const parsed = await parseBase64JsonBody(req);
+        const parsed = await parseJsonBody(req);
         if (parsed && typeof parsed === "object") {
           body = parsed as ExecBody;
         }
@@ -83,7 +90,7 @@ export function makeExecHandler(deps: ExecDeps) {
     // a blocking response opt in via mode: "await".
     const mode: ExecMode = body.mode === "await" ? "await" : "background";
 
-    const env = buildDevEnv(config, body.env);
+    const env = buildDevEnv(config, { ...config.env, ...body.env });
     const { cmd, label } = pmRunCommand(
       config.runtimePathPrefix,
       cwd,

@@ -6,28 +6,26 @@
 
 import { vi } from "bun:test";
 import {
-  createTestDatabase,
-  closeTestDatabase,
-  type TestDatabase,
-} from "../../database/test-db";
-import {
-  createTestSchema,
-  seedCommonTestFixtures,
-} from "../../storage/test-helpers";
+  closeTestPgDatabase,
+  connectTestPgDatabase,
+  resetTestPgDatabase,
+  seedCommonTestPgFixtures,
+} from "../../database/test-db-pg";
+import type { StudioDatabase } from "../../database";
 import { CredentialVault } from "../../encryption/credential-vault";
 import {
   SqlThreadStorage,
   OrgScopedThreadStorage,
 } from "../../storage/threads";
 import { VirtualMCPStorage } from "../../storage/virtual";
-import type { BoundAuthClient, MeshContext } from "../../core/mesh-context";
+import type { BoundAuthClient, StudioContext } from "../../core/studio-context";
 
 const ORG_ID = "org_test";
 const USER_ID = "user_test";
 
 export interface ThreadTestEnv {
-  database: TestDatabase;
-  ctx: MeshContext;
+  database: StudioDatabase;
+  ctx: StudioContext;
   orgId: string;
   userId: string;
   close: () => Promise<void>;
@@ -56,9 +54,9 @@ const createMockBoundAuth = (): BoundAuthClient =>
   }) as unknown as BoundAuthClient;
 
 export async function buildThreadTestContext(): Promise<ThreadTestEnv> {
-  const database = await createTestDatabase();
-  await createTestSchema(database.db);
-  await seedCommonTestFixtures(database.db);
+  const database = await connectTestPgDatabase();
+  await resetTestPgDatabase(database);
+  await seedCommonTestPgFixtures(database);
 
   const vault = new CredentialVault(CredentialVault.generateKey());
   const sqlThreads = new SqlThreadStorage(database.db);
@@ -89,6 +87,8 @@ export async function buildThreadTestContext(): Promise<ThreadTestEnv> {
       tags: null as never,
       virtualMcpPluginConfigs: null as never,
       aiProviderKeys: null as never,
+      secrets: null as never,
+      orgFileConfigs: null as never,
       oauthPkceStates: null as never,
       automations: null as never,
       orgSsoConfig: null as never,
@@ -97,6 +97,9 @@ export async function buildThreadTestContext(): Promise<ThreadTestEnv> {
       registry: null as never,
       brandContext: null as never,
       organizationDomains: null as never,
+      organizationJoinRequests: null as never,
+      kv: null as never,
+      interests: null as never,
     },
     vault,
     authInstance: null as never,
@@ -126,19 +129,18 @@ export async function buildThreadTestContext(): Promise<ThreadTestEnv> {
     } as never,
     baseUrl: "https://mesh.example.com",
     metadata: { requestId: "req_test", timestamp: new Date() },
-    eventBus: null as never,
     objectStorage: null as never,
     aiProviders: null as never,
     createMCPProxy: vi.fn().mockResolvedValue({}),
     getOrCreateClient: vi.fn().mockResolvedValue({}),
     pendingRevalidations: [],
-  } as unknown as MeshContext;
+  } as unknown as StudioContext;
 
   return {
     database,
     ctx,
     orgId: ORG_ID,
     userId: USER_ID,
-    close: () => closeTestDatabase(database),
+    close: () => closeTestPgDatabase(database),
   };
 }

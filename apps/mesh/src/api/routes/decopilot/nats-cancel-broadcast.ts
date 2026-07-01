@@ -9,8 +9,9 @@
  * JetStream persistence would be wrong here (replaying stale cancels).
  */
 
-import type { NatsConnection, Subscription } from "nats";
+import type { NatsConnection, Subscription } from "@nats-io/nats-core";
 import type { CancelBroadcast } from "./cancel-broadcast";
+import type { ControlFrame } from "./control-frames";
 
 const CANCEL_SUBJECT = "mesh.decopilot.cancel";
 
@@ -77,6 +78,11 @@ export class NatsCancelBroadcast implements CancelBroadcast {
     } catch (err) {
       console.warn("[NatsCancelBroadcast] Publish failed (non-critical):", err);
     }
+  }
+
+  publishControlFrame(_userSub: string, _frame: ControlFrame): void {
+    // Control frames are delivered through the tunnel publisher installed by
+    // app wiring. The NATS broadcaster only handles cross-pod cancel fan-out.
   }
 
   async stop(): Promise<void> {

@@ -1,0 +1,244 @@
+/**
+ * CLUSTER Decopilot environment-deps assembler (spec §5.2/§9 — "ONE factory").
+ *
+ * The Decopilot harness runs ONE orchestration loop (`runDecopilotCore`). The
+ * package factory gets its StudioContext-backed `DecopilotToolRuntime` +
+ * `telemetry` through this registered cluster assembler:
+ *
+ *   - the in-process virtual-MCP passthrough client + the full cluster tool set
+ *     (web_search / update_interests / Browserless built-ins) + the per-run
+ *     HTML-artifact buffer/watcher, plus the ctx-coupled `runAgentLoop` engine.
+ */
+
+import type {
+  OrganizationScope,
+  StudioContext,
+} from "../../core/studio-context";
+import { monitorLlmCall } from "@/monitoring/emit-llm-call";
+import { recordLlmCallMetrics } from "@/monitoring/record-llm-call-metrics";
+import type { VirtualMCPEntity } from "@/tools/virtual/schema";
+import type { ConnectionEntity } from "@/tools/connection/schema";
+import { createVirtualClientFrom } from "@/mcp-clients/virtual-mcp";
+import { resolveDevConnection } from "@/api/routes/dev-connection";
+import { readSandboxMap } from "@/tools/sandbox/sandbox-map";
+import type { SideChannelWriter } from "@decocms/harness/side-channel-writer";
+import { assembleDecopilotTools } from "./tools";
+import { buildClusterMcpToolHooks } from "@/api/routes/decopilot/cluster-mcp-tool-hooks";
+import { createHtmlArtifactBuffer } from "./built-in-tools/vm-tools/html-artifact-buffer";
+import { createHtmlArtifactWatcher } from "./built-in-tools/vm-tools/html-artifact-watcher";
+import type { PendingImage } from "./built-in-tools";
+import type {
+  DecopilotToolRuntime,
+  ModelRuntime,
+} from "@decocms/harness/decopilot/run-core";
+import type {
+  AssembledEngineHandle,
+  HarnessAssembledTools,
+  RunEngineArgs,
+} from "@decocms/harness/decopilot/engine";
+import { runAgentLoop } from "./run-agent-loop";
+import type { DecopilotTelemetry } from "@decocms/harness/decopilot/run-stream";
+import { createBackgroundToolDispatcher } from "./background-tool-workflow";
+import { requireDecopilotRunContext } from "@decocms/harness/decopilot/run-context";
+
+/**
+ * Cluster engine adapter: maps the portable `RunEngineArgs` onto the ctx-coupled
+ * `runAgentLoop` (which owns system-prompt assembly + tool assembly + the
+ * native streamText loop). Closes over `ctx` + `organization`. No behavior
+ * change — the same `runAgentLoop` call the cluster factory made before the
+ * unification, with the parent-supplied args threaded through.
+ */
+async function runClusterEngine(
+  ctx: StudioContext,
+  organization: OrganizationScope,
+  args: RunEngineArgs,
+): Promise<AssembledEngineHandle> {
+  const handle = await runAgentLoop({
+    kind: args.kind,
+    ctx,
+    organization,
+    virtualMcp: args.virtualMcp,
+    mcpClient: args.mcpClient,
+    provider: args.provider,
+    models: args.models,
+    messages: args.messages,
+    abortSignal: args.abortSignal,
+    temperature: args.temperature,
+    planMode: args.planMode,
+    isDecopilot: args.isDecopilot,
+    systemAgentInstructions: args.systemAgentInstructions,
+    currentThreadId: args.currentThreadId,
+    user: args.user,
+    userContext: args.userContext,
+    codingWorkspace: args.codingWorkspace,
+    writer: args.writer,
+    subtaskParams: {
+      provider: args.provider,
+      organization,
+      models: args.models,
+      codingWorkspace: args.codingWorkspace,
+    },
+    prepareStep: args.prepareStep,
+    onStepFinish: args.onStepFinish,
+    passthroughClient: args.passthroughClient,
+    connectionsData: args.connectionsData,
+    extraTools: args.extraTools,
+    additionalSystemMessages: args.additionalSystemMessages,
+    // Subtask core runs cap the loop at SUBAGENT_STEP_LIMIT (Task 17).
+    stepLimit: args.stepLimit,
+  });
+  return {
+    result: handle.result,
+    error: handle.error,
+    span: handle.span,
+    assembledSystemMessages: handle.assembledSystemMessages,
+  };
+}
+
+/**
+ * Build the CLUSTER environment deps: the StudioContext-backed tool runtime
+ * (in-process virtual-MCP passthrough + full cluster built-ins + the per-run
+ * HTML-artifact buffer) and the cluster telemetry sink. `cleanup.close` is assigned
+ * inside `buildEnvironmentTools` so the factory's `finally` can close the live
+ * passthrough client even if the core throws mid-stream.
+ */
+export function buildClusterEnvironmentTools(args: {
+  ctx: StudioContext;
+  organization: OrganizationScope;
+  modelRuntime: ModelRuntime;
+  sideChannel: SideChannelWriter;
+  cleanup: { close?: () => Promise<void> };
+}): { toolRuntime: DecopilotToolRuntime; telemetry: DecopilotTelemetry } {
+  const { ctx, organization, modelRuntime, sideChannel, cleanup } = args;
+  // Live HTML-artifact previews: change-feed watcher emitting `data-deck-updated`
+  // parts for `decks/`|`pages/` writes in the org home volume, plus the
+  // write/edit fast-path mirror that lands tool content in org-fs at step end
+  // (ahead of the mount's slow vfs write-back).
+  const htmlArtifactWatcher = createHtmlArtifactWatcher(
+    ctx,
+    sideChannel.writer,
+  );
+  const htmlArtifactBuffer = createHtmlArtifactBuffer(ctx);
+
+  const toolRuntime: DecopilotToolRuntime = {
+    buildEnvironmentTools: async ({ input: streamInput, onChildUsage }) => {
+      const runContext = requireDecopilotRunContext(streamInput);
+      const toolOutputMap = new Map<string, string>();
+      const pendingImages: PendingImage[] = [];
+      const { resolveArgs, onToolCalled } = buildClusterMcpToolHooks(ctx);
+
+      const assembled = await assembleDecopilotTools(streamInput, ctx, {
+        writer: sideChannel.writer,
+        toolOutputMap,
+        pendingImages,
+        threadId: streamInput.threadId,
+        // Cluster MCP tool-call hooks: storage-ref resolution + posthog
+        // analytics. The portable assembly forwards these as-is; the
+        // desktop daemon omits them.
+        resolveArgs,
+        onToolCalled,
+        // Cluster `mcpForAgent` hook: opens the in-process passthrough
+        // client over the run's resolved Virtual MCP. superUser/listTimeout
+        // come from the caller (assembleDecopilotTools). The daemon/desktop
+        // factory supplies an HTTP-backed impl at the agent's mcp.url.
+        mcpForAgent: async (_agentId, opts) => {
+          // Cluster-side: `virtualMcp` is the real `VirtualMCPEntity`;
+          // the transport type widens the field to a loose bag so the
+          // daemon can ship without the cluster's storage types.
+          const vm = runContext.virtualMcp as VirtualMCPEntity;
+          // Surface the dev sandbox's tools when the user has a running sandbox
+          // for this agent. Cheap local pre-filter ("does the user have a
+          // sandbox entry?"), no repo/pairing flag — agents without a sandbox
+          // skip the resolver. resolveDevConnection then confirms the dev server
+          // actually speaks MCP (probe).
+          let devConnection: ConnectionEntity | null = null;
+          if (
+            vm.id &&
+            streamInput.user.id &&
+            readSandboxMap(vm.metadata)[streamInput.user.id]
+          ) {
+            devConnection = await resolveDevConnection(
+              ctx,
+              vm.id,
+              streamInput.user.id,
+              runContext.branch ?? undefined,
+            ).catch(() => null);
+          }
+          return createVirtualClientFrom(
+            vm,
+            ctx,
+            "passthrough",
+            opts?.superUser ?? false,
+            {
+              listTimeoutMs: opts?.listTimeoutMs,
+              includeSkillsCatalog: true,
+              additionalConnections: devConnection ? [devConnection] : [],
+            },
+          );
+        },
+        provider: modelRuntime.thinking.provider,
+        imageProvider:
+          modelRuntime.image?.provider ?? modelRuntime.thinking.provider,
+        webSearchProvider:
+          modelRuntime.webSearch?.provider ?? modelRuntime.thinking.provider,
+        deepResearchProvider:
+          modelRuntime.deepResearch?.provider ?? modelRuntime.thinking.provider,
+        // Hosted cluster runs get a DBOS-backed background dispatcher so slow
+        // built-ins (generate_image) don't freeze the turn. The reaction turn
+        // is rebuilt on any pod from this serializable snapshot.
+        backgroundDispatcher: createBackgroundToolDispatcher({
+          threadId: streamInput.threadId,
+          orgId: streamInput.organizationId,
+          userId: streamInput.user.id,
+          agentId: streamInput.agent.id,
+          temperature: streamInput.temperature,
+          toolApprovalLevel: streamInput.toolApprovalLevel,
+          branch: runContext.branch ?? null,
+        }),
+        htmlArtifactBuffer,
+        // Roll subtask child usage into the parent run's accumulator
+        // (Task 17). Threaded into the subtask tool via getBuiltInTools.
+        onChildUsage,
+      });
+      const bundle: HarnessAssembledTools = {
+        tools: assembled.tools,
+        passthroughTools: assembled.passthroughTools,
+        builtInTools: assembled.builtInTools,
+        connectionsBlockTools: assembled.connectionsBlockTools,
+        toolAnnotations: assembled.toolAnnotations,
+        connectionTitleMap: assembled.connectionTitleMap,
+        serverInstructions: assembled.serverInstructions,
+        passthroughClient: assembled.passthroughClient,
+        writer: sideChannel.writer,
+        pendingImages,
+        sideChunks: sideChannel.stream,
+        closeSideChunks: sideChannel.close,
+        onStepFinish: async () => {
+          // Fast-path mirror must land before the sweep so the change-feed
+          // entry it creates is picked up in the same step. Both swallow
+          // their own errors; late rclone write-backs are caught by the next
+          // step's sweep or the tab's stat poll.
+          await htmlArtifactBuffer.flush();
+          await htmlArtifactWatcher.sweep();
+        },
+        close: assembled.close,
+      };
+      cleanup.close = assembled.close;
+      return bundle;
+    },
+    runEngine: (engineArgs) => runClusterEngine(ctx, organization, engineArgs),
+  };
+
+  const telemetry: DecopilotTelemetry = {
+    recordLlmCall: (params) => recordLlmCallMetrics({ ctx, ...params }),
+    monitorLlmCall: (params) =>
+      monitorLlmCall({
+        ctx,
+        ...params,
+        requestId: ctx.metadata.requestId,
+        userAgent: ctx.metadata.userAgent ?? null,
+      }),
+  };
+
+  return { toolRuntime, telemetry };
+}

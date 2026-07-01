@@ -33,20 +33,34 @@ const PersistedModelInfoSchema = z.object({
   provider: z.string().nullish(),
 });
 
+/**
+ * Image and deepResearch tiers can resolve to a different credential than the
+ * chat tier. Pre-fix runs persisted without these per-tool credentialIds — on
+ * resume, the dispatch falls back to the chat credential, matching the
+ * legacy single-provider behavior.
+ */
+const PersistedToolModelInfoSchema = PersistedModelInfoSchema.extend({
+  credentialId: z.string().optional(),
+});
+
 /** Raw DB shape may include legacy `toolApprovalLevel: "plan"`. */
 const PersistedRunConfigRawSchema = z.object({
+  // Legacy rows may carry a `coding` slot; the non-strict object drops it
+  // on parse (the slot was removed — D11).
   models: z.object({
     credentialId: z.string(),
     thinking: PersistedModelInfoSchema,
-    coding: PersistedModelInfoSchema.optional(),
     fast: PersistedModelInfoSchema.optional(),
-    image: PersistedModelInfoSchema.optional(),
-    deepResearch: PersistedModelInfoSchema.optional(),
+    image: PersistedToolModelInfoSchema.optional(),
+    webSearch: PersistedToolModelInfoSchema.optional(),
+    deepResearch: PersistedToolModelInfoSchema.optional(),
   }),
   agent: z.object({ id: z.string() }),
   temperature: z.number(),
   toolApprovalLevel: z.enum(["auto", "readonly", "plan"]).optional(),
-  mode: z.enum(["default", "plan", "web-search", "gen-image"]).optional(),
+  mode: z
+    .enum(["default", "plan", "web-search", "deep-research", "gen-image"])
+    .optional(),
   windowSize: z.number().optional(),
   triggerId: z.string().optional(),
 });
@@ -76,33 +90,3 @@ export const PersistedRunConfigSchema = PersistedRunConfigRawSchema.transform(
     };
   },
 );
-
-export type PersistedRunConfig = z.output<typeof PersistedRunConfigSchema>;
-
-type PersistedModelInfo = z.infer<typeof PersistedModelInfoSchema>;
-
-/**
- * Reconstruct a full ModelInfo (with required `title`) from a persisted model.
- * Falls back to `id` when `title` was not stored.
- */
-function toModelInfo(m: PersistedModelInfo) {
-  return { ...m, title: m.title ?? m.id };
-}
-
-/**
- * Convert a persisted models config into the full `ModelsConfig` shape
- * expected by `DispatchRunInput`, filling in required fields that may
- * have been omitted at persistence time.
- */
-export function toModelsConfig(models: PersistedRunConfig["models"]) {
-  return {
-    credentialId: models.credentialId,
-    thinking: toModelInfo(models.thinking),
-    ...(models.coding && { coding: toModelInfo(models.coding) }),
-    ...(models.fast && { fast: toModelInfo(models.fast) }),
-    ...(models.image && { image: toModelInfo(models.image) }),
-    ...(models.deepResearch && {
-      deepResearch: toModelInfo(models.deepResearch),
-    }),
-  };
-}

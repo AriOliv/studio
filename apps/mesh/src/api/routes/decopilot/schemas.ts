@@ -20,32 +20,47 @@ const MemoryConfigSchema = z.object({
   thread_id: z.string(),
 });
 
-export const StreamRequestSchema = z.object({
-  messages: z
-    .array(UIMessageSchema)
-    .min(1)
-    .refine((msgs) => msgs.filter((m) => m.role !== "system").length === 1, {
-      message: "Expected exactly one non-system message",
-    }),
-  memory: MemoryConfigSchema.optional(),
-  tier: SimpleModeTierSchema.optional(),
-  agent: z
-    .object({
-      id: z.string(),
-    })
-    .loose(),
-  stream: z.boolean().optional(),
-  temperature: z.number().default(0.5),
-  thread_id: z.string().optional(),
-  /**
-   * Git branch to pin the thread to on first-message creation. Only honored
-   * when the thread doesn't exist yet; existing threads keep their branch.
-   */
-  branch: z.string().nullish(),
-  toolApprovalLevel: z.enum(["auto", "readonly"]).default("auto"),
-  mode: z
-    .enum(["default", "plan", "web-search", "gen-image"])
-    .default("default"),
-});
+export const StreamRequestSchema = z
+  .object({
+    messages: z
+      .array(UIMessageSchema)
+      .min(1)
+      .refine((msgs) => msgs.filter((m) => m.role !== "system").length === 1, {
+        message: "Expected exactly one non-system message",
+      }),
+    memory: MemoryConfigSchema.optional(),
+    tier: SimpleModeTierSchema.optional(),
+    agent: z
+      .object({
+        id: z.string(),
+      })
+      .loose(),
+    stream: z.boolean().optional(),
+    temperature: z.number().default(0.5),
+    thread_id: z.string().optional(),
+    /**
+     * Git branch to pin the thread to on first-message creation. Only honored
+     * when the thread doesn't exist yet; existing threads keep their branch.
+     */
+    branch: z.string().nullish(),
+    toolApprovalLevel: z.enum(["auto", "readonly"]).default("auto"),
+    sandboxProviderKind: z
+      .enum(["agent-sandbox", "user-desktop", "cluster"])
+      .transform((kind) => (kind === "cluster" ? "agent-sandbox" : kind))
+      .nullish()
+      .describe(
+        "Pinned on first message. Subsequent messages ignore this field (the thread row carries the pinned value).",
+      ),
+    harnessId: z
+      .enum(["claude-code", "codex", "decopilot"])
+      .nullish()
+      .describe(
+        "Pinned on first message. Subsequent messages ignore this field.",
+      ),
+    mode: z
+      .enum(["default", "plan", "web-search", "deep-research", "gen-image"])
+      .default("default"),
+  })
+  .strict();
 
 export type StreamRequest = z.infer<typeof StreamRequestSchema>;

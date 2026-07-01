@@ -25,7 +25,9 @@ export interface CreateAutomationInput {
   created_by: string;
   messages: string; // JSON
   models: string; // JSON
+  tools?: string | null; // JSON string[] | null = all tools
   temperature?: number;
+  max_agent_steps?: number | null; // null = PARENT_STEP_LIMIT default
   virtual_mcp_id: string;
 }
 
@@ -34,17 +36,20 @@ export interface UpdateAutomationInput {
   active?: boolean;
   messages?: string;
   models?: string;
+  tools?: string | null;
   temperature?: number;
+  max_agent_steps?: number | null;
 }
 
 export interface CreateTriggerInput {
   automation_id: string;
-  type: "cron" | "event";
+  type: "cron" | "event" | "webhook";
   cron_expression?: string | null;
   connection_id?: string | null;
   event_type?: string | null;
   params?: string | null;
   next_run_at?: string | null;
+  api_key_id?: string | null;
 }
 
 // ============================================================================
@@ -79,7 +84,11 @@ export interface AutomationsStorage {
     automationId: string,
   ): Promise<{ success: boolean }>;
   listTriggers(automationId: string): Promise<AutomationTrigger[]>;
+  listTriggersForAutomations(
+    automationIds: string[],
+  ): Promise<AutomationTrigger[]>;
   findTriggerById(triggerId: string): Promise<AutomationTrigger | null>;
+  setTriggerApiKeyId(triggerId: string, apiKeyId: string | null): Promise<void>;
   findActiveEventTriggers(
     connectionId: string,
     eventType: string,
@@ -95,8 +104,36 @@ export interface AutomationsStorage {
     triggerId: string | null,
   ): Promise<string>;
   markRunFailed(taskId: string): Promise<void>;
+  markRunCompleted(taskId: string): Promise<void>;
   updateTriggerLastRunAt(triggerId: string, lastRunAt: string): Promise<void>;
   deactivateAutomation(id: string): Promise<void>;
+  /**
+   * Count run threads for an automation grouped into the run-lifecycle buckets,
+   * joining `threads` → `automation_triggers`. Backs the per-automation Runs
+   * stat cards (total + success rate).
+   */
+  getRunStats(
+    automationId: string,
+    organizationId: string,
+    opts?: { startDate?: string; endDate?: string },
+  ): Promise<AutomationRunStats>;
+  /**
+   * Most-recent run thread IDs for an automation (newest first), capped by
+   * `limit`. Used to aggregate token/cost usage for the stat cards via the
+   * monitoring store (keyed by `properties.thread_id`).
+   */
+  listRunThreadIds(
+    automationId: string,
+    organizationId: string,
+    opts?: { startDate?: string; endDate?: string; limit?: number },
+  ): Promise<string[]>;
+}
+
+export interface AutomationRunStats {
+  total: number;
+  completed: number;
+  failed: number;
+  inProgress: number;
 }
 
 // ============================================================================
@@ -115,7 +152,9 @@ function automationFromDbRow(row: {
   created_by: string;
   messages: string;
   models: string;
+  tools: string | null;
   temperature: number;
+  max_agent_steps: number | null;
   virtual_mcp_id: string;
   created_at: Date | string;
   updated_at: Date | string;
@@ -128,7 +167,9 @@ function automationFromDbRow(row: {
     created_by: row.created_by,
     messages: row.messages,
     models: row.models,
+    tools: row.tools ?? null,
     temperature: row.temperature,
+    max_agent_steps: row.max_agent_steps ?? null,
     virtual_mcp_id: row.virtual_mcp_id,
     created_at: toIsoString(row.created_at),
     updated_at: toIsoString(row.updated_at),
@@ -145,20 +186,74 @@ function triggerFromDbRow(row: {
   params: string | null;
   last_run_at: Date | string | null;
   next_run_at?: Date | string | null;
+  api_key_id?: string | null;
   created_at: Date | string;
 }): AutomationTrigger {
   return {
     id: row.id,
     automation_id: row.automation_id,
-    type: row.type as "cron" | "event",
+    type: row.type as "cron" | "event" | "webhook",
     cron_expression: row.cron_expression,
     connection_id: row.connection_id,
     event_type: row.event_type,
     params: row.params,
     last_run_at: row.last_run_at ? toIsoString(row.last_run_at) : null,
     next_run_at: row.next_run_at ? toIsoString(row.next_run_at) : null,
+    api_key_id: row.api_key_id ?? null,
     created_at: toIsoString(row.created_at),
   };
+}
+
+// Shared between findActiveEventTriggers and findAllCronTriggers — both join
+// `automations as a` and need the full automation row reconstructed from
+// aliased columns. Keeping the alias list in one place means new automation
+// columns only need updating here.
+const TRIGGER_JOIN_AUTOMATION_COLUMNS = [
+  "a.id as a_id",
+  "a.organization_id as a_organization_id",
+  "a.name as a_name",
+  "a.active as a_active",
+  "a.created_by as a_created_by",
+  "a.messages as a_messages",
+  "a.models as a_models",
+  "a.tools as a_tools",
+  "a.temperature as a_temperature",
+  "a.max_agent_steps as a_max_agent_steps",
+  "a.virtual_mcp_id as a_virtual_mcp_id",
+  "a.created_at as a_created_at",
+  "a.updated_at as a_updated_at",
+] as const;
+
+function automationFromAliasedRow(row: {
+  a_id: string;
+  a_organization_id: string;
+  a_name: string;
+  a_active: boolean | number;
+  a_created_by: string;
+  a_messages: string;
+  a_models: string;
+  a_tools: string | null;
+  a_temperature: number;
+  a_max_agent_steps: number | null;
+  a_virtual_mcp_id: string;
+  a_created_at: Date | string;
+  a_updated_at: Date | string;
+}): Automation {
+  return automationFromDbRow({
+    id: row.a_id,
+    organization_id: row.a_organization_id,
+    name: row.a_name,
+    active: row.a_active,
+    created_by: row.a_created_by,
+    messages: row.a_messages,
+    models: row.a_models,
+    tools: row.a_tools,
+    temperature: row.a_temperature,
+    max_agent_steps: row.a_max_agent_steps,
+    virtual_mcp_id: row.a_virtual_mcp_id,
+    created_at: row.a_created_at,
+    updated_at: row.a_updated_at,
+  });
 }
 
 // ============================================================================
@@ -180,7 +275,9 @@ class KyselyAutomationsStorage implements AutomationsStorage {
       created_by: input.created_by,
       messages: input.messages,
       models: input.models,
+      tools: input.tools ?? null,
       temperature: input.temperature ?? 0.5,
+      max_agent_steps: input.max_agent_steps ?? null,
       virtual_mcp_id: input.virtual_mcp_id,
       created_at: now,
       updated_at: now,
@@ -235,7 +332,9 @@ class KyselyAutomationsStorage implements AutomationsStorage {
         "a.created_by",
         "a.messages",
         "a.models",
+        "a.tools",
         "a.temperature",
+        "a.max_agent_steps",
         "a.virtual_mcp_id",
         "a.created_at",
         "a.updated_at",
@@ -257,7 +356,9 @@ class KyselyAutomationsStorage implements AutomationsStorage {
         "a.created_by",
         "a.messages",
         "a.models",
+        "a.tools",
         "a.temperature",
+        "a.max_agent_steps",
         "a.virtual_mcp_id",
         "a.created_at",
         "a.updated_at",
@@ -286,8 +387,11 @@ class KyselyAutomationsStorage implements AutomationsStorage {
     if (input.active !== undefined) updateData.active = input.active;
     if (input.messages !== undefined) updateData.messages = input.messages;
     if (input.models !== undefined) updateData.models = input.models;
+    if (input.tools !== undefined) updateData.tools = input.tools;
     if (input.temperature !== undefined)
       updateData.temperature = input.temperature;
+    if (input.max_agent_steps !== undefined)
+      updateData.max_agent_steps = input.max_agent_steps;
 
     await this.db
       .updateTable("automations")
@@ -331,6 +435,7 @@ class KyselyAutomationsStorage implements AutomationsStorage {
       params: input.params ?? null,
       last_run_at: null,
       next_run_at: input.next_run_at ?? null,
+      api_key_id: input.api_key_id ?? null,
       created_at: now,
     };
 
@@ -367,6 +472,20 @@ class KyselyAutomationsStorage implements AutomationsStorage {
     return rows.map(triggerFromDbRow);
   }
 
+  async listTriggersForAutomations(
+    automationIds: string[],
+  ): Promise<AutomationTrigger[]> {
+    if (automationIds.length === 0) return [];
+    const rows = await this.db
+      .selectFrom("automation_triggers")
+      .selectAll()
+      .where("automation_id", "in", automationIds)
+      .orderBy("created_at", "asc")
+      .execute();
+
+    return rows.map(triggerFromDbRow);
+  }
+
   async findTriggerById(triggerId: string): Promise<AutomationTrigger | null> {
     const row = await this.db
       .selectFrom("automation_triggers")
@@ -375,6 +494,17 @@ class KyselyAutomationsStorage implements AutomationsStorage {
       .executeTakeFirst();
 
     return row ? triggerFromDbRow(row) : null;
+  }
+
+  async setTriggerApiKeyId(
+    triggerId: string,
+    apiKeyId: string | null,
+  ): Promise<void> {
+    await this.db
+      .updateTable("automation_triggers")
+      .set({ api_key_id: apiKeyId })
+      .where("id", "=", triggerId)
+      .execute();
   }
 
   async findActiveEventTriggers(
@@ -394,18 +524,9 @@ class KyselyAutomationsStorage implements AutomationsStorage {
         "t.event_type",
         "t.params",
         "t.last_run_at",
+        "t.api_key_id",
         "t.created_at",
-        "a.id as a_id",
-        "a.organization_id as a_organization_id",
-        "a.name as a_name",
-        "a.active as a_active",
-        "a.created_by as a_created_by",
-        "a.messages as a_messages",
-        "a.models as a_models",
-        "a.temperature as a_temperature",
-        "a.virtual_mcp_id as a_virtual_mcp_id",
-        "a.created_at as a_created_at",
-        "a.updated_at as a_updated_at",
+        ...TRIGGER_JOIN_AUTOMATION_COLUMNS,
       ])
       .where("t.type", "=", "event")
       .where("t.connection_id", "=", connectionId)
@@ -416,19 +537,7 @@ class KyselyAutomationsStorage implements AutomationsStorage {
 
     return rows.map((row) => ({
       ...triggerFromDbRow(row),
-      automation: automationFromDbRow({
-        id: row.a_id,
-        organization_id: row.a_organization_id,
-        name: row.a_name,
-        active: row.a_active,
-        created_by: row.a_created_by,
-        messages: row.a_messages,
-        models: row.a_models,
-        temperature: row.a_temperature,
-        virtual_mcp_id: row.a_virtual_mcp_id,
-        created_at: row.a_created_at,
-        updated_at: row.a_updated_at,
-      }),
+      automation: automationFromAliasedRow(row),
     }));
   }
 
@@ -447,37 +556,16 @@ class KyselyAutomationsStorage implements AutomationsStorage {
         "t.event_type",
         "t.params",
         "t.last_run_at",
+        "t.api_key_id",
         "t.created_at",
-        "a.id as a_id",
-        "a.organization_id as a_organization_id",
-        "a.name as a_name",
-        "a.active as a_active",
-        "a.created_by as a_created_by",
-        "a.messages as a_messages",
-        "a.models as a_models",
-        "a.temperature as a_temperature",
-        "a.virtual_mcp_id as a_virtual_mcp_id",
-        "a.created_at as a_created_at",
-        "a.updated_at as a_updated_at",
+        ...TRIGGER_JOIN_AUTOMATION_COLUMNS,
       ])
       .where("t.type", "=", "cron")
       .execute();
 
     return rows.map((row) => ({
       ...triggerFromDbRow(row),
-      automation: automationFromDbRow({
-        id: row.a_id,
-        organization_id: row.a_organization_id,
-        name: row.a_name,
-        active: row.a_active,
-        created_by: row.a_created_by,
-        messages: row.a_messages,
-        models: row.a_models,
-        temperature: row.a_temperature,
-        virtual_mcp_id: row.a_virtual_mcp_id,
-        created_at: row.a_created_at,
-        updated_at: row.a_updated_at,
-      }),
+      automation: automationFromAliasedRow(row),
     }));
   }
 
@@ -509,6 +597,11 @@ class KyselyAutomationsStorage implements AutomationsStorage {
         trigger_id: triggerId,
         virtual_mcp_id: automation.virtual_mcp_id,
         hidden: false,
+        // Pin v2 (the only write path). Automation runs don't go through the
+        // routes.ts first-message site that pins user-message threads v2, so
+        // without this they default to v1 — and the consume step (sole terminal
+        // writer now) skips v1 runs, so the automation would never complete.
+        message_storage_version: 2,
         created_at: now,
         updated_at: now,
         created_by: automation.created_by,
@@ -522,6 +615,15 @@ class KyselyAutomationsStorage implements AutomationsStorage {
     await this.db
       .updateTable("threads")
       .set({ status: "failed", updated_at: new Date().toISOString() })
+      .where("id", "=", taskId)
+      .where("status", "=", "in_progress")
+      .execute();
+  }
+
+  async markRunCompleted(taskId: string): Promise<void> {
+    await this.db
+      .updateTable("threads")
+      .set({ status: "completed", updated_at: new Date().toISOString() })
       .where("id", "=", taskId)
       .where("status", "=", "in_progress")
       .execute();
@@ -545,6 +647,88 @@ class KyselyAutomationsStorage implements AutomationsStorage {
       .where("id", "=", id)
       .where("active", "=", true)
       .execute();
+  }
+
+  async getRunStats(
+    automationId: string,
+    organizationId: string,
+    opts?: { startDate?: string; endDate?: string },
+  ): Promise<AutomationRunStats> {
+    let query = this.db
+      .selectFrom("threads as th")
+      .innerJoin("automation_triggers as t", "t.id", "th.trigger_id")
+      .select("th.status")
+      .select((eb) => eb.fn.count("th.id").as("count"))
+      .where("t.automation_id", "=", automationId)
+      .where("th.organization_id", "=", organizationId)
+      .where("th.hidden", "=", false)
+      .groupBy("th.status");
+
+    if (opts?.startDate) {
+      query = query.where(
+        "th.created_at",
+        ">=",
+        opts.startDate as unknown as Date,
+      );
+    }
+    if (opts?.endDate) {
+      query = query.where(
+        "th.created_at",
+        "<=",
+        opts.endDate as unknown as Date,
+      );
+    }
+
+    const rows = await query.execute();
+
+    const stats: AutomationRunStats = {
+      total: 0,
+      completed: 0,
+      failed: 0,
+      inProgress: 0,
+    };
+    for (const row of rows) {
+      const count = Number(row.count);
+      stats.total += count;
+      if (row.status === "completed") stats.completed += count;
+      else if (row.status === "failed") stats.failed += count;
+      else if (row.status === "in_progress") stats.inProgress += count;
+    }
+    return stats;
+  }
+
+  async listRunThreadIds(
+    automationId: string,
+    organizationId: string,
+    opts?: { startDate?: string; endDate?: string; limit?: number },
+  ): Promise<string[]> {
+    let query = this.db
+      .selectFrom("threads as th")
+      .innerJoin("automation_triggers as t", "t.id", "th.trigger_id")
+      .select("th.id")
+      .where("t.automation_id", "=", automationId)
+      .where("th.organization_id", "=", organizationId)
+      .where("th.hidden", "=", false)
+      .orderBy("th.created_at", "desc")
+      .limit(opts?.limit ?? 500);
+
+    if (opts?.startDate) {
+      query = query.where(
+        "th.created_at",
+        ">=",
+        opts.startDate as unknown as Date,
+      );
+    }
+    if (opts?.endDate) {
+      query = query.where(
+        "th.created_at",
+        "<=",
+        opts.endDate as unknown as Date,
+      );
+    }
+
+    const rows = await query.execute();
+    return rows.map((row) => row.id);
   }
 }
 

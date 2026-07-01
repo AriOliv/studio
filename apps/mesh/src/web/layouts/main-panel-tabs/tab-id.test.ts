@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
+  formatDeckTabId,
+  formatFileTabId,
+  formatLibraryFileTabId,
   isLegacySettingsTab,
+  isPerThreadTab,
   parseAutomationTabId,
+  parseDeckTabId,
+  parseFileTabId,
+  parseLibraryFileTabId,
   resolveDefaultTabId,
   resolveActiveTabAndOpen,
   resolveTabClickTarget,
@@ -25,6 +32,87 @@ describe("parseAutomationTabId", () => {
 
   test("automation: with empty id → null", () => {
     expect(parseAutomationTabId("automation:")).toBeNull();
+  });
+});
+
+describe("file tab id", () => {
+  test("round-trips S3 and org-fs keys (slashes, colons, spaces)", () => {
+    for (const key of [
+      "model-outputs/thread-1/report final.pdf",
+      "org-fs:outputs/thread-1/nested/dir/data.csv",
+      "model-outputs/t/weird?#&name.txt",
+    ]) {
+      expect(parseFileTabId(formatFileTabId(key))).toEqual({ key });
+    }
+  });
+
+  test("non-file tab → null", () => {
+    expect(parseFileTabId("settings")).toBeNull();
+    expect(parseFileTabId("web-page:home")).toBeNull();
+    expect(parseFileTabId(undefined)).toBeNull();
+    expect(parseFileTabId("file:")).toBeNull();
+  });
+
+  test("malformed percent-encoding → null, not a throw", () => {
+    expect(parseFileTabId("file:%E0%A4%A")).toBeNull();
+  });
+
+  test("file tabs are per-thread", () => {
+    expect(isPerThreadTab(formatFileTabId("model-outputs/t/a.pdf"))).toBe(true);
+    expect(isPerThreadTab("settings")).toBe(false);
+  });
+});
+
+describe("deck tab id", () => {
+  test("round-trips home-volume deck paths", () => {
+    for (const path of ["decks/q3-launch.html", "decks/My.Deck_2.html"]) {
+      expect(parseDeckTabId(formatDeckTabId(path))).toEqual({ path });
+    }
+  });
+
+  test("non-deck tab → null", () => {
+    expect(parseDeckTabId("settings")).toBeNull();
+    expect(parseDeckTabId("file:decks%2Fa.html")).toBeNull();
+    expect(parseDeckTabId(undefined)).toBeNull();
+    expect(parseDeckTabId("deck:")).toBeNull();
+  });
+
+  test("malformed percent-encoding → null, not a throw", () => {
+    expect(parseDeckTabId("deck:%E0%A4%A")).toBeNull();
+  });
+
+  test("deck tabs are per-thread", () => {
+    expect(isPerThreadTab(formatDeckTabId("decks/a.html"))).toBe(true);
+  });
+});
+
+describe("library file tab id", () => {
+  test("round-trips Library browse paths (home + public sets)", () => {
+    for (const path of [
+      "home/docs/spec final.md",
+      "public/core/skills/a.ts",
+      "uploads/My.File_2.csv",
+    ]) {
+      expect(parseLibraryFileTabId(formatLibraryFileTabId(path))).toEqual({
+        path,
+      });
+    }
+  });
+
+  test("non-library-file tab → null", () => {
+    expect(parseLibraryFileTabId("settings")).toBeNull();
+    expect(parseLibraryFileTabId("file:home%2Fa.md")).toBeNull();
+    expect(parseLibraryFileTabId("deck:decks%2Fa.html")).toBeNull();
+    expect(parseLibraryFileTabId(undefined)).toBeNull();
+    expect(parseLibraryFileTabId("library-file:")).toBeNull();
+  });
+
+  test("malformed percent-encoding → null, not a throw", () => {
+    expect(parseLibraryFileTabId("library-file:%E0%A4%A")).toBeNull();
+  });
+
+  test("library file tabs are per-thread", () => {
+    expect(isPerThreadTab(formatLibraryFileTabId("home/a.md"))).toBe(true);
   });
 });
 

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Kysely } from "kysely";
 import type { CredentialVault } from "../encryption/credential-vault";
+import type { ProviderKeyCache } from "./provider-key-cache";
 import type { Database, ProviderKeyInfo } from "./types";
 import type { ProviderId } from "@decocms/mesh-sdk";
 import { generatePrefixedId } from "@/shared/utils/generate-id";
@@ -13,6 +14,7 @@ export class AIProviderKeyStorage {
   constructor(
     private db: Kysely<Database>,
     private vault: CredentialVault,
+    private cache?: ProviderKeyCache,
   ) {}
 
   private rowToKeyInfo(row: {
@@ -129,6 +131,10 @@ export class AIProviderKeyStorage {
       ])
       .executeTakeFirstOrThrow();
 
+    // Rotation: the encrypted key may have changed for an existing id, so evict
+    // (and broadcast) to stop replicas serving the previous key.
+    this.cache?.invalidate(params.organizationId, row.id);
+
     return this.rowToKeyInfo(row);
   }
 
@@ -163,6 +169,16 @@ export class AIProviderKeyStorage {
     keyId: string,
     organizationId: string,
   ): Promise<{ keyInfo: ProviderKeyInfo; apiKey: string }> {
+    // The cache holds the encrypted key + metadata, never plaintext — decrypt
+    // happens per call (cheap CPU) so secrets stay request-scoped.
+    const cached = this.cache?.get(organizationId, keyId);
+    if (cached) {
+      return {
+        keyInfo: cached.keyInfo,
+        apiKey: await this.vault.decrypt(cached.encryptedApiKey),
+      };
+    }
+
     const row = await this.db
       .selectFrom("ai_provider_keys")
       .where("id", "=", keyId)
@@ -170,11 +186,15 @@ export class AIProviderKeyStorage {
       .selectAll()
       .executeTakeFirstOrThrow();
 
-    const apiKey = await this.vault.decrypt(row.encrypted_api_key);
+    const keyInfo = this.rowToKeyInfo(row);
+    this.cache?.set(organizationId, keyId, {
+      keyInfo,
+      encryptedApiKey: row.encrypted_api_key,
+    });
 
     return {
-      keyInfo: this.rowToKeyInfo(row),
-      apiKey,
+      keyInfo,
+      apiKey: await this.vault.decrypt(row.encrypted_api_key),
     };
   }
 
@@ -202,7 +222,74 @@ export class AIProviderKeyStorage {
     if (!row) {
       throw new Error(`AI provider key ${keyId} not found`);
     }
+    // keyInfo (label) is cached too, so evict to avoid serving a stale label.
+    this.cache?.invalidate(organizationId, keyId);
     return this.rowToKeyInfo(row);
+  }
+
+  async getPreview(
+    keyId: string,
+    organizationId: string,
+  ): Promise<{ label: string; maskedKey: string; baseUrl?: string }> {
+    const { keyInfo, apiKey } = await this.resolve(keyId, organizationId);
+    if (keyInfo.providerId === "openai-compatible") {
+      try {
+        const parsed = JSON.parse(apiKey) as {
+          baseUrl?: string;
+          apiKey?: string;
+        };
+        const rawKey = parsed.apiKey ?? "";
+        const maskedKey =
+          rawKey.length > 4
+            ? `${"•".repeat(8)}${rawKey.slice(-4)}`
+            : "•".repeat(rawKey.length || 1);
+        return { label: keyInfo.label, maskedKey, baseUrl: parsed.baseUrl };
+      } catch {
+        return { label: keyInfo.label, maskedKey: "••••••••" };
+      }
+    }
+    const maskedKey =
+      apiKey.length > 4
+        ? `${"•".repeat(8)}${apiKey.slice(-4)}`
+        : "•".repeat(apiKey.length || 1);
+    return { label: keyInfo.label, maskedKey };
+  }
+
+  async updateKey(
+    keyId: string,
+    organizationId: string,
+    updates: { label?: string; apiKey?: string },
+  ): Promise<ProviderKeyInfo> {
+    if (updates.apiKey !== undefined) {
+      const encryptedApiKey = await this.vault.encrypt(updates.apiKey);
+      const keyHash = hashApiKey(updates.apiKey);
+      const row = await this.db
+        .updateTable("ai_provider_keys")
+        .set({
+          ...(updates.label !== undefined ? { label: updates.label } : {}),
+          encrypted_api_key: encryptedApiKey,
+          key_hash: keyHash,
+        })
+        .where("id", "=", keyId)
+        .where("organization_id", "=", organizationId)
+        .returning([
+          "id",
+          "provider_id",
+          "label",
+          "preset_id",
+          "organization_id",
+          "created_by",
+          "created_at",
+        ])
+        .executeTakeFirst();
+      if (!row) throw new Error(`AI provider key ${keyId} not found`);
+      this.cache?.invalidate(organizationId, keyId);
+      return this.rowToKeyInfo(row);
+    }
+    if (updates.label !== undefined) {
+      return this.updateLabel(keyId, organizationId, updates.label);
+    }
+    return this.findById(keyId, organizationId);
   }
 
   async delete(keyId: string, organizationId: string): Promise<void> {
@@ -215,6 +302,9 @@ export class AIProviderKeyStorage {
     if (!result.numDeletedRows) {
       throw new Error(`AI provider key ${keyId} not found`);
     }
+    // Revocation: drop locally and broadcast so no replica keeps serving the
+    // deleted key until its TTL would have expired.
+    this.cache?.invalidate(organizationId, keyId);
   }
 
   async findById(

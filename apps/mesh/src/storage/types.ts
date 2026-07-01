@@ -142,7 +142,8 @@ export type SimpleModeTier =
   | "smart"
   | "thinking"
   | "image"
-  | "web_research";
+  | "web_search"
+  | "deep_research";
 
 export interface SimpleModeConfig {
   tiers: Record<SimpleModeTier, SimpleModeModelSlot | null>;
@@ -203,7 +204,12 @@ export interface MCPConnectionTable {
   //   - "shared":  one downstream token shared across the org (legacy).
   //   - "per_user": each member authorises with their own account; tokens
   //                  are keyed by (connection_id, user_id).
-  auth_mode: "shared" | "per_user";
+  // Optional on insert (DB default 'shared'); always present on select.
+  auth_mode: ColumnType<
+    "shared" | "per_user",
+    "shared" | "per_user" | undefined,
+    "shared" | "per_user"
+  >;
 
   // Configuration state (for MESH_CONFIGURATION feature)
   configuration_state: string | null; // Encrypted JSON state
@@ -280,6 +286,144 @@ export interface ProviderKeyInfo {
   organizationId: string;
   createdBy: string;
   createdAt: string;
+}
+
+export type SecretScopeKind = "user" | "organization";
+
+export interface SecretTable {
+  id: string;
+  organization_id: string;
+  scope: SecretScopeKind;
+  user_id: string | null;
+  name: string;
+  encrypted_value: string;
+  description: string | null;
+  created_by: string;
+  created_at: ColumnType<Date, Date | string, never>;
+  updated_by: string;
+  updated_at: ColumnType<Date, Date | string, Date | string>;
+}
+
+/** Public DTO for a secret — never exposes the encrypted value. */
+export interface SecretInfo {
+  id: string;
+  organizationId: string;
+  scope: SecretScopeKind;
+  userId: string | null;
+  name: string;
+  description: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedBy: string;
+  updatedAt: string;
+}
+
+/**
+ * Org-scoped S3-compatible bucket configuration. Stores connection metadata
+ * plus an encrypted JSON blob holding the access key / secret key pair.
+ * `endpoint` and `force_path_style` support non-AWS S3 (R2, MinIO, GCS).
+ */
+export interface OrgFileConfigTable {
+  id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  bucket: string;
+  region: string;
+  endpoint: string | null;
+  force_path_style: ColumnType<boolean, boolean | undefined, boolean>;
+  prefix: string | null;
+  // Public URL host (e.g. R2 dev domain, CDN). Null = compute from bucket+region.
+  public_url_base: string | null;
+  // "static" (long-lived key pair in encrypted_credentials), "sts-session"
+  // (temporary creds fetched on demand from refresh_url; the encrypted blob
+  // holds only the API key for the refresh call), or "managed" (no stored
+  // secret — studio mints prefix-scoped STS creds in-process for `site_slug`,
+  // authorized by org_sites ownership). Has a DB default of 'static'.
+  credential_type: ColumnType<
+    "static" | "sts-session" | "managed",
+    "static" | "sts-session" | "managed" | undefined,
+    "static" | "sts-session" | "managed"
+  >;
+  // Endpoint that vends temporary credentials for `sts-session` configs. Null
+  // for `static` / `managed`.
+  refresh_url: string | null;
+  // Site slug a `managed` config mints credentials for (its `<slug>/` prefix on
+  // the shared tenant bucket). Null for `static` / `sts-session`.
+  site_slug: string | null;
+  encrypted_credentials: string;
+  created_by: string;
+  created_at: ColumnType<Date, Date | string, never>;
+  updated_by: string;
+  updated_at: ColumnType<Date, Date | string, Date | string>;
+}
+
+/**
+ * Org filesystem manifest row. Indexes the org-prefixed object-storage
+ * keyspace under `_fs/{volume}/...` with path/tree semantics. Bytes live in
+ * object storage; this carries metadata + the change-feed cursor (`seq`) and
+ * conflict oracle (`content_hash`). See `.context/org-filesystem-proposal.md`.
+ */
+export interface OrgFsEntryTable {
+  organization_id: string;
+  volume: string;
+  /** Normalized path, no leading/trailing slash. "" is the volume root. */
+  path: string;
+  /** Parent directory path ("" for top-level). Drives listDir. */
+  parent: string;
+  kind: "file" | "dir";
+  /** sha256 of the bytes for files; null for dirs. */
+  content_hash: string | null;
+  // bigint columns come back from pg as strings; coerce in the storage layer.
+  size: ColumnType<string, string | number | undefined, string | number>;
+  seq: ColumnType<string, string | number | undefined, string | number>;
+  deleted_at: ColumnType<
+    Date | null,
+    Date | string | null | undefined,
+    Date | string | null
+  >;
+  created_by: string;
+  created_at: ColumnType<Date, Date | string | undefined, never>;
+  updated_by: string;
+  updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
+  /** Chat/run that last wrote this file; null for writes not tied to a
+   *  dispatch (mount write-backs, backfill). Scopes live deck previews to
+   *  the originating chat. */
+  thread_id: string | null;
+  /** When true, the `/fs/:volume/read` proxy serves this entry to anyone — no
+   *  auth, no org membership. On a dir it publishes the whole subtree (reads
+   *  inherit from a published ancestor). Defaults to false (org-only).
+   *  Preserved across in-place overwrites; reset to false on delete + recreate. */
+  read_public: ColumnType<boolean, boolean | undefined, boolean>;
+  /** scrypt hash of the share password. Null on a published entry = fully
+   *  public; set = the proxy serves a password form first. Never sent to
+   *  clients. Meaningless unless `read_public`. */
+  share_password_hash: string | null;
+  /** Random per-node token mixed into unlock-cookie signatures; rotated on
+   *  every password change so old cookies stop validating. Null when not
+   *  password-protected. */
+  share_secret: string | null;
+}
+
+/** Public DTO for a file config — never exposes access key / secret key. */
+export interface FileConfigInfo {
+  id: string;
+  organizationId: string;
+  name: string;
+  description: string | null;
+  bucket: string;
+  region: string;
+  endpoint: string | null;
+  forcePathStyle: boolean;
+  prefix: string | null;
+  publicUrlBase: string | null;
+  credentialType: "static" | "sts-session" | "managed";
+  refreshUrl: string | null;
+  siteSlug: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedBy: string;
+  updatedAt: string;
 }
 
 /**
@@ -364,6 +508,30 @@ export interface DownstreamTokenTable {
   clientId: string | null;
   clientSecret: string | null; // Encrypted
   tokenEndpoint: string | null;
+}
+
+export interface ConnectionWorkloadTokenTable {
+  id: string;
+  organization_id: string;
+  subject_connection_id: string;
+  token_hash: string;
+  token_prefix: string;
+  name: string;
+  revoked_at: ColumnType<Date, Date | string, Date | string> | null;
+  last_used_at: ColumnType<Date, Date | string, Date | string> | null;
+  created_at: ColumnType<Date, Date | string | undefined, never>;
+  updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
+}
+
+export interface ConnectionCredentialGrantTable {
+  id: string;
+  organization_id: string;
+  subject_connection_id: string;
+  target_connection_id: string;
+  scope: string;
+  created_by: string;
+  created_at: ColumnType<Date, Date | string | undefined, never>;
+  updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
 }
 
 // ============================================================================
@@ -801,12 +969,61 @@ export interface ThreadTable {
   virtual_mcp_id: string;
   /** Git branch this thread is pinned to (GitHub-linked virtualmcps only) */
   branch: string | null;
+  /** Sandbox provider kind pinned on first message (e.g. "agent-sandbox", "user-desktop") */
+  sandbox_provider_kind: string | null;
+  /** Harness id pinned on first message (e.g. "claude-code", "codex", "decopilot") */
+  harness_id: string | null;
   /** Per-task UI state (e.g., expanded_tools for right-panel tabs) */
   metadata: ColumnType<ThreadMetadata, string | undefined, string>;
   created_at: ColumnType<Date, Date | string, never>;
   updated_at: ColumnType<Date, Date | string, Date | string>;
   created_by: string; // User ID;
   updated_by: string | null;
+  message_storage_version: ColumnType<number, number | undefined, number>;
+  last_progress_at: ColumnType<
+    Date | null,
+    Date | string | null,
+    Date | string | null
+  >;
+  /** Single-writer fence for the active run; null when none minted (Phase A). */
+  run_fence_token: ColumnType<string | null, string | null, string | null>;
+  /**
+   * @deprecated Per-thread transport selector. No longer read for routing —
+   * the thread gate uses the active link publisher whenever NATS and the link
+   * dispatch runtime are available (see thread-gate-workflow.ts). The writer
+   * (`setLinkTransport`) was removed with the cluster reverse-WS cleanup.
+   * Column retained (nullable) for backward compatibility; no drop migration.
+   * New code MUST NOT read or write it.
+   */
+  link_transport: ColumnType<string | null, string | null, string | null>;
+  /**
+   * Durable cancel flag (Phase C). Set by the cancel endpoint; the ingest
+   * backstop rejects with 409 when non-null, regardless of fence state.
+   * Null = no cancel requested; non-null timestamp = cancel was requested.
+   */
+  cancel_requested_at: ColumnType<
+    Date | null,
+    Date | string | null,
+    Date | string | null
+  >;
+  /**
+   * Human-readable reason the run was marked failed (e.g. the error message
+   * from the harness or the projector). Null for runs that completed normally
+   * or were failed without a reason (pre-migration rows).
+   */
+  failure_reason: string | null;
+  /**
+   * Coarse failure category. One of "harness" | "projection" | "transport".
+   * Null for pre-migration rows or runs failed without kind information.
+   */
+  failure_kind: string | null;
+  /**
+   * Highest contiguous publish-confirmed seq for the active run. Written via a
+   * monotonic CAS (only advances, never regresses). Null for pre-existing rows
+   * and runs that haven't published a chunk yet. Cleared implicitly when a new
+   * run resets the floor at the call site (fence epoch change).
+   */
+  run_acked_seq: number | null;
 }
 
 export interface ThreadExpandedTool {
@@ -837,12 +1054,133 @@ export interface Thread {
   run_owner_pod: string | null;
   run_config: Record<string, unknown> | null;
   run_started_at: string | null;
-  inflight_async_jobs: InflightAsyncJob[] | null;
   /** Virtual MCP (agent) this thread was initiated with */
   virtual_mcp_id: string;
   /** Git branch this thread is pinned to (GitHub-linked virtualmcps only) */
   branch: string | null;
+  /** Sandbox provider kind pinned on first message (e.g. "agent-sandbox", "user-desktop") */
+  sandbox_provider_kind: string | null;
+  /** Harness id pinned on first message (e.g. "claude-code", "codex", "decopilot") */
+  harness_id: string | null;
   metadata: ThreadMetadata;
+  /**
+   * Message storage format for this thread's history.
+   * 1 = legacy `thread_messages` rows (folded server-side as whole messages).
+   * 2 = `thread_message_parts` stream-of-record (folded via `foldParts`).
+   * Pinned on the thread row; read path forks on this value.
+   */
+  message_storage_version: number;
+  /**
+   * @deprecated No longer used for routing (see the `threads` table column
+   * doc). Surfaced on the read path for backward compatibility only; nothing
+   * writes it. New code MUST NOT depend on it.
+   */
+  link_transport: string | null;
+}
+
+/**
+ * Lifecycle states for a single async research job.
+ *
+ * pending   — row inserted, provider job not yet submitted (rare; the gap
+ *             between INSERT and the submit call).
+ * polling   — submitted to the provider, driving to terminal state.
+ * completed — provider returned a final report.
+ * failed    — provider reported terminal failure.
+ * cancelled — user aborted; provider job (best-effort) cancelled too.
+ * abandoned — sweeper flipped a stale polling row whose `last_polled_at`
+ *             is older than the staleness threshold. Visible in audit logs;
+ *             contrast with the old approach that silently filtered stale
+ *             rows at read time.
+ */
+const ASYNC_RESEARCH_JOB_STATUSES = [
+  "pending",
+  "polling",
+  "completed",
+  "failed",
+  "cancelled",
+  "abandoned",
+] as const;
+export type AsyncResearchJobStatus =
+  (typeof ASYNC_RESEARCH_JOB_STATUSES)[number];
+
+export interface AsyncResearchJobCitation {
+  url: string;
+  title?: string;
+}
+
+export interface AsyncResearchJobTable {
+  id: ColumnType<string, string | undefined, never>;
+  interaction_id: string | null;
+  tool_call_id: string;
+
+  organization_id: string;
+  thread_id: string;
+  message_id: string | null;
+
+  provider: string;
+  model_id: string;
+  query: string;
+
+  status: AsyncResearchJobStatus;
+  attempts: number;
+  last_polled_at: ColumnType<
+    Date | null,
+    Date | string | null,
+    Date | string | null
+  >;
+  last_error: string | null;
+
+  input_tokens: number | null;
+  output_tokens: number | null;
+  citations: JsonArray<AsyncResearchJobCitation> | null;
+  result_uri: string | null;
+  result_preview: string | null;
+  /**
+   * Full report text for inline-sized completed jobs. NULL when the
+   * report was offloaded to blob storage via `result_uri`. Drives the
+   * replay path so a re-entry with the same tool_call_id returns the
+   * exact original content (not the truncated preview).
+   */
+  result_content: string | null;
+
+  created_at: ColumnType<Date, Date | string | undefined, never>;
+  updated_at: ColumnType<Date, Date | string, Date | string>;
+  completed_at: ColumnType<
+    Date | null,
+    Date | string | null,
+    Date | string | null
+  >;
+}
+
+/** Runtime representation of an async research job (decoded JSON columns). */
+export interface AsyncResearchJob {
+  id: string;
+  interactionId: string | null;
+  toolCallId: string;
+
+  organizationId: string;
+  threadId: string;
+  messageId: string | null;
+
+  provider: string;
+  modelId: string;
+  query: string;
+
+  status: AsyncResearchJobStatus;
+  attempts: number;
+  lastPolledAt: string | null;
+  lastError: string | null;
+
+  inputTokens: number | null;
+  outputTokens: number | null;
+  citations: AsyncResearchJobCitation[] | null;
+  resultUri: string | null;
+  resultPreview: string | null;
+  resultContent: string | null;
+
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
 }
 
 export interface ThreadMessageTable {
@@ -858,6 +1196,30 @@ export interface ThreadMessage extends ChatMessage {
   thread_id: string;
   created_at: string;
   updated_at: string;
+}
+
+export type PartKind =
+  | "text"
+  | "reasoning"
+  | "tool_call"
+  | "tool_result"
+  | "file"
+  | "error"
+  | "finish";
+
+export interface ThreadMessagePartTable {
+  id: string; // "<run_id>:<message_id>:<seq>"
+  seq: number; // integer, monotonic per message
+  org_id: string;
+  thread_id: string;
+  run_id: string;
+  message_id: string;
+  role: "user" | "assistant" | "system";
+  kind: PartKind;
+  payload: unknown; // jsonb
+  payload_ref: string | null;
+  metadata: unknown | null; // jsonb
+  created_at: string; // ISO; derived from durable seq order, NOT now+i
 }
 
 // ============================================================================
@@ -938,9 +1300,14 @@ export interface AutomationTable {
   name: string;
   active: boolean;
   created_by: string;
-  messages: string; // JSON string: UIMessage[]
-  models: string; // JSON string: { tier: "fast" | "smart" | "thinking" } (post-migration 077)
+  messages: string;
+  models: string;
+  // JSON-encoded string[] of model-facing tool names the run is restricted to.
+  // null = all of the bound agent's tools (default / pre-existing behavior).
+  tools: string | null;
   temperature: number;
+  // Parent agent-loop step cap (AI SDK stopWhen). null = PARENT_STEP_LIMIT.
+  max_agent_steps: number | null;
   virtual_mcp_id: string;
   created_at: ColumnType<Date, Date | string, never>;
   updated_at: ColumnType<Date, Date | string, Date | string>;
@@ -957,7 +1324,9 @@ export interface Automation {
   created_by: string;
   messages: string;
   models: string;
+  tools: string | null;
   temperature: number;
+  max_agent_steps: number | null;
   virtual_mcp_id: string;
   created_at: string;
   updated_at: string;
@@ -985,6 +1354,9 @@ export interface AutomationTriggerTable {
     Date | string | null,
     Date | string | null
   >;
+  // For webhook triggers: Better Auth apikey.id used to authenticate POSTs.
+  // Null for cron/event triggers.
+  api_key_id: string | null;
   created_at: ColumnType<Date, Date | string, never>;
 }
 
@@ -994,13 +1366,14 @@ export interface AutomationTriggerTable {
 export interface AutomationTrigger {
   id: string;
   automation_id: string;
-  type: "cron" | "event";
+  type: "cron" | "event" | "webhook";
   cron_expression: string | null;
   connection_id: string | null;
   event_type: string | null;
   params: string | null;
   last_run_at: string | null;
   next_run_at: string | null;
+  api_key_id: string | null;
   created_at: string;
 }
 
@@ -1022,10 +1395,10 @@ export interface KVTable {
   updated_at: ColumnType<Date, Date | string, Date | string>;
 }
 
-export interface SandboxRunnerStateTable {
+export interface SandboxProviderStateTable {
   user_id: string;
   project_ref: string;
-  runner_kind: string;
+  sandbox_provider_kind: string;
   handle: string;
   state: ColumnType<Record<string, unknown>, string, string>;
   updated_at: ColumnType<Date, Date | string, Date | string>;
@@ -1035,20 +1408,93 @@ export interface SandboxRunnerStateTable {
 // Organization Domain Table Definition
 // ============================================================================
 
+export type DomainJoinMode = "off" | "auto" | "request";
+export type DomainVerificationStatus = "pending" | "verified";
+export type DomainVerificationMethod = "email" | "dns";
+
 export interface OrganizationDomainTable {
+  id: string;
   organization_id: string;
   domain: string;
-  auto_join_enabled: boolean;
+  join_mode: DomainJoinMode;
+  verification_status: DomainVerificationStatus;
+  verification_method: DomainVerificationMethod | null;
+  verification_token: string | null;
+  verified_at: ColumnType<
+    Date | null,
+    Date | string | null,
+    Date | string | null
+  >;
   created_at: ColumnType<Date, Date | string, never>;
   updated_at: ColumnType<Date, Date | string, Date | string>;
 }
 
 export interface OrganizationDomain {
+  id: string;
   organizationId: string;
   domain: string;
-  autoJoinEnabled: boolean;
+  joinMode: DomainJoinMode;
+  verificationStatus: DomainVerificationStatus;
+  verificationMethod: DomainVerificationMethod | null;
+  verificationToken: string | null;
+  verifiedAt: Date | string | null;
   createdAt: Date | string;
   updatedAt: Date | string;
+}
+
+export type JoinRequestStatus = "pending" | "approved" | "denied";
+
+export interface OrganizationJoinRequestTable {
+  id: string;
+  organization_id: string;
+  user_id: string;
+  status: JoinRequestStatus;
+  decided_by: string | null;
+  decided_at: ColumnType<
+    Date | null,
+    Date | string | null,
+    Date | string | null
+  >;
+  created_at: ColumnType<Date, Date | string, never>;
+  updated_at: ColumnType<Date, Date | string, Date | string>;
+}
+
+export interface OrganizationJoinRequest {
+  id: string;
+  organizationId: string;
+  userId: string;
+  status: JoinRequestStatus;
+  decidedBy: string | null;
+  decidedAt: Date | string | null;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
+// ============================================================================
+// Org Sites (asset tenancy: org owns globally-unique site slugs)
+// ============================================================================
+
+export interface OrgSiteTable {
+  // Globally-unique site slug = object-key prefix namespace in the shared
+  // tenant bucket. Primary key enforces global uniqueness across orgs.
+  slug: string;
+  organization_id: string;
+  // Provenance of the claim: 'deco-import' (migrated) or 'manual'.
+  source: ColumnType<string, string | undefined, string>;
+  created_by: string;
+  created_at: ColumnType<Date, Date | string | undefined, never>;
+  updated_by: string;
+  updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
+}
+
+export interface OrgSite {
+  slug: string;
+  organizationId: string;
+  source: string;
+  createdBy: string;
+  createdAt: string;
+  updatedBy: string;
+  updatedAt: string;
 }
 
 // ============================================================================
@@ -1127,6 +1573,8 @@ export interface Database {
   oauth_authorization_codes: OAuthAuthorizationCodeTable;
   oauth_refresh_tokens: OAuthRefreshTokenTable;
   downstream_tokens: DownstreamTokenTable;
+  connection_workload_tokens: ConnectionWorkloadTokenTable;
+  connection_credential_grants: ConnectionCredentialGrantTable;
 
   // Better Auth organization tables (managed by Better Auth plugin)
   organization: BetterAuthOrganizationTable;
@@ -1143,6 +1591,8 @@ export interface Database {
 
   threads: ThreadTable;
   thread_messages: ThreadMessageTable;
+  thread_message_parts: ThreadMessagePartTable;
+  async_research_jobs: AsyncResearchJobTable;
 
   // Member tags tables
   organization_tags: OrganizationTagTable;
@@ -1153,6 +1603,15 @@ export interface Database {
 
   // AI Provider keys tables
   ai_provider_keys: AIProviderKeyTable;
+
+  // Generic secrets vault (org and user scoped)
+  secrets: SecretTable;
+
+  // Org-scoped S3 bucket configurations
+  org_file_configs: OrgFileConfigTable;
+
+  // Org filesystem manifest (indexes the `_fs/{volume}/...` keyspace)
+  org_fs_entry: OrgFsEntryTable;
 
   // OAuth PKCE state table (short-lived, server-side verifier storage)
   oauth_pkce_states: OAuthPkceStateTable;
@@ -1174,8 +1633,14 @@ export interface Database {
   // Brand context (org-scoped company profile)
   brand_context: BrandContextTable;
 
-  // Organization domain claims (for auto-join)
+  // Organization domain claims (for auto-join / request-to-join)
   organization_domains: OrganizationDomainTable;
 
-  sandbox_runner_state: SandboxRunnerStateTable;
+  // Pending/decided requests to join an org
+  organization_join_requests: OrganizationJoinRequestTable;
+
+  // Asset tenancy: org ownership of globally-unique site slugs
+  org_sites: OrgSiteTable;
+
+  sandbox_runner_state: SandboxProviderStateTable;
 }

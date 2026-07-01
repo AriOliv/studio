@@ -10,7 +10,7 @@
  * NOTE: This file is imported by frontend code. Do NOT import runtime values
  * from ./index (only type imports are safe, but they cause circular issues).
  *
- * Keep ALL_TOOL_NAMES in sync with ALL_TOOLS in index.ts manually.
+ * Keep ALL_TOOL_NAMES in sync with CORE_TOOLS in index.ts manually.
  * A test can verify they match.
  */
 
@@ -29,14 +29,18 @@ export type ToolCategory =
   | "Event Bus"
   | "Tags"
   | "AI Providers"
+  | "Secrets"
+  | "File Configs"
   | "Automations"
   | "Object Storage"
   | "Registry"
   | "GitHub"
-  | "VM";
+  | "VM"
+  | "Links"
+  | "Search";
 
 /**
- * All tool names - keep in sync with ALL_TOOLS in index.ts
+ * All tool names - keep in sync with CORE_TOOLS in index.ts
  */
 const ALL_TOOL_NAMES = [
   // Organization tools
@@ -55,10 +59,14 @@ const ALL_TOOL_NAMES = [
   "BRAND_CONTEXT_EXTRACT",
   "BRAND_GET",
   "BRAND_LIST",
-  "ORGANIZATION_DOMAIN_GET",
-  "ORGANIZATION_DOMAIN_SET",
+  "ORGANIZATION_DOMAIN_LIST",
+  "ORGANIZATION_DOMAIN_ADD",
   "ORGANIZATION_DOMAIN_UPDATE",
-  "ORGANIZATION_DOMAIN_CLEAR",
+  "ORGANIZATION_DOMAIN_VERIFY",
+  "ORGANIZATION_DOMAIN_REMOVE",
+  "ORGANIZATION_JOIN_REQUEST_LIST",
+  "ORGANIZATION_JOIN_REQUEST_APPROVE",
+  "ORGANIZATION_JOIN_REQUEST_DENY",
   "ORGANIZATION_MEMBER_ADD",
   "ORGANIZATION_MEMBER_REMOVE",
   "ORGANIZATION_MEMBER_LIST",
@@ -70,6 +78,7 @@ const ALL_TOOL_NAMES = [
   "COLLECTION_CONNECTIONS_UPDATE",
   "COLLECTION_CONNECTIONS_DELETE",
   "CONNECTION_TEST",
+  "COMMERCE_DISCOVERY_SETUP",
   // Virtual MCP tools
   "COLLECTION_VIRTUAL_MCP_CREATE",
   "COLLECTION_VIRTUAL_MCP_LIST",
@@ -82,19 +91,12 @@ const ALL_TOOL_NAMES = [
   "MONITORING_LOG_GET",
   "MONITORING_LOGS_LIST",
   "MONITORING_STATS",
+  "MONITORING_THREAD_USAGE",
   // API Key tools
   "API_KEY_CREATE",
   "API_KEY_LIST",
   "API_KEY_UPDATE",
   "API_KEY_DELETE",
-  // Event Bus tools
-  "EVENT_PUBLISH",
-  "EVENT_SUBSCRIBE",
-  "EVENT_UNSUBSCRIBE",
-  "EVENT_CANCEL",
-  "EVENT_ACK",
-  "EVENT_SUBSCRIPTION_LIST",
-  "EVENT_SYNC_SUBSCRIPTIONS",
   // User tools
   "USER_GET",
   // Thread tools
@@ -104,6 +106,8 @@ const ALL_TOOL_NAMES = [
   "COLLECTION_THREADS_UPDATE",
   "COLLECTION_THREADS_DELETE",
   "COLLECTION_THREAD_MESSAGES_LIST",
+  "THREAD_BACKGROUND_TOOL_START",
+  "THREAD_SUBTASK_DELIVER",
   // Tag tools
   "TAGS_LIST",
   "TAGS_CREATE",
@@ -118,11 +122,14 @@ const ALL_TOOL_NAMES = [
   "AUTOMATION_DELETE",
   "AUTOMATION_TRIGGER_ADD",
   "AUTOMATION_TRIGGER_REMOVE",
+  "AUTOMATION_TRIGGER_ROTATE_TOKEN",
   "AUTOMATION_RUN",
+  "AUTOMATION_RUN_STATS",
   // Virtual MCP plugin config and pinned views tools
   "VIRTUAL_MCP_PLUGIN_CONFIG_GET",
   "VIRTUAL_MCP_PLUGIN_CONFIG_UPDATE",
   "VIRTUAL_MCP_PINNED_VIEWS_UPDATE",
+  "VIRTUAL_MCP_LAST_USED_LIST",
 
   // Ai providers tools
   "AI_PROVIDERS_LIST",
@@ -132,12 +139,26 @@ const ALL_TOOL_NAMES = [
   "AI_PROVIDER_KEY_LIST",
   "AI_PROVIDER_KEY_DELETE",
   "AI_PROVIDER_KEY_UPDATE",
+  "AI_PROVIDER_KEY_PREVIEW",
   "AI_PROVIDER_OAUTH_URL",
   "AI_PROVIDER_OAUTH_EXCHANGE",
   "AI_PROVIDER_PROVISION_KEY",
   "AI_PROVIDER_TOPUP_URL",
   "AI_PROVIDER_CREDITS",
-  "AI_PROVIDER_CLI_ACTIVATE",
+
+  // Secrets vault tools
+  "SECRET_CREATE",
+  "SECRET_LIST",
+
+  // File config tools (org-scoped S3 bucket configurations)
+  "FILE_CONFIG_CREATE",
+  "FILE_CONFIG_LIST",
+  "FILE_CONFIG_UPDATE",
+  "FILE_CONFIG_DELETE",
+  "FILE_OBJECTS_LIST",
+
+  // Org filesystem (shared public skill sets)
+  "ORG_FS_PUBLIC_SETS_SYNC",
 
   // Object Storage tools
   "LIST_OBJECTS",
@@ -178,15 +199,20 @@ const ALL_TOOL_NAMES = [
   "REGISTRY_MONITOR_CONNECTION_LIST",
   "REGISTRY_MONITOR_CONNECTION_SYNC",
   "REGISTRY_MONITOR_CONNECTION_UPDATE_AUTH",
-  "REGISTRY_MONITOR_SCHEDULE_SET",
-  "REGISTRY_MONITOR_SCHEDULE_CANCEL",
 
   // VM tools (app-only)
-  "VM_START",
-  "VM_DELETE",
+  "SANDBOX_START",
+  "SANDBOX_DELETE",
 
   // GitHub tools (app-only)
   "GITHUB_LIST_USER_ORGS",
+
+  // Link tools
+  "LINK_CURRENT_GET",
+  "LINK_DISCONNECT",
+
+  // Search tools
+  "GLOBAL_SEARCH",
 ] as const;
 
 /**
@@ -307,24 +333,46 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
     category: "Organizations",
   },
   {
-    name: "ORGANIZATION_DOMAIN_GET",
-    description: "Get organization domain claim",
+    name: "ORGANIZATION_DOMAIN_LIST",
+    description: "List organization domain claims",
     category: "Organizations",
   },
   {
-    name: "ORGANIZATION_DOMAIN_SET",
-    description: "Set organization domain claim",
+    name: "ORGANIZATION_DOMAIN_ADD",
+    description: "Claim an email domain for the organization",
     category: "Organizations",
   },
   {
     name: "ORGANIZATION_DOMAIN_UPDATE",
-    description: "Update organization domain settings",
+    description: "Set a domain's join mode",
     category: "Organizations",
   },
   {
-    name: "ORGANIZATION_DOMAIN_CLEAR",
-    description: "Clear organization domain claim",
+    name: "ORGANIZATION_DOMAIN_VERIFY",
+    description: "Verify a domain via DNS TXT record",
     category: "Organizations",
+  },
+  {
+    name: "ORGANIZATION_DOMAIN_REMOVE",
+    description: "Remove an organization domain claim",
+    category: "Organizations",
+    dangerous: true,
+  },
+  {
+    name: "ORGANIZATION_JOIN_REQUEST_LIST",
+    description: "List pending requests to join the organization",
+    category: "Organizations",
+  },
+  {
+    name: "ORGANIZATION_JOIN_REQUEST_APPROVE",
+    description: "Approve a request to join the organization",
+    category: "Organizations",
+  },
+  {
+    name: "ORGANIZATION_JOIN_REQUEST_DENY",
+    description: "Deny a request to join the organization",
+    category: "Organizations",
+    dangerous: true,
   },
   {
     name: "ORGANIZATION_MEMBER_ADD",
@@ -380,6 +428,11 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
     category: "Connections",
   },
   {
+    name: "COMMERCE_DISCOVERY_SETUP",
+    description: "Set up Commerce Discovery",
+    category: "Connections",
+  },
+  {
     name: "DATABASES_RUN_SQL",
     description: "Run SQL queries",
     category: "Connections",
@@ -429,6 +482,11 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
     category: "Monitoring",
   },
   {
+    name: "MONITORING_THREAD_USAGE",
+    description: "View per-thread token usage and cost",
+    category: "Monitoring",
+  },
+  {
     name: "API_KEY_CREATE",
     description: "Create API key",
     category: "API Keys",
@@ -448,42 +506,6 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
     description: "Delete API key",
     category: "API Keys",
     dangerous: true,
-  },
-  // Event Bus tools
-  {
-    name: "EVENT_PUBLISH",
-    description: "Publish events",
-    category: "Event Bus",
-  },
-  {
-    name: "EVENT_SUBSCRIBE",
-    description: "Subscribe to events",
-    category: "Event Bus",
-  },
-  {
-    name: "EVENT_UNSUBSCRIBE",
-    description: "Unsubscribe from events",
-    category: "Event Bus",
-  },
-  {
-    name: "EVENT_CANCEL",
-    description: "Cancel recurring events",
-    category: "Event Bus",
-  },
-  {
-    name: "EVENT_ACK",
-    description: "Acknowledge event delivery",
-    category: "Event Bus",
-  },
-  {
-    name: "EVENT_SUBSCRIPTION_LIST",
-    description: "List event subscriptions",
-    category: "Event Bus",
-  },
-  {
-    name: "EVENT_SYNC_SUBSCRIPTIONS",
-    description: "Sync subscriptions to desired state",
-    category: "Event Bus",
   },
   // User tools
   {
@@ -521,6 +543,16 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
   {
     name: "COLLECTION_THREAD_MESSAGES_LIST",
     description: "List thread messages",
+    category: "Threads",
+  },
+  {
+    name: "THREAD_BACKGROUND_TOOL_START",
+    description: "Enqueue a slow built-in tool as a background job",
+    category: "Threads",
+  },
+  {
+    name: "THREAD_SUBTASK_DELIVER",
+    description: "Deliver a backgrounded subtask's result to its thread",
     category: "Threads",
   },
   // Tag tools
@@ -588,8 +620,18 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
     category: "Automations",
   },
   {
+    name: "AUTOMATION_TRIGGER_ROTATE_TOKEN",
+    description: "Rotate the secret token for a webhook automation trigger",
+    category: "Automations",
+  },
+  {
     name: "AUTOMATION_RUN",
     description: "Manually trigger an automation run",
+    category: "Automations",
+  },
+  {
+    name: "AUTOMATION_RUN_STATS",
+    description: "View aggregated run counts and token/cost for an automation",
     category: "Automations",
   },
   // Virtual MCP plugin config and pinned views tools
@@ -606,6 +648,11 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
   {
     name: "VIRTUAL_MCP_PINNED_VIEWS_UPDATE",
     description: "Update virtual MCP pinned sidebar views",
+    category: "Virtual MCPs",
+  },
+  {
+    name: "VIRTUAL_MCP_LAST_USED_LIST",
+    description: "Get last-used info for one or more virtual MCPs",
     category: "Virtual MCPs",
   },
   {
@@ -641,7 +688,12 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
   },
   {
     name: "AI_PROVIDER_KEY_UPDATE",
-    description: "Update AI provider API key label",
+    description: "Update AI provider API key label or credential",
+    category: "AI Providers",
+  },
+  {
+    name: "AI_PROVIDER_KEY_PREVIEW",
+    description: "Get masked preview of AI provider API key",
     category: "AI Providers",
   },
   {
@@ -669,11 +721,52 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
     description: "Get current credit balance for a provider",
     category: "AI Providers",
   },
+  // Secrets tools
   {
-    name: "AI_PROVIDER_CLI_ACTIVATE",
-    description: "Activate Claude Code via local CLI",
-    category: "AI Providers",
+    name: "SECRET_CREATE",
+    description: "Create a secret in the credential vault",
+    category: "Secrets",
   },
+  {
+    name: "SECRET_LIST",
+    description: "List secrets visible to the caller (no values returned)",
+    category: "Secrets",
+  },
+  // File config tools
+  {
+    name: "FILE_CONFIG_CREATE",
+    description: "Create an S3-compatible bucket configuration for the org",
+    category: "File Configs",
+  },
+  {
+    name: "FILE_CONFIG_LIST",
+    description:
+      "List S3 bucket configurations for the org (no creds returned)",
+    category: "File Configs",
+  },
+  {
+    name: "ORG_FS_PUBLIC_SETS_SYNC",
+    description:
+      "Re-sync the shared public skill-set volumes from their GitHub sources",
+    category: "File Configs",
+  },
+  {
+    name: "FILE_CONFIG_UPDATE",
+    description:
+      "Update an S3 bucket configuration, optionally rotating credentials",
+    category: "File Configs",
+  },
+  {
+    name: "FILE_CONFIG_DELETE",
+    description: "Delete an S3 bucket configuration",
+    category: "File Configs",
+  },
+  {
+    name: "FILE_OBJECTS_LIST",
+    description: "List existing objects in a configured bucket",
+    category: "File Configs",
+  },
+
   // Object Storage tools
   {
     name: "LIST_OBJECTS",
@@ -862,29 +955,39 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
     category: "Registry",
   },
   {
-    name: "REGISTRY_MONITOR_SCHEDULE_SET",
-    description: "Set monitor schedule",
-    category: "Registry",
-  },
-  {
-    name: "REGISTRY_MONITOR_SCHEDULE_CANCEL",
-    description: "Cancel monitor schedule",
-    category: "Registry",
-  },
-  {
-    name: "VM_START",
-    description: "Start a Freestyle VM with dev server preview",
+    name: "SANDBOX_START",
+    description: "Start a sandbox VM with dev server preview",
     category: "VM",
   },
   {
-    name: "VM_DELETE",
-    description: "Stop and delete a Freestyle VM",
+    name: "SANDBOX_DELETE",
+    description: "Stop and delete a sandbox VM",
     category: "VM",
   },
   {
     name: "GITHUB_LIST_USER_ORGS",
     description: "List GitHub user's personal account and organizations",
     category: "GitHub",
+  },
+  // Link tools
+  {
+    name: "LINK_CURRENT_GET",
+    description:
+      "Return the calling user's current desktop link status (online/offline, capabilities)",
+    category: "Links",
+  },
+  {
+    name: "LINK_DISCONNECT",
+    description:
+      "Disconnect the calling user's desktop link (stops the daemon, removes the presence claim)",
+    category: "Links",
+  },
+  // Search tools
+  {
+    name: "GLOBAL_SEARCH",
+    description:
+      "Search across organization resources (currently threads). Returns a typed union of matches.",
+    category: "Search",
   },
 ];
 
@@ -924,21 +1027,64 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       "COLLECTION_VIRTUAL_MCP_LIST",
       "COLLECTION_VIRTUAL_MCP_GET",
       "VIRTUAL_MCP_PLUGIN_CONFIG_GET",
+      "VIRTUAL_MCP_LAST_USED_LIST",
       // View automations
       "AUTOMATION_GET",
       "AUTOMATION_LIST",
-      // View AI providers
+      "AUTOMATION_RUN_STATS",
+      // View AI providers (read-only — every member needs to know which
+      // providers are configured so chat / agents can use them). KEY_LIST
+      // returns metadata only (no secret material); CREDITS is the balance
+      // shown in the chat header. TOPUP_URL returns a checkout link surfaced
+      // in the chat credits-exhausted banner so any member can self-serve.
       "AI_PROVIDERS_LIST",
       "AI_PROVIDERS_LIST_MODELS",
       "AI_PROVIDERS_ACTIVE",
+      "AI_PROVIDER_KEY_LIST",
+      "AI_PROVIDER_CREDITS",
+      "AI_PROVIDER_TOPUP_URL",
       // Object storage access
       "LIST_OBJECTS",
       "GET_OBJECT_METADATA",
       "GET_PRESIGNED_URL",
       "PUT_PRESIGNED_URL",
-      // VM previews
-      "VM_START",
-      "VM_DELETE",
+      // Browse files in a configured bucket (file picker in the sandbox /
+      // content editor). Lists object keys only — no credentials returned.
+      "FILE_OBJECTS_LIST",
+      // Sandbox previews
+      "SANDBOX_START",
+      "SANDBOX_DELETE",
+      // Cross-resource discovery / command palette
+      "GLOBAL_SEARCH",
+      // App-shell essentials (read-only) — every member hits these on first
+      // paint or in the global chrome:
+      //   SETTINGS_GET → sidebar / plugins / model tiers loaded at shell boot
+      //   USER_GET     → resolve member display ("created by" on agents, etc.);
+      //                  handler scopes to shared-org members, no secrets
+      //   LINK_CURRENT_GET → caller's own desktop-link status (header poll)
+      //   LINK_DISCONNECT  → self-scoped: disconnects the CALLER's own
+      //                      desktop link only (handler keys everything off
+      //                      ctx.auth.user.id), so members keep it
+      //   BRAND_CONTEXT_LIST → org branding for the chat empty state
+      "ORGANIZATION_SETTINGS_GET",
+      "USER_GET",
+      "LINK_CURRENT_GET",
+      "LINK_DISCONNECT",
+      "BRAND_CONTEXT_LIST",
+      // Chat threads — talking to an agent is the most basic usage of the
+      // product, so every member can CRUD their OWN threads. Per-thread access
+      // is scoped at the handler level (you only see your own threads unless
+      // you also hold the threads:view-all capability).
+      "COLLECTION_THREADS_CREATE",
+      "COLLECTION_THREADS_LIST",
+      "COLLECTION_THREADS_GET",
+      "COLLECTION_THREADS_UPDATE",
+      "COLLECTION_THREADS_DELETE",
+      "COLLECTION_THREAD_MESSAGES_LIST",
+      // Background a slow built-in on your own thread — gated per-handler by
+      // the run fence token, same trust boundary as the chat turn itself.
+      "THREAD_BACKGROUND_TOOL_START",
+      "THREAD_SUBTASK_DELIVER",
     ],
   },
   // Organization
@@ -962,10 +1108,11 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       "BRAND_CONTEXT_EXTRACT",
       "BRAND_GET",
       "BRAND_LIST",
-      "ORGANIZATION_DOMAIN_GET",
-      "ORGANIZATION_DOMAIN_SET",
+      "ORGANIZATION_DOMAIN_LIST",
+      "ORGANIZATION_DOMAIN_ADD",
       "ORGANIZATION_DOMAIN_UPDATE",
-      "ORGANIZATION_DOMAIN_CLEAR",
+      "ORGANIZATION_DOMAIN_VERIFY",
+      "ORGANIZATION_DOMAIN_REMOVE",
     ],
   },
   {
@@ -978,6 +1125,11 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       "ORGANIZATION_MEMBER_ADD",
       "ORGANIZATION_MEMBER_REMOVE",
       "ORGANIZATION_MEMBER_UPDATE_ROLE",
+      // Approving/denying join requests adds members, and the UI lives on the
+      // members page — keep it under members:manage.
+      "ORGANIZATION_JOIN_REQUEST_LIST",
+      "ORGANIZATION_JOIN_REQUEST_APPROVE",
+      "ORGANIZATION_JOIN_REQUEST_DENY",
     ],
     dangerous: true,
   },
@@ -991,6 +1143,7 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       "COLLECTION_CONNECTIONS_CREATE",
       "COLLECTION_CONNECTIONS_UPDATE",
       "COLLECTION_CONNECTIONS_DELETE",
+      "COMMERCE_DISCOVERY_SETUP",
     ],
     dangerous: true,
   },
@@ -1020,6 +1173,7 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       "AUTOMATION_DELETE",
       "AUTOMATION_TRIGGER_ADD",
       "AUTOMATION_TRIGGER_REMOVE",
+      "AUTOMATION_TRIGGER_ROTATE_TOKEN",
       "AUTOMATION_RUN",
     ],
     dangerous: true,
@@ -1030,7 +1184,34 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
     label: "View monitoring",
     description: "Access logs and usage statistics",
     section: "Monitoring",
-    tools: ["MONITORING_LOG_GET", "MONITORING_LOGS_LIST", "MONITORING_STATS"],
+    tools: [
+      "MONITORING_LOG_GET",
+      "MONITORING_LOGS_LIST",
+      "MONITORING_STATS",
+      "MONITORING_THREAD_USAGE",
+    ],
+  },
+  // Secrets
+  {
+    id: "secrets:manage",
+    label: "Manage secrets",
+    description: "Create and list secrets stored in the credential vault",
+    section: "Organization",
+    tools: ["SECRET_CREATE", "SECRET_LIST"],
+  },
+  // File Configs
+  {
+    id: "file-configs:manage",
+    label: "Manage file configs",
+    description: "Create, list, update and delete S3 bucket configurations",
+    section: "Organization",
+    tools: [
+      "FILE_CONFIG_CREATE",
+      "FILE_CONFIG_LIST",
+      "FILE_CONFIG_UPDATE",
+      "FILE_CONFIG_DELETE",
+      "FILE_OBJECTS_LIST",
+    ],
   },
   // AI Providers
   {
@@ -1043,12 +1224,12 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       "AI_PROVIDER_KEY_LIST",
       "AI_PROVIDER_KEY_DELETE",
       "AI_PROVIDER_KEY_UPDATE",
+      "AI_PROVIDER_KEY_PREVIEW",
       "AI_PROVIDER_OAUTH_URL",
       "AI_PROVIDER_OAUTH_EXCHANGE",
       "AI_PROVIDER_PROVISION_KEY",
       "AI_PROVIDER_TOPUP_URL",
       "AI_PROVIDER_CREDITS",
-      "AI_PROVIDER_CLI_ACTIVATE",
     ],
   },
   // Organization (tags moved here from Developer)
@@ -1111,8 +1292,6 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       "REGISTRY_MONITOR_CONNECTION_LIST",
       "REGISTRY_MONITOR_CONNECTION_SYNC",
       "REGISTRY_MONITOR_CONNECTION_UPDATE_AUTH",
-      "REGISTRY_MONITOR_SCHEDULE_SET",
-      "REGISTRY_MONITOR_SCHEDULE_CANCEL",
     ],
   },
   // Developer
@@ -1126,21 +1305,6 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       "API_KEY_LIST",
       "API_KEY_UPDATE",
       "API_KEY_DELETE",
-    ],
-  },
-  {
-    id: "event-bus:use",
-    label: "Use event bus",
-    description: "Publish events and manage subscriptions",
-    section: "Developer",
-    tools: [
-      "EVENT_PUBLISH",
-      "EVENT_SUBSCRIBE",
-      "EVENT_UNSUBSCRIBE",
-      "EVENT_CANCEL",
-      "EVENT_ACK",
-      "EVENT_SUBSCRIPTION_LIST",
-      "EVENT_SYNC_SUBSCRIPTIONS",
     ],
   },
   {
@@ -1164,21 +1328,53 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
 /**
  * Tools every authenticated org member can use by default.
  *
- * The role editor (`org-role-detail.tsx`) bakes these into every custom
- * role's saved `permission.self` array at submit time, so AccessControl
- * sees them as a normal Better Auth permission — no runtime bypass.
+ * Granted at runtime by AccessControl (`checkResource`) to every member
+ * regardless of role — NOT persisted into stored role permissions. To change
+ * the set, edit the `basic-usage` capability above; it takes effect
+ * immediately for all existing and new roles, with no backfill migration.
  *
- * ⚠️  Adding or removing a tool from the basic-usage capability above?
- *     You MUST also write a Kysely migration that backfills the change
- *     into existing custom roles in the `organizationRole` table.
- *     See `apps/mesh/migrations/073-backfill-basic-usage-roles.ts` for
- *     the pattern. Snapshot the tools you're adding inside the migration
- *     — do not import this constant from a migration (migrations are
- *     immutable history).
+ * (Migrations 073 and 093 backfilled basic-usage tools into roles under the
+ * older bake-in model. They are now redundant but harmless — the runtime
+ * grant supersedes them. No new backfill migrations are needed.)
  */
-export const BASIC_USAGE_TOOLS: ReadonlySet<string> = new Set(
-  PERMISSION_CAPABILITIES.find((c) => c.id === BASIC_USAGE_CAPABILITY_ID)
-    ?.tools ?? [],
+export const BASIC_USAGE_TOOLS: ReadonlySet<string> = new Set([
+  ...(PERMISSION_CAPABILITIES.find((c) => c.id === BASIC_USAGE_CAPABILITY_ID)
+    ?.tools ?? []),
+  // Organization filesystem HTTP-API resource keys (NOT MCP tools, so they
+  // can't live in the typed capability `tools` list). Decision A: every org
+  // member may read+write every volume. Moving to per-volume ACL later =
+  // drop these from the basic set and gate by role/permission, no route
+  // changes. See `.context/org-filesystem-proposal.md`.
+  "ORG_FS_READ",
+  "ORG_FS_WRITE",
+]);
+
+/**
+ * Gated capability ids additionally granted to the built-in `user` role, beyond
+ * basic-usage. EMPTY by default — every member is otherwise enforced down to
+ * basic-usage only. Add a capability id here (e.g. "agents:manage") to grant ALL
+ * of its tools to every member of every org. This is a GLOBAL change with no
+ * migration; for per-org grants use a custom role instead.
+ */
+const USER_ROLE_CAPABILITY_IDS: string[] = [
+  "agents:manage",
+  "connections:manage",
+];
+
+/**
+ * Tools the built-in `user` role gets beyond basic-usage, derived from
+ * USER_ROLE_CAPABILITY_IDS. Single source of truth for the two layers that must
+ * stay in sync:
+ *   - enforcement: baked into the `user` role's `self` grant (auth/index.ts)
+ *   - UI gating: the MY_CAPABILITIES endpoint (api/routes/auth.ts)
+ *
+ * List specific tool names only — never `"*"` — so the wildcard fallback in
+ * `createBoundAuthClient` can't be tricked into granting everything.
+ */
+export const USER_ROLE_TOOLS: ReadonlySet<string> = new Set(
+  PERMISSION_CAPABILITIES.filter((c) =>
+    USER_ROLE_CAPABILITY_IDS.includes(c.id),
+  ).flatMap((c) => c.tools),
 );
 
 export function getCapabilitySections(): Array<{
@@ -1222,6 +1418,66 @@ export function toggleCapabilityInTools(
   return Array.from(toolSet);
 }
 
+/**
+ * Map of gated capability id → granted, for the privileged built-in roles
+ * (owner / admin) which bypass every permission check. The hidden basic-usage
+ * capability is never part of the map — it's always-on and not UI-gated.
+ */
+export function allCapabilitiesGranted(): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  for (const cap of PERMISSION_CAPABILITIES) {
+    if (cap.id === BASIC_USAGE_CAPABILITY_ID) continue;
+    out[cap.id] = true;
+  }
+  return out;
+}
+
+/**
+ * Resolve which gated capabilities a stored role permission grants, as a
+ * capability id → boolean map. Pure: mirrors the wildcard rules AccessControl
+ * applies, so the UI can gate actions without re-deriving role logic.
+ *
+ * A capability is granted when every tool it lists appears in some resource
+ * bucket of the permission, or when the role holds an org-wide / self wildcard.
+ * The hidden basic-usage capability is excluded (always-on, never gated).
+ *
+ * Defensive by design: `permission` is JSON stored on the role, so buckets may
+ * be malformed despite the type — non-array buckets are treated as empty and
+ * never throw.
+ */
+export function resolveCapabilities(
+  permission: Record<string, string[]>,
+): Record<string, boolean> {
+  const perm = permission as Record<string, unknown>;
+  const arrayBucket = (key: string): string[] => {
+    const value = perm[key];
+    return Array.isArray(value) ? (value as string[]) : [];
+  };
+
+  // ONLY an org-wide (`*`) or full org-tool (`self`) wildcard is a GLOBAL grant
+  // across every capability. A `["*"]` inside any other bucket (e.g. a
+  // connection id) means "all tools on that resource" and must NOT light up
+  // unrelated management capabilities.
+  const hasGlobalGrant =
+    arrayBucket("*").includes("*") || arrayBucket("self").includes("*");
+
+  const grantedActions = new Set<string>();
+  if (!hasGlobalGrant) {
+    for (const actions of Object.values(perm)) {
+      if (!Array.isArray(actions)) continue;
+      for (const action of actions) grantedActions.add(action);
+    }
+  }
+
+  const out: Record<string, boolean> = {};
+  for (const cap of PERMISSION_CAPABILITIES) {
+    if (cap.id === BASIC_USAGE_CAPABILITY_ID) continue;
+    out[cap.id] =
+      hasGlobalGrant || cap.tools.every((tool) => grantedActions.has(tool));
+  }
+  return out;
+}
+
 // ============================================================================
 // Exports
 // ============================================================================
@@ -1246,6 +1502,8 @@ export function getToolsByCategory() {
     Registry: [],
     GitHub: [],
     VM: [],
+    Links: [],
+    Search: [],
   };
 
   for (const tool of MANAGEMENT_TOOLS) {

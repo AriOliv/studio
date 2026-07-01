@@ -10,6 +10,7 @@ import type { ToolUIPart } from "ai";
 import { useOrg } from "@decocms/mesh-sdk";
 import { ToolCallShell } from "./common.tsx";
 import { getEffectiveState } from "./utils.tsx";
+import { getToolPartErrorText, safeStringifyFormatted } from "../utils.ts";
 import { ImageLightbox } from "../../../image-lightbox.tsx";
 import type { UsageStats } from "@/web/lib/usage-utils.ts";
 import { formatDuration } from "@/web/lib/format-time.ts";
@@ -27,6 +28,9 @@ interface GenerateImageResult {
   images?: Array<{ uri?: string; url?: string; mediaType: string }>;
   model?: string;
   usage?: { inputTokens?: number; outputTokens?: number };
+  /** Set when the tool was dispatched as a background job: the call returned
+   *  immediately with a handle and the image arrives later as its own message. */
+  background?: boolean;
 }
 
 interface GenerateImageInput {
@@ -119,7 +123,34 @@ export function GenerateImagePart({ part, latency }: GenerateImagePartProps) {
     );
   }
 
+  // Backgrounded: the call returned a handle immediately; the finished image
+  // arrives later as its own message below. This card is terminal (no spinner)
+  // — the live progress lives on that follow-up message, not here.
+  if (result?.background) {
+    return (
+      <ToolCallShell
+        icon={<Image01 size={14} />}
+        title="Image queued — generating in the background"
+        summary={input?.prompt ? `"${input.prompt.slice(0, 80)}…"` : undefined}
+        state="idle"
+      />
+    );
+  }
+
   if (state === "error" || !images || images.length === 0) {
+    const errorText =
+      state === "error" ? getToolPartErrorText(part) : undefined;
+    let detail = "";
+    if (input !== undefined) {
+      detail += "# Input\n" + safeStringifyFormatted(input);
+    }
+    if (errorText) {
+      if (detail) detail += "\n\n";
+      detail += "# Error\n" + errorText;
+    } else if (result !== undefined) {
+      if (detail) detail += "\n\n";
+      detail += "# Output\n" + safeStringifyFormatted(result);
+    }
     return (
       <ToolCallShell
         icon={<Image01 size={14} />}
@@ -128,6 +159,7 @@ export function GenerateImagePart({ part, latency }: GenerateImagePartProps) {
         state={state === "error" ? "error" : "idle"}
         usage={usage}
         trailing={latencyLabel}
+        detail={detail || null}
       />
     );
   }

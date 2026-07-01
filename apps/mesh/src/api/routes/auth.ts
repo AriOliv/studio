@@ -16,15 +16,31 @@ import {
   resetPasswordEnabled,
 } from "../../auth";
 import { getDb } from "../../database";
+import { ensureUserOrganization } from "../../auth/ensure-user-organization";
 import { extractBrandFromDomain } from "../../auth/extract-brand";
+import { isDiscoverableDomainRecord } from "../../auth/org-assurance-policy";
+import {
+  createEmailSender,
+  findEmailProvider,
+} from "../../auth/email-providers";
+import { emailButton, emailTemplate } from "../../auth/email-template";
+import { ADMIN_ROLES } from "../../auth/roles";
+import { isOrgArchived } from "../../core/org-archived";
+import { getBaseUrl } from "../../core/server-constants";
 import { BrandContextStorage } from "../../storage/brand-context";
 import { OrganizationDomainStorage } from "../../storage/organization-domains";
+import { OrganizationJoinRequestStorage } from "../../storage/organization-join-requests";
 import { KNOWN_OAUTH_PROVIDERS, OAuthProvider } from "@/auth/oauth-providers";
 import {
   getLocalAdminUser,
   getLocalAdminPassword,
   isLocalMode,
 } from "@/auth/local-mode";
+import {
+  allCapabilitiesGranted,
+  resolveCapabilities,
+  USER_ROLE_TOOLS,
+} from "@/tools/registry-metadata";
 
 const app = new Hono();
 
@@ -181,11 +197,103 @@ app.post("/local-session", async (c) => {
 });
 
 /**
+ * My Capabilities Endpoint (authenticated)
+ *
+ * Resolves which permission capabilities the current user has in the given
+ * organization, as a capability-id → boolean map. The single source of truth
+ * for proactive UI gating, so the client never re-implements role logic.
+ *
+ * Server-resolved against the role's stored permission using the same wildcard
+ * rules AccessControl applies. Better Auth's listRoles is admin-only, so this
+ * route reads the caller's own membership + role directly to support every
+ * member. The org is taken from the path (not the session's active org, which
+ * can be stale or point at a different org than the one being viewed).
+ *
+ * Route: GET /api/auth/custom/my-capabilities/:slug
+ */
+app.get("/my-capabilities/:slug", async (c) => {
+  const slug = c.req.param("slug");
+  const session = (await auth.api.getSession({
+    headers: c.req.raw.headers,
+  })) as { user?: { id: string } } | null;
+
+  if (!session?.user) {
+    return c.json({ error: "Authentication required" }, 401);
+  }
+
+  const db = getDb().db;
+
+  const org = await db
+    .selectFrom("organization")
+    .select(["id"])
+    .where("slug", "=", slug)
+    .executeTakeFirst();
+  if (!org) {
+    return c.json({ role: null, capabilities: {} });
+  }
+
+  const member = await db
+    .selectFrom("member")
+    .select(["role"])
+    .where("userId", "=", session.user.id)
+    .where("organizationId", "=", org.id)
+    .executeTakeFirst();
+
+  const role = member?.role ?? null;
+  if (!role) {
+    return c.json({ role: null, capabilities: {} });
+  }
+
+  // owner / admin bypass every permission check — match AccessControl.
+  if (role === "owner" || role === "admin") {
+    return c.json({ role, capabilities: allCapabilitiesGranted() });
+  }
+
+  // The built-in "user" role has no organizationRole row; its gated grants are
+  // baked into code (USER_ROLE_TOOLS, empty by default), NOT stored in the DB.
+  // Resolve from that set so UI gating matches the role's `self` grant in the
+  // auth config. Empty set → no gated capabilities, same as before.
+  if (role === "user") {
+    return c.json({
+      role,
+      capabilities: resolveCapabilities({ self: [...USER_ROLE_TOOLS] }),
+    });
+  }
+
+  // A custom role is resolved from its stored permission.
+  const customRole = await db
+    .selectFrom("organizationRole")
+    .select(["permission"])
+    .where("role", "=", role)
+    .where("organizationId", "=", org.id)
+    .executeTakeFirst();
+
+  let permission: Record<string, string[]> = {};
+  const raw = customRole?.permission;
+  if (typeof raw === "string") {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      // Stored permission must be a JSON object map. Anything else (array,
+      // primitive, null) is treated as no permissions rather than trusted —
+      // resolveCapabilities is also defensive, but we don't pass it garbage.
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        permission = parsed as Record<string, string[]>;
+      }
+    } catch {
+      permission = {};
+    }
+  }
+
+  return c.json({ role, capabilities: resolveCapabilities(permission) });
+});
+
+/**
  * Domain Lookup Endpoint (authenticated, verified email required)
  *
- * For the onboarding flow: checks if the authenticated user's email domain
- * has a claimed organization. Derives the domain from the session — no
- * query params needed.
+ * For the onboarding flow: returns the list of organizations that have
+ * claimed the authenticated user's email domain. A domain can be claimed
+ * by multiple orgs, so callers should present a picker when more than
+ * one match is returned.
  *
  * Route: GET /api/auth/custom/domain-lookup
  */
@@ -199,31 +307,55 @@ app.get("/domain-lookup", async (c) => {
     return c.json({ success: false, error: "Authentication required" }, 401);
   }
   if (!session.user.emailVerified) {
-    return c.json({ found: false });
+    return c.json({ found: false, organizations: [] });
   }
   const domain = session.user.email?.split("@")[1]?.toLowerCase();
   if (!domain || GENERIC_EMAIL_DOMAINS.has(domain)) {
-    return c.json({ found: false });
+    return c.json({ found: false, organizations: [] });
   }
 
   try {
     const domainStorage = new OrganizationDomainStorage(getDb().db);
-    const record = await domainStorage.getByDomain(domain);
+    // Only verified domains in a discoverable join mode surface. Unverified
+    // claims aren't proven, and verified "off" domains are intentionally not
+    // discoverable (matches /org-access-status and /domain-join).
+    const records = (await domainStorage.getAllByDomain(domain)).filter(
+      isDiscoverableDomainRecord,
+    );
 
-    if (!record) {
-      return c.json({ found: false });
+    if (records.length === 0) {
+      return c.json({ found: false, organizations: [] });
     }
 
-    const org = await getDb()
+    const orgs = await getDb()
       .db.selectFrom("organization")
-      .select(["name", "slug"])
-      .where("id", "=", record.organizationId)
-      .executeTakeFirst();
+      .select(["id", "name", "slug", "logo", "metadata"])
+      .where(
+        "id",
+        "in",
+        records.map((r) => r.organizationId),
+      )
+      .execute();
+
+    const orgById = new Map(orgs.map((o) => [o.id, o]));
+    const organizations = records
+      .map((r) => {
+        const org = orgById.get(r.organizationId);
+        if (!org) return null;
+        if (isOrgArchived(org)) return null;
+        return {
+          id: org.id,
+          name: org.name,
+          slug: org.slug,
+          logo: org.logo,
+          joinMode: r.joinMode,
+        };
+      })
+      .filter((o): o is NonNullable<typeof o> => o !== null);
 
     return c.json({
-      found: true,
-      autoJoinEnabled: record.autoJoinEnabled,
-      organization: org ? { name: org.name, slug: org.slug } : null,
+      found: organizations.length > 0,
+      organizations,
     });
   } catch (error) {
     console.error("[Auth] Domain lookup failed:", error);
@@ -234,11 +366,15 @@ app.get("/domain-lookup", async (c) => {
 /**
  * Domain Auto-Join Endpoint (authenticated, verified email required)
  *
- * Adds the authenticated user to the organization that claimed their
- * email domain, provided auto_join_enabled is true. Everything is
- * derived from the session — no request body needed.
+ * Adds the authenticated user to an organization that claimed their
+ * email domain with a verified domain in "auto" join mode. With multiple
+ * orgs allowed to claim a domain, callers SHOULD pass the target org's
+ * slug in the body (e.g. picked from /domain-lookup). When omitted, the
+ * endpoint joins the matching org only if exactly one auto-join-eligible
+ * org exists for the domain — otherwise it returns 409 with the list.
  *
  * Route: POST /api/auth/custom/domain-join
+ * Body (optional): { organizationSlug?: string }
  */
 app.post("/domain-join", async (c) => {
   const session = (await auth.api.getSession({
@@ -263,10 +399,22 @@ app.post("/domain-join", async (c) => {
     );
   }
 
+  const body = (await c.req.json().catch(() => ({}))) as {
+    organizationSlug?: unknown;
+  };
+  const targetSlug =
+    typeof body.organizationSlug === "string" && body.organizationSlug.trim()
+      ? body.organizationSlug.trim()
+      : null;
+
   try {
-    const domainStorage = new OrganizationDomainStorage(getDb().db);
-    const domainRecord = await domainStorage.getByDomain(emailDomain);
-    if (!domainRecord || !domainRecord.autoJoinEnabled) {
+    const db = getDb().db;
+    const domainStorage = new OrganizationDomainStorage(db);
+    const domainRecords = await domainStorage.getAllByDomain(emailDomain);
+    const eligibleRecords = domainRecords.filter(
+      (r) => r.verificationStatus === "verified" && r.joinMode === "auto",
+    );
+    if (eligibleRecords.length === 0) {
       return c.json(
         {
           success: false,
@@ -276,13 +424,62 @@ app.post("/domain-join", async (c) => {
       );
     }
 
-    const org = await getDb()
-      .db.selectFrom("organization")
-      .select(["id", "slug"])
-      .where("id", "=", domainRecord.organizationId)
-      .executeTakeFirst();
-    if (!org) {
-      return c.json({ success: false, error: "Organization not found" }, 404);
+    const eligibleOrgs = await db
+      .selectFrom("organization")
+      .select(["id", "slug", "metadata"])
+      .where(
+        "id",
+        "in",
+        eligibleRecords.map((r) => r.organizationId),
+      )
+      .execute();
+    const eligibleOrgById = new Map(
+      eligibleOrgs
+        .filter((org) => !isOrgArchived(org))
+        .map((org) => [org.id, { id: org.id, slug: org.slug }]),
+    );
+    const eligible = eligibleRecords.flatMap((record) => {
+      const org = eligibleOrgById.get(record.organizationId);
+      return org ? [org] : [];
+    });
+    if (eligible.length === 0) {
+      return c.json(
+        {
+          success: false,
+          error: "Auto-join is not available for this domain",
+        },
+        403,
+      );
+    }
+
+    // Resolve target org. With a slug, look it up directly and confirm it
+    // claims the domain with auto-join. Without a slug, only proceed when
+    // exactly one match exists so we never silently pick for the user.
+    let org: { id: string; slug: string } | undefined;
+    if (targetSlug) {
+      const candidate = eligible.find((org) => org.slug === targetSlug);
+      if (!candidate) {
+        return c.json(
+          {
+            success: false,
+            error:
+              "This organization is not available for auto-join with your email domain.",
+          },
+          403,
+        );
+      }
+      org = candidate;
+    } else if (eligible.length === 1) {
+      org = eligible[0]!;
+    } else {
+      return c.json(
+        {
+          success: false,
+          error: "Multiple organizations match this domain. Please pick one.",
+          requiresSelection: true,
+        },
+        409,
+      );
     }
 
     // Add the user as a member — if they're already a member
@@ -381,39 +578,31 @@ app.post("/domain-setup", async (c) => {
     const db = getDb().db;
     const domainStorage = new OrganizationDomainStorage(db);
 
-    // Only block on existing claim if the caller actually wants to claim
-    // the domain. If they're opting out, another org owning the domain
-    // doesn't conflict with creating a new (unclaimed) org.
-    const existing = shouldClaimDomain
-      ? await domainStorage.getByDomain(emailDomain)
-      : null;
-    if (existing) {
-      // Verify the user is actually a member of this org
-      const membership = await db
+    // If the user already belongs to an org that claims this domain, send
+    // them there instead of creating a duplicate. Multiple orgs may claim
+    // the same domain, so we look at every claim and pick the first one
+    // the user is a member of.
+    const existingClaims = await domainStorage.getAllByDomain(emailDomain);
+    if (existingClaims.length > 0) {
+      const existingMembership = await db
         .selectFrom("member")
         .innerJoin("organization", "organization.id", "member.organizationId")
         .select(["organization.slug"])
         .where("member.userId", "=", session.user.id)
-        .where("member.organizationId", "=", existing.organizationId)
+        .where(
+          "member.organizationId",
+          "in",
+          existingClaims.map((c) => c.organizationId),
+        )
         .executeTakeFirst();
 
-      if (membership) {
+      if (existingMembership) {
         return c.json({
           success: true,
-          slug: membership.slug,
+          slug: existingMembership.slug,
           alreadyExists: true,
         });
       }
-
-      // Domain claimed but user isn't a member — they can't use this flow
-      return c.json(
-        {
-          success: false,
-          error:
-            "This domain is already claimed. Ask an admin for an invitation.",
-        },
-        403,
-      );
     }
 
     // Org name/slug: prefer caller-supplied name, else derive from domain
@@ -467,40 +656,18 @@ app.post("/domain-setup", async (c) => {
     }
     const orgId = orgResult.id;
 
-    // Claim the domain (optional). Only clean up the org on a domain race
-    // (specific "already claimed" error from the storage layer). Transient
-    // DB errors should not delete the org — it can be reclaimed later.
+    // Claim the domain (optional). Multiple orgs may claim the same
+    // domain, so there's no race to handle — the storage layer just
+    // inserts another row. Transient DB errors leave the org in place so
+    // the user can retry claiming later.
     if (shouldClaimDomain) {
-      try {
-        await domainStorage.setDomain(orgId, emailDomain, true);
-      } catch (claimError) {
-        const isDomainRace =
-          claimError instanceof Error &&
-          claimError.message.includes("already claimed");
-        if (isDomainRace) {
-          try {
-            await auth.api.deleteOrganization({
-              headers: c.req.raw.headers,
-              body: { organizationId: orgId },
-            });
-          } catch {
-            console.error(
-              "[Auth] Failed to clean up orphaned org after domain race:",
-              orgId,
-            );
-          }
-          return c.json(
-            {
-              success: false,
-              error:
-                "This domain was just claimed by another user. Please refresh and try again.",
-            },
-            409,
-          );
-        }
-        // Transient error — org exists but domain claim failed. Don't delete.
-        throw claimError;
-      }
+      // The creator's verified corporate email proves this domain (email
+      // trust), so it's verified immediately with auto-join on.
+      await domainStorage.add(orgId, emailDomain, {
+        joinMode: "auto",
+        verificationStatus: "verified",
+        verificationMethod: "email",
+      });
     }
 
     // Brand extraction (best-effort — don't fail the setup if this errors).
@@ -596,6 +763,396 @@ app.post("/domain-setup", async (c) => {
     console.error("[Auth] Domain setup failed:", error);
     return c.json(
       { success: false, error: "Failed to set up organization" },
+      500,
+    );
+  }
+});
+
+/**
+ * Org Access Status Endpoint (authenticated)
+ *
+ * For the shell layout's "you visited /:org/... but aren't a member" branch.
+ * Resolves an org by slug and tells the frontend which screen to render:
+ *
+ *   member            — user is already a member (shell should re-fetch)
+ *   pending-invite    — there's a pending invitation for this email
+ *   auto-domain-join  — org claims the user's verified domain in "auto" mode
+ *   can-request       — org claims the verified domain in "request" mode
+ *   request-pending   — a join request already exists for this user
+ *   no-access         — none of the above
+ *   not-found         — slug doesn't resolve
+ *
+ * Route: GET /api/auth/custom/org-access-status/:slug
+ */
+app.get("/org-access-status/:slug", async (c) => {
+  const slug = c.req.param("slug");
+  const session = (await auth.api.getSession({
+    headers: c.req.raw.headers,
+  })) as {
+    user?: { id: string; email: string; emailVerified: boolean };
+  } | null;
+  if (!session?.user) {
+    return c.json({ success: false, error: "Authentication required" }, 401);
+  }
+
+  const db = getDb().db;
+
+  const org = await db
+    .selectFrom("organization")
+    .select(["id", "name", "slug", "logo"])
+    .where("slug", "=", slug)
+    .executeTakeFirst();
+
+  if (!org) {
+    return c.json({ status: "not-found" as const });
+  }
+
+  const orgPayload = {
+    id: org.id,
+    name: org.name,
+    slug: org.slug,
+    logo: org.logo,
+  };
+
+  const membership = await db
+    .selectFrom("member")
+    .select(["id"])
+    .where("userId", "=", session.user.id)
+    .where("organizationId", "=", org.id)
+    .executeTakeFirst();
+
+  if (membership) {
+    return c.json({ status: "member" as const, organization: orgPayload });
+  }
+
+  // Pending invite for this user's email targeting this org?
+  try {
+    const invitations = (await auth.api.listUserInvitations({
+      headers: c.req.raw.headers,
+    })) as Array<{
+      id: string;
+      organizationId: string;
+      status: string;
+      expiresAt: string | Date;
+    }>;
+    const now = Date.now();
+    const match = invitations.find(
+      (inv) =>
+        inv.organizationId === org.id &&
+        inv.status === "pending" &&
+        new Date(inv.expiresAt).getTime() > now,
+    );
+    if (match) {
+      return c.json({
+        status: "pending-invite" as const,
+        invitation: { id: match.id },
+        organization: orgPayload,
+      });
+    }
+  } catch (error) {
+    // listUserInvitations can fail for unverified emails or transient DB
+    // issues — fall through to the auto-domain-join / no-access checks
+    // rather than failing the whole status lookup.
+    console.error("[Auth] listUserInvitations failed:", error);
+  }
+
+  // Domain-based access: the org claims the user's verified domain.
+  //   auto    → auto-domain-join (one-click join)
+  //   request → can-request, or request-pending if one already exists
+  if (session.user.emailVerified) {
+    const emailDomain = session.user.email?.split("@")[1]?.toLowerCase();
+    if (emailDomain && !GENERIC_EMAIL_DOMAINS.has(emailDomain)) {
+      const domainRecord = await new OrganizationDomainStorage(
+        db,
+      ).getByOrgAndDomain(org.id, emailDomain);
+      if (domainRecord?.verificationStatus === "verified") {
+        if (domainRecord.joinMode === "auto") {
+          return c.json({
+            status: "auto-domain-join" as const,
+            organization: { ...orgPayload, domain: emailDomain },
+          });
+        }
+        if (domainRecord.joinMode === "request") {
+          const pending = await new OrganizationJoinRequestStorage(
+            db,
+          ).getPending(org.id, session.user.id);
+          return c.json({
+            status: pending
+              ? ("request-pending" as const)
+              : ("can-request" as const),
+            organization: { ...orgPayload, domain: emailDomain },
+          });
+        }
+      }
+    }
+  }
+
+  return c.json({ status: "no-access" as const, organization: orgPayload });
+});
+
+/**
+ * Best-effort email to the org's admins/owners when a join request arrives.
+ * Mirrors the invitation email setup; never throws.
+ */
+async function notifyAdminsOfJoinRequest(
+  db: ReturnType<typeof getDb>["db"],
+  org: { id: string; slug: string; name: string },
+  requesterEmail: string,
+): Promise<void> {
+  try {
+    if (
+      !authConfig.inviteEmailProviderId ||
+      !authConfig.emailProviders ||
+      authConfig.emailProviders.length === 0
+    ) {
+      return;
+    }
+    const provider = findEmailProvider(
+      authConfig.emailProviders,
+      authConfig.inviteEmailProviderId,
+    );
+    if (!provider) return;
+
+    const members = await db
+      .selectFrom("member")
+      .innerJoin("user", "user.id", "member.userId")
+      .select(["user.email as email", "member.role as role"])
+      .where("member.organizationId", "=", org.id)
+      .execute();
+    // Roles are stored comma-joined (composite) and custom roles exist, so
+    // post-filter in JS instead of an exact SQL match.
+    const adminRoles = ADMIN_ROLES as readonly string[];
+    const admins = members.filter((m) =>
+      (m.role ?? "")
+        .split(",")
+        .map((r) => r.trim())
+        .some((r) => adminRoles.includes(r)),
+    );
+    if (admins.length === 0) return;
+
+    const sendEmail = createEmailSender(provider);
+    // Join requests are reviewed on the members settings page.
+    const reviewUrl = `${getBaseUrl()}/${org.slug}/settings/members`;
+    await Promise.allSettled(
+      admins.map((a) =>
+        sendEmail({
+          to: a.email,
+          subject: `New request to join ${org.name}`,
+          html: emailTemplate({
+            preheader: `${requesterEmail} requested to join ${org.name}.`,
+            heading: "New join request",
+            subheading: `<strong>${requesterEmail}</strong> requested to join <strong>${org.name}</strong> on deco Studio.`,
+            body: emailButton("Review request", reviewUrl),
+            footnote:
+              "You can approve or deny this request from your members settings.",
+          }),
+        }),
+      ),
+    );
+  } catch (error) {
+    console.error("[Auth] Failed to notify admins of join request:", error);
+  }
+}
+
+/**
+ * Domain Request-to-Join Endpoint (authenticated, verified email required)
+ *
+ * For orgs that claim the user's verified domain in "request" join mode:
+ * records a pending membership request that an admin must approve. Mirrors
+ * /domain-join, but creates a request instead of adding a member directly.
+ *
+ * Route: POST /api/auth/custom/domain-request-join
+ * Body: { organizationSlug: string }
+ */
+app.post("/domain-request-join", async (c) => {
+  const session = (await auth.api.getSession({
+    headers: c.req.raw.headers,
+  })) as {
+    user?: { id: string; email: string; emailVerified: boolean };
+  } | null;
+  if (!session?.user) {
+    return c.json({ success: false, error: "Authentication required" }, 401);
+  }
+  if (!session.user.emailVerified) {
+    return c.json(
+      { success: false, error: "Email must be verified to request access" },
+      403,
+    );
+  }
+  const emailDomain = session.user.email?.split("@")[1]?.toLowerCase();
+  if (!emailDomain || GENERIC_EMAIL_DOMAINS.has(emailDomain)) {
+    return c.json(
+      { success: false, error: "Generic email domains cannot request access" },
+      403,
+    );
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    organizationSlug?: unknown;
+  };
+  const targetSlug =
+    typeof body.organizationSlug === "string" && body.organizationSlug.trim()
+      ? body.organizationSlug.trim()
+      : null;
+  if (!targetSlug) {
+    return c.json(
+      { success: false, error: "organizationSlug is required" },
+      400,
+    );
+  }
+
+  try {
+    const db = getDb().db;
+    const org = await db
+      .selectFrom("organization")
+      .select(["id", "slug", "name"])
+      .where("slug", "=", targetSlug)
+      .executeTakeFirst();
+    if (!org) {
+      return c.json({ success: false, error: "Organization not found" }, 404);
+    }
+
+    // The org must claim this domain, verified, in request mode.
+    const domainRecord = await new OrganizationDomainStorage(
+      db,
+    ).getByOrgAndDomain(org.id, emailDomain);
+    if (
+      !domainRecord ||
+      domainRecord.verificationStatus !== "verified" ||
+      domainRecord.joinMode !== "request"
+    ) {
+      return c.json(
+        {
+          success: false,
+          error: "This organization is not accepting requests for your domain.",
+        },
+        403,
+      );
+    }
+
+    // Already a member? Nothing to request.
+    const existingMember = await db
+      .selectFrom("member")
+      .select(["id"])
+      .where("userId", "=", session.user.id)
+      .where("organizationId", "=", org.id)
+      .executeTakeFirst();
+    if (existingMember) {
+      return c.json({ success: true, slug: org.slug, alreadyMember: true });
+    }
+
+    await new OrganizationJoinRequestStorage(db).create(
+      org.id,
+      session.user.id,
+    );
+
+    await notifyAdminsOfJoinRequest(db, org, session.user.email);
+
+    posthog.capture({
+      distinctId: session.user.id,
+      event: "organization_join_requested",
+      groups: { organization: org.id },
+      properties: {
+        organization_id: org.id,
+        organization_slug: org.slug,
+        email_domain: emailDomain,
+      },
+    });
+
+    return c.json({ success: true, status: "pending" });
+  } catch (error) {
+    posthog.captureException(error, session.user.id);
+    console.error("[Auth] Domain request-join failed:", error);
+    return c.json({ success: false, error: "Failed to request access" }, 500);
+  }
+});
+
+/**
+ * Ensure Organization Endpoint (authenticated)
+ *
+ * Route-local recovery for authenticated users who have no organization.
+ * Returns JSON only so callers can decide the next route without being
+ * redirected to onboarding.
+ *
+ * Route: POST /api/auth/custom/ensure-organization
+ */
+app.post("/ensure-organization", async (c) => {
+  type EnsureOrganizationSession = {
+    user?: {
+      id: string;
+      email: string;
+      name?: string | null;
+      emailVerified: boolean;
+    };
+  } | null;
+  let session: EnsureOrganizationSession = null;
+
+  try {
+    session = (await auth.api.getSession({
+      headers: c.req.raw.headers,
+    })) as EnsureOrganizationSession;
+    if (!session?.user) {
+      return c.json({ success: false, error: "Authentication required" }, 401);
+    }
+
+    const result = await ensureUserOrganization({
+      db: getDb().db,
+      authApi: auth.api,
+      user: {
+        id: session.user.id,
+        email: session.user.email,
+        name: session.user.name ?? null,
+        emailVerified: !!session.user.emailVerified,
+      },
+      allowCreate: true,
+      createdVia: "commerce_onboarding_recovery",
+    });
+
+    if (result.status === "ambiguous") {
+      return c.json({
+        success: false,
+        status: result.status,
+        domain: result.domain,
+        organizations: result.organizations,
+      });
+    }
+
+    if (result.status === "skipped") {
+      return c.json(
+        {
+          success: false,
+          status: result.status,
+          reason: result.reason,
+          domain: result.domain,
+          error: "Organization creation is not available.",
+        },
+        409,
+      );
+    }
+
+    if (result.status === "already_has_organization") {
+      return c.json({
+        success: true,
+        status: result.status,
+        organization: result.organization,
+        domain: result.domain,
+      });
+    }
+
+    return c.json({
+      success: true,
+      status: result.status,
+      organization: result.organization,
+      domain: result.domain,
+    });
+  } catch (error) {
+    const userId = session?.user?.id;
+    if (userId) {
+      posthog.captureException(error, userId);
+    }
+    console.error("[Auth] ensure organization failed:", error);
+    return c.json(
+      { success: false, error: "Failed to ensure organization" },
       500,
     );
   }

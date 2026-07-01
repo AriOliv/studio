@@ -1,3 +1,16 @@
+/**
+ * Settings Shell Layout
+ *
+ * Wraps `/$org/settings/...` routes. Mirrors the org shell shape:
+ *   SidebarProvider
+ *   └── app-shell-root (flex-col, h-dvh)
+ *       ├── Toolbar.Header           — full-width, "← Settings" + trigger + back/forward
+ *       └── SidebarLayout            — body row
+ *           ├── SettingsSidebar      — desktop only
+ *           └── SidebarInset         — content card with routed children
+ *   + MobileSidebarSheet for the mobile sidebar
+ */
+
 import {
   Outlet,
   Link,
@@ -16,43 +29,52 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarProvider,
-  useSidebar,
 } from "@deco/ui/components/sidebar.tsx";
-import { Sheet, SheetContent, SheetTitle } from "@deco/ui/components/sheet.tsx";
 import { PageContentClassNameProvider } from "@/web/components/page";
 import {
-  ArrowNarrowLeft,
   BarChart10,
   BookOpen01,
   Building02,
-  ChevronLeft,
-  ChevronRight,
   ZapSquare,
   CpuChip01,
   Loading01,
   Lock01,
   LogOut01,
-  Menu01,
   PackageCheck,
   Shield01,
   User01,
   Users03,
   Zap,
+  Key01,
+  HardDrive,
 } from "@untitledui/icons";
 import { useProjectContext } from "@decocms/mesh-sdk";
+import { useCapabilities, type CapabilityId } from "@/web/hooks/use-capability";
+import { usePendingJoinRequests } from "@/web/hooks/use-join-requests";
 import { useIsMobile } from "@deco/ui/hooks/use-mobile.ts";
 import { Suspense } from "react";
-import { pluginSettingsSidebarItems } from "@/web/index";
 import { useStatusSounds } from "../hooks/use-status-sounds";
 import { authClient } from "@/web/lib/auth-client";
 import { track } from "@/web/lib/posthog-client";
-import { useCurrentMemberRole } from "@/web/hooks/use-current-member-role";
+import { clearPersistedQueryCache } from "@/web/lib/query-persist";
+import { Toolbar } from "@/web/layouts/agent-shell-layout/toolbar";
+import {
+  MobileSidebarSheet,
+  SidebarTriggerButton,
+} from "@/web/layouts/shell-controls";
 
 interface SettingsNavItem {
   key: string;
   label: string;
   icon: React.ReactNode;
   to: string;
+  /** Capability required to see this item. Omitted = visible to every member. */
+  requires?: CapabilityId;
+  /** Restrict to privileged built-in roles (owner/admin). For screens backed
+   *  by owner/admin-only APIs (e.g. role management). */
+  privilegedOnly?: boolean;
+  /** Count for a small red notification dot on the item (omit / 0 = none). */
+  badge?: number;
 }
 
 interface SettingsNavGroup {
@@ -61,45 +83,50 @@ interface SettingsNavGroup {
 }
 
 function useSettingsSidebarGroups(): SettingsNavGroup[] {
-  const currentProject = useProjectContext().project;
-  const enabledPlugins = currentProject.enabledPlugins ?? [];
-  const { canManageOrg, canManageAIProviders, canManageMembers, canEditRoles } =
-    useCurrentMemberRole();
-
-  const enabledSettingsItems = pluginSettingsSidebarItems
-    .filter((item) => enabledPlugins.includes(item.pluginId))
-    .map(({ key, label, icon, to }) => ({ key, label, icon, to }));
+  const { capabilities, isPrivileged, loading, error } = useCapabilities();
+  const joinRequestCount = usePendingJoinRequests().length;
 
   const groups: SettingsNavGroup[] = [
     {
       label: "Organization",
       items: [
-        ...(canManageOrg
-          ? [
-              {
-                key: "general",
-                label: "General",
-                icon: <Building02 size={14} />,
-                to: "/$org/settings/general",
-              },
-              {
-                key: "brand-context",
-                label: "Brand Context",
-                icon: <BookOpen01 size={14} />,
-                to: "/$org/settings/brand-context",
-              },
-            ]
-          : []),
-        ...(canManageAIProviders
-          ? [
-              {
-                key: "ai-providers",
-                label: "AI Providers",
-                icon: <CpuChip01 size={14} />,
-                to: "/$org/settings/ai-providers",
-              },
-            ]
-          : []),
+        {
+          key: "general",
+          label: "General",
+          icon: <Building02 size={14} />,
+          to: "/$org/settings/general",
+          requires: "org:manage",
+        },
+        {
+          key: "brand-context",
+          label: "Brand Context",
+          icon: <BookOpen01 size={14} />,
+          to: "/$org/settings/brand-context",
+          requires: "org:manage",
+        },
+        {
+          key: "ai-providers",
+          label: "AI Providers",
+          icon: <CpuChip01 size={14} />,
+          to: "/$org/settings/ai-providers",
+          requires: "ai-providers:manage",
+        },
+        {
+          key: "secrets",
+          label: "Secrets",
+          icon: <Key01 size={14} />,
+          to: "/$org/settings/secrets",
+          requires: "secrets:manage",
+        },
+        // Files moved to the top-level Library (/$org/files); the old
+        // settings route redirects there.
+        {
+          key: "buckets",
+          label: "Buckets",
+          icon: <HardDrive size={14} />,
+          to: "/$org/settings/buckets",
+          requires: "file-configs:manage",
+        },
       ],
     },
     {
@@ -122,12 +149,14 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
           label: "Automations",
           icon: <Zap size={14} />,
           to: "/$org/settings/automations",
+          requires: "automations:manage",
         },
         {
           key: "store",
           label: "Store",
           icon: <PackageCheck size={14} />,
           to: "/$org/settings/store",
+          requires: "registry:manage",
         },
       ],
     },
@@ -139,52 +168,32 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
           label: "Monitor",
           icon: <BarChart10 size={14} />,
           to: "/$org/settings/monitor",
+          requires: "monitoring:view",
         },
-        ...(canManageMembers
-          ? [
-              {
-                key: "members",
-                label: "Members",
-                icon: <Users03 size={14} />,
-                to: "/$org/settings/members",
-              },
-            ]
-          : []),
-        ...(canEditRoles
-          ? [
-              {
-                key: "roles",
-                label: "Roles",
-                icon: <Shield01 size={14} />,
-                to: "/$org/settings/roles",
-              },
-            ]
-          : []),
-        ...(canManageOrg
-          ? [
-              {
-                key: "sso",
-                label: "Security",
-                icon: <Lock01 size={14} />,
-                to: "/$org/settings/sso",
-              },
-            ]
-          : []),
+        {
+          key: "members",
+          label: "Members",
+          icon: <Users03 size={14} />,
+          to: "/$org/settings/members",
+          requires: "members:manage",
+          badge: joinRequestCount,
+        },
+        {
+          key: "roles",
+          label: "Roles",
+          icon: <Shield01 size={14} />,
+          to: "/$org/settings/roles",
+          // Role management uses owner/admin-only Better Auth APIs.
+          privilegedOnly: true,
+        },
+        {
+          key: "sso",
+          label: "Security",
+          icon: <Lock01 size={14} />,
+          to: "/$org/settings/sso",
+          requires: "org:manage",
+        },
       ],
-    },
-    {
-      label: "Extensions",
-      items: canManageOrg
-        ? [
-            {
-              key: "features",
-              label: "Plugins",
-              icon: <Zap size={14} />,
-              to: "/$org/settings/features",
-            },
-            ...enabledSettingsItems,
-          ]
-        : [],
     },
     {
       label: "Account",
@@ -199,7 +208,24 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
     },
   ];
 
-  return groups.filter((group) => group.items.length > 0);
+  // While capabilities load — or if the lookup errored — show every item
+  // optimistically. This avoids a flicker for the common privileged case and
+  // ensures a transient failure never hides nav from owners/admins. Once
+  // resolved, hide items the member's role can't open and drop any group left
+  // empty. Items without a `requires` (Profile, plugin items) are always shown.
+  if (loading || error) {
+    return groups;
+  }
+  return groups
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => {
+        if (item.privilegedOnly) return isPrivileged;
+        if (!item.requires) return true;
+        return isPrivileged || capabilities[item.requires];
+      }),
+    }))
+    .filter((group) => group.items.length > 0);
 }
 
 export function SettingsSidebar() {
@@ -216,27 +242,7 @@ export function SettingsSidebar() {
 
   return (
     <Sidebar variant="sidebar">
-      <SidebarContent className="flex flex-col flex-1 mt-2 px-2 pb-2 gap-0">
-        {/* Back to org */}
-        <SidebarGroup className="pt-0 pr-0 pb-3 md:pb-3 pl-0">
-          <SidebarGroupContent>
-            <SidebarMenu className="gap-1.5">
-              <SidebarMenuItem>
-                <SidebarMenuButton asChild>
-                  <Link
-                    to="/$org"
-                    params={{ org }}
-                    className="flex items-center gap-2 text-sm text-muted-foreground"
-                  >
-                    <ArrowNarrowLeft size={14} />
-                    <span>Settings</span>
-                  </Link>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
+      <SidebarContent className="flex flex-col flex-1 mt-2 px-2 pb-2 gap-0 overflow-y-auto">
         {groups.map((group, i) => (
           <SidebarGroup
             key={`${group.label}-${i}`}
@@ -269,7 +275,12 @@ export function SettingsSidebar() {
                         }
                         className="flex items-center gap-2.5 text-sm"
                       >
-                        <span className="shrink-0">{item.icon}</span>
+                        <span className="relative shrink-0">
+                          {item.icon}
+                          {item.badge ? (
+                            <span className="absolute -right-1 -top-1 size-2 rounded-full bg-red-500 pointer-events-none" />
+                          ) : null}
+                        </span>
                         <span className="truncate">{item.label}</span>
                       </Link>
                     </SidebarMenuButton>
@@ -289,6 +300,7 @@ export function SettingsSidebar() {
                 <SidebarMenuButton
                   onClick={() => {
                     track("signed_out", { source: "settings_sidebar" });
+                    clearPersistedQueryCache();
                     authClient.signOut();
                   }}
                   className="flex items-center gap-2.5 text-sm"
@@ -328,20 +340,6 @@ export function SettingsSidebarMobile({ onClose }: { onClose: () => void }) {
 
   return (
     <div className="flex flex-col h-full bg-sidebar">
-      {/* Header with back button */}
-      <div className="flex items-center h-14 px-4 shrink-0 border-b border-border/50">
-        <Link
-          to="/$org"
-          params={{ org }}
-          onClick={onClose}
-          className="flex items-center gap-2 text-sm font-semibold text-foreground"
-        >
-          <ArrowNarrowLeft size={16} className="shrink-0" />
-          <span>Settings</span>
-        </Link>
-      </div>
-
-      {/* Nav items */}
       <div className="flex flex-col flex-1 overflow-y-auto px-2 py-2 gap-0.5">
         {groups.map((group, i) => (
           <div key={`${group.label}-${i}`} className="flex flex-col gap-0.5">
@@ -368,7 +366,12 @@ export function SettingsSidebarMobile({ onClose }: { onClose: () => void }) {
                     : "text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground",
                 )}
               >
-                <span className="shrink-0">{item.icon}</span>
+                <span className="relative shrink-0">
+                  {item.icon}
+                  {item.badge ? (
+                    <span className="absolute -right-1 -top-1 size-2 rounded-full bg-red-500 pointer-events-none" />
+                  ) : null}
+                </span>
                 <span className="truncate">{item.label}</span>
               </Link>
             ))}
@@ -380,7 +383,10 @@ export function SettingsSidebarMobile({ onClose }: { onClose: () => void }) {
           <div className="h-px bg-border/50 my-2" />
           <button
             type="button"
-            onClick={() => authClient.signOut()}
+            onClick={() => {
+              clearPersistedQueryCache();
+              authClient.signOut();
+            }}
             className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg transition-colors text-sm text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
           >
             <span className="shrink-0">
@@ -402,51 +408,7 @@ export function SettingsSidebarMobile({ onClose }: { onClose: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
-// Settings toolbar — back/forward navigation only (no panel toggles)
-// ---------------------------------------------------------------------------
-
-function SettingsToolbar() {
-  return (
-    <div className="shrink-0 flex items-center justify-between pl-1 pr-2 h-10">
-      <div className="flex items-center gap-0.5 min-w-0">
-        <button
-          type="button"
-          onClick={() => window.history.back()}
-          className="flex size-7 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/60 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors"
-          title="Go back"
-        >
-          <ChevronLeft size={16} />
-        </button>
-        <button
-          type="button"
-          onClick={() => window.history.forward()}
-          className="flex size-7 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/60 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors"
-          title="Go forward"
-        >
-          <ChevronRight size={16} />
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function MobileToolbar({ onOpenSidebar }: { onOpenSidebar: () => void }) {
-  return (
-    <div className="shrink-0 flex items-center justify-between px-3 h-12 bg-background border-b border-border">
-      <button
-        type="button"
-        onClick={onOpenSidebar}
-        className="flex size-8 items-center justify-center rounded-md text-foreground/60 hover:bg-accent hover:text-foreground transition-colors"
-        aria-label="Open menu"
-      >
-        <Menu01 size={20} />
-      </button>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Settings inset — lightweight content area (no Chat, no virtualMCP)
+// Settings inset — content card holding routed children
 // ---------------------------------------------------------------------------
 
 function SettingsInset() {
@@ -456,65 +418,44 @@ function SettingsInset() {
   // Org-wide SSE sound notifications
   useStatusSounds(org.slug);
 
-  const { setOpenMobile, openMobile: mobileSidebarOpen } = useSidebar();
+  const content = (
+    <Suspense
+      fallback={
+        <div className="flex-1 flex items-center justify-center">
+          <Loading01 size={20} className="animate-spin text-muted-foreground" />
+        </div>
+      }
+    >
+      <div className="flex flex-1 items-center overflow-hidden rounded-[inherit]">
+        <PageContentClassNameProvider value="p-0">
+          <div className="flex-1 min-w-0 overflow-hidden h-full">
+            <Outlet />
+          </div>
+        </PageContentClassNameProvider>
+      </div>
+    </Suspense>
+  );
 
   if (isMobile) {
     return (
-      <div className="flex flex-col flex-1 bg-background min-h-0">
-        <MobileToolbar onOpenSidebar={() => setOpenMobile(true)} />
-        <div className="flex-1 overflow-hidden">
-          <PageContentClassNameProvider value="p-0">
-            <div className="flex-1 min-w-0 overflow-hidden h-full">
-              <Outlet />
-            </div>
-          </PageContentClassNameProvider>
-        </div>
-        <Sheet open={mobileSidebarOpen} onOpenChange={setOpenMobile}>
-          <SheetContent
-            side="left"
-            hideCloseButton
-            className="w-[calc(100vw-3rem)] sm:max-w-md! p-0"
-          >
-            <SheetTitle className="sr-only">Navigation</SheetTitle>
-            <SettingsSidebarMobile onClose={() => setOpenMobile(false)} />
-          </SheetContent>
-        </Sheet>
+      <div className="flex flex-col flex-1 bg-background min-h-0 overflow-hidden">
+        {content}
       </div>
     );
   }
 
   return (
-    <>
-      <SettingsToolbar />
-      <div className="flex-1 min-h-0 p-1">
-        <div
-          className={cn(
-            "flex flex-col h-full min-h-0 bg-background overflow-hidden",
-            "card-shadow",
-            "rounded-[0.75rem]",
-          )}
-        >
-          <Suspense
-            fallback={
-              <div className="flex-1 flex items-center justify-center">
-                <Loading01
-                  size={20}
-                  className="animate-spin text-muted-foreground"
-                />
-              </div>
-            }
-          >
-            <div className="flex flex-1 items-center overflow-hidden rounded-[inherit]">
-              <PageContentClassNameProvider value="p-0">
-                <div className="flex-1 min-w-0 overflow-hidden h-full">
-                  <Outlet />
-                </div>
-              </PageContentClassNameProvider>
-            </div>
-          </Suspense>
-        </div>
+    <div className="flex-1 min-h-0 p-1">
+      <div
+        className={cn(
+          "flex flex-col h-full min-h-0 bg-background overflow-hidden",
+          "card-shadow",
+          "rounded-[0.75rem]",
+        )}
+      >
+        {content}
       </div>
-    </>
+    </div>
   );
 }
 
@@ -523,29 +464,53 @@ function SettingsInset() {
 // ---------------------------------------------------------------------------
 
 export default function SettingsLayout() {
+  const isMobile = useIsMobile();
+
   return (
-    <SidebarProvider defaultOpen={true}>
-      <div className="flex flex-col h-dvh overflow-hidden">
-        <SidebarLayout
-          className="flex-1 bg-sidebar"
-          style={
-            {
-              "--sidebar-width-icon": "3.5rem",
-            } as Record<string, string>
-          }
-        >
-          <SettingsSidebar />
-          <SidebarInset
-            className="flex flex-col"
-            style={{
-              background: "transparent",
-              containerType: "inline-size",
-            }}
+    <Toolbar.Provider>
+      <SidebarProvider defaultOpen={true}>
+        <div className="app-shell-root flex flex-col h-dvh overflow-hidden">
+          <Toolbar.Header>
+            <Toolbar.LeftColumn>
+              <Toolbar.LogoLink />
+              {isMobile && <SidebarTriggerButton />}
+              <span className="hidden md:contents">
+                <Toolbar.Nav />
+              </span>
+            </Toolbar.LeftColumn>
+            <Toolbar.CenterSlot />
+            <Toolbar.RightColumn>
+              <span />
+            </Toolbar.RightColumn>
+          </Toolbar.Header>
+          <SidebarLayout
+            className="flex-1 bg-sidebar min-h-0"
+            style={
+              {
+                "--sidebar-width-icon": "3.5rem",
+              } as Record<string, string>
+            }
           >
-            <SettingsInset />
-          </SidebarInset>
-        </SidebarLayout>
-      </div>
-    </SidebarProvider>
+            {!isMobile && <SettingsSidebar />}
+            <SidebarInset
+              className="flex flex-col"
+              style={{
+                background: "transparent",
+                containerType: "inline-size",
+              }}
+            >
+              <SettingsInset />
+            </SidebarInset>
+          </SidebarLayout>
+          {isMobile && (
+            <MobileSidebarSheet
+              renderSidebar={({ onClose }) => (
+                <SettingsSidebarMobile onClose={onClose} />
+              )}
+            />
+          )}
+        </div>
+      </SidebarProvider>
+    </Toolbar.Provider>
   );
 }

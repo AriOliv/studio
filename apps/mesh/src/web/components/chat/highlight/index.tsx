@@ -1,19 +1,22 @@
 import { Button } from "@deco/ui/components/button.tsx";
-import { AlertCircle, AlertTriangle } from "@untitledui/icons";
+import { AlertCircle, AlertTriangle, Copy01 } from "@untitledui/icons";
+import { toast } from "sonner";
 import {
   readToolApprovalLevel,
   usePreferences,
   type ToolApprovalLevel,
 } from "@/web/hooks/use-preferences.ts";
 import { useChatPrefs, useChatStream, useChatTask } from "../context";
-import type { RequestOptions } from "../hooks/thread-connection";
+import type { RequestOptions } from "../store/thread-connection";
 import { ApprovalHighlight, extractPendingApprovals } from "./approval";
 import { ProposePlanHighlight, extractPendingPlans } from "./propose-plan";
 import { UserAskQuestionHighlight } from "./user-ask-question";
 import { TodosHighlight } from "./todos";
 import { CollapsibleHighlight } from "./collapsible-highlight";
 import { CreditsExhaustedBanner } from "../credits-exhausted-banner";
+import { DesktopOfflineBanner } from "../desktop-offline-banner";
 import { useHighlightFlags } from "./use-highlight-count";
+import { parseErrorMessage } from "./parse-error-message";
 import type { UserAskToolPart } from "../types";
 
 // ============================================================================
@@ -47,17 +50,22 @@ function StatusHighlight(props: StatusHighlightProps) {
   const isError = variant === "error";
 
   const label = isError ? "Error occurred" : "Response incomplete";
-  const message = isError
+  const Icon = isError ? AlertCircle : AlertTriangle;
+
+  const rawMessage = isError
     ? props.error.message
     : (WARNING_DESCRIPTIONS[props.finishReason] ??
       `Response stopped unexpectedly: ${props.finishReason}`);
-  const Icon = isError ? AlertCircle : AlertTriangle;
+
+  const { summary, rawDetails } = isError
+    ? parseErrorMessage(rawMessage)
+    : { summary: rawMessage, rawDetails: null };
 
   return (
     <CollapsibleHighlight
       icon={<Icon size={14} />}
       label={label}
-      title={message}
+      title={summary}
       defaultExpanded={true}
       variant={variant}
       onClose={onDismiss}
@@ -83,7 +91,47 @@ function StatusHighlight(props: StatusHighlightProps) {
         )
       }
     >
-      {null}
+      {rawDetails ? (
+        <details className="group mx-4">
+          <summary className="flex cursor-pointer list-none items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground [&::-webkit-details-marker]:hidden">
+            <svg
+              aria-hidden="true"
+              className="size-3 transition-transform group-open:rotate-90"
+              viewBox="0 0 12 12"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="m4.5 3 3 3-3 3" />
+            </svg>
+            <span className="group-open:hidden">Show technical details</span>
+            <span className="hidden group-open:inline">
+              Hide technical details
+            </span>
+          </summary>
+          <div className="relative mt-2">
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard
+                  .writeText(rawDetails)
+                  .then(() => toast.success("Copied to clipboard"))
+                  .catch(() => toast.error("Could not copy"));
+              }}
+              aria-label="Copy error details"
+              title="Copy"
+              className="absolute right-1.5 top-1.5 z-10 flex h-6 w-6 items-center justify-center rounded-md bg-background/80 text-muted-foreground backdrop-blur-sm transition-colors hover:bg-background hover:text-foreground"
+            >
+              <Copy01 className="size-3.5" />
+            </button>
+            <pre className="max-h-40 overflow-auto rounded-md border border-border/60 bg-background px-3 py-2 pr-8 font-mono text-xs text-foreground/80 whitespace-pre-wrap break-all">
+              {rawDetails}
+            </pre>
+          </div>
+        </details>
+      ) : null}
     </CollapsibleHighlight>
   );
 }
@@ -232,6 +280,7 @@ export function ChatHighlight() {
   return (
     <div className="absolute bottom-full left-0 right-0">
       <TodosHighlight />
+      <DesktopOfflineBanner />
       {showError && (
         <StatusHighlight
           variant="error"

@@ -18,7 +18,7 @@ import { createServerFromClient, getDecopilotId } from "@decocms/mesh-sdk";
 import { SpanStatusCode } from "@opentelemetry/api";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { Hono } from "hono";
-import type { MeshContext } from "../../core/mesh-context";
+import { getUserId, type StudioContext } from "../../core/studio-context";
 import { MCP_TOOL_CALL_TIMEOUT_MS } from "@/core/constants";
 import { getAllowedToolsForRole } from "../../auth/role-tools";
 import {
@@ -26,8 +26,11 @@ import {
   renderPerUserAuthorizationRequired,
 } from "../../mcp-clients/outbound/errors";
 import { createVirtualClientFrom } from "../../mcp-clients/virtual-mcp";
+import { resolveDevConnection } from "./dev-connection";
+import { readSandboxMap } from "../../tools/sandbox/sandbox-map";
+import type { ConnectionEntity } from "../../tools/connection/schema";
 import type { Env } from "../hono-env";
-import { guardResponseStream } from "../utils/stream-guard";
+import { serveMcpRequest } from "../utils/serve-mcp";
 
 // ============================================================================
 // Route Handler (shared between /gateway and /virtual-mcp endpoints for backward compat)
@@ -35,7 +38,7 @@ import { guardResponseStream } from "../utils/stream-guard";
 
 export async function handleVirtualMcpRequest(
   c: {
-    get: (key: "meshContext") => MeshContext;
+    get: (key: "meshContext") => StudioContext;
     req: {
       header: (name: string) => string | undefined;
       param: (name: string) => string | undefined;
@@ -83,7 +86,7 @@ export async function handleVirtualMcpRequest(
     }
 
     const virtualMcp = await ctx.tracer.startActiveSpan(
-      "mesh.virtual_mcp.lookup",
+      "studio.virtual_mcp.lookup",
       { attributes: { "virtual_mcp.id": virtualId } },
       async (span) => {
         try {
@@ -152,9 +155,30 @@ export async function handleVirtualMcpRequest(
       };
     }
 
+    // Surface the dev sandbox's tools when the acting user has a running sandbox
+    // for this agent. The cheap local pre-filter is just "does the user have a
+    // sandbox entry?" (no repo/pairing flag) — agents without a sandbox skip the
+    // resolver entirely. resolveDevConnection then confirms the dev server
+    // actually speaks MCP (probe). Safe on this legacy route's looser org
+    // binding: it only resolves a sandbox the acting user themselves started.
+    const actingUserId = getUserId(ctx);
+    let devConnection: ConnectionEntity | null = null;
+    if (
+      virtualMcp.id &&
+      actingUserId &&
+      readSandboxMap(virtualMcp.metadata)[actingUserId]
+    ) {
+      devConnection = await resolveDevConnection(
+        ctx,
+        virtualMcp.id,
+        actingUserId,
+        c.req.query("branch") ?? undefined,
+      ).catch(() => null);
+    }
+
     // Create client from entity (always passthrough)
     const client = await ctx.tracer.startActiveSpan(
-      "mesh.virtual_mcp.create_client",
+      "studio.virtual_mcp.create_client",
       { attributes: { "virtual_mcp.id": virtualMcp.id ?? "decopilot" } },
       async (span) => {
         try {
@@ -162,6 +186,13 @@ export async function handleVirtualMcpRequest(
             virtualMcp,
             ctx,
             "passthrough",
+            false,
+            // Serves the agent's MCP (incl. the desktop daemon); surface the
+            // skill catalog in the instructions it reads.
+            {
+              includeSkillsCatalog: true,
+              additionalConnections: devConnection ? [devConnection] : [],
+            },
           );
           span.setStatus({ code: SpanStatusCode.OK });
           return result;
@@ -190,10 +221,10 @@ export async function handleVirtualMcpRequest(
     // Create server from client using the bridge
     const server = createServerFromClient(client, serverInfo, {
       capabilities: { tools: {}, resources: {}, prompts: {} },
-      instructions:
-        typeof virtualMcp.metadata?.instructions === "string"
-          ? virtualMcp.metadata.instructions
-          : undefined,
+      // Use the client's instructions (not raw metadata) so attached
+      // files/skills ride along to the sandbox daemon, which reads server
+      // instructions over this endpoint to assemble its system prompt.
+      instructions: client.getInstructions(),
       toolCallTimeoutMs: MCP_TOOL_CALL_TIMEOUT_MS,
     });
 
@@ -213,10 +244,16 @@ export async function handleVirtualMcpRequest(
     // Connect server to transport
     await server.connect(transport);
 
-    const response = await transport.handleRequest(c.req.raw);
-    return guardResponseStream(
-      response,
+    return await serveMcpRequest(
+      server,
+      transport,
+      c.req.raw,
       `virtual-mcp:${virtualMcp.id ?? "decopilot"}`,
+      // `client` is built fresh per request and is NOT pooled; the bridge
+      // server delegates to it but never closes it. Close it here or the
+      // PassthroughClient + every downstream lazy/real client + their
+      // transports leak (GatewayClient.close() cascades to all children).
+      { onClose: () => client.close() },
     );
   } catch (error) {
     const err = error as Error;

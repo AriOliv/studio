@@ -5,24 +5,31 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@deco/ui/components/dropdown-menu.tsx";
+import { Spinner } from "@deco/ui/components/spinner.tsx";
 import { ChevronDown } from "@untitledui/icons";
-import * as tpl from "./message-templates.ts";
+import { publishToBaseLabel } from "./publish-label.ts";
 
 interface Props {
-  prNumber: number;
+  /** PR base branch (e.g. main) — controls publish button copy. */
+  baseBranch: string;
   disabled: boolean;
-  send: (text: string) => Promise<void> | void;
+  loading?: boolean;
+  onPublish: () => void | Promise<void>;
+  onReview?: () => void;
 }
 
 /**
- * Split-style merge action: clicking the label fires Publish (squash-
- * merge); clicking the chevron opens a dropdown with Review. Each choice
- * sends a templated chat message.
+ * Split-style merge action: Publish squash-merges via GitHub MCP; Review still
+ * uses the chat agent for a read-only review pass.
  */
-export function MergeSplitButton({ prNumber, disabled, send }: Props) {
-  const squash = () => send(tpl.mergeSquash({ prNumber }));
-  const review = () => send(tpl.reviewPr({ prNumber }));
-
+export function MergeSplitButton({
+  baseBranch,
+  disabled,
+  loading = false,
+  onPublish,
+  onReview,
+}: Props) {
+  const publishLabel = publishToBaseLabel(baseBranch);
   return (
     <div className="inline-flex items-stretch rounded-md">
       <Button
@@ -30,9 +37,10 @@ export function MergeSplitButton({ prNumber, disabled, send }: Props) {
         variant="success"
         className="rounded-r-none border-r border-success-foreground/20"
         disabled={disabled}
-        onClick={squash}
+        onClick={() => void onPublish()}
       >
-        Publish
+        {loading ? <Spinner size="xs" variant="default" /> : null}
+        {publishLabel}
       </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -47,7 +55,9 @@ export function MergeSplitButton({ prNumber, disabled, send }: Props) {
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem onClick={review}>Review</DropdownMenuItem>
+          {onReview ? (
+            <DropdownMenuItem onClick={onReview}>Review</DropdownMenuItem>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
     </div>

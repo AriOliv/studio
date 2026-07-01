@@ -17,7 +17,17 @@
         "migrations/**/*.ts",
         "scripts/**/*.ts",
         // Dev-only module loaded via require() - needs explicit entry
-        "src/api/routes/dev-only.ts"
+        "src/api/routes/dev-only.ts",
+        // Browser asset served verbatim from the Vite public dir; deck HTML
+        // files reference it via <script src="/deck-runtime/v1/...">.
+        "public/deck-runtime/**/*.js",
+        // Playwright Component Testing harness. The mount template is loaded
+        // via ct/playwright/index.html + ctTemplateDir (index.css is imported
+        // from it), and the I/O stubs are wired only through resolve.alias in
+        // playwright-ct.config.ts — both are reachable by tooling knip can't
+        // trace. The *.ct.tsx specs are already entries via the playwright config.
+        "ct/playwright/index.tsx",
+        "ct/harness/stubs/**"
       ],
       "ignore": ["src/api/index.ts"],
       "ignoreDependencies": [
@@ -35,11 +45,29 @@
     },
     "packages/sandbox": {
       // daemon/entry.ts is bundled via `bun build` into a standalone binary
-      // that runs inside sandbox VMs. Without marking it as an entry, knip
-      // treats the whole daemon graph as unused.
-      "entry": ["daemon/entry.ts"]
+      // that runs inside sandbox VMs; org-fs/sidecar-main.ts likewise into
+      // the orgfs-sidecar image (deploy/helm/sandbox-env/orgfs-sidecar).
+      // The skills *.mjs CLIs are COPY'd into the sandbox image and executed
+      // there via the _bin shims (e.g. `slides-create`), never imported.
+      // Without marking them as entries, knip treats their graphs as unused.
+      "entry": [
+        "daemon/entry.ts",
+        "daemon/org-fs/sidecar-main.ts",
+        "image/skills/*/*.mjs"
+      ],
+      // Skill example assets (tokens.css, brand.md, deck.json, …) are runtime
+      // reference files COPY'd into the image and read by agents via `cat`
+      // (and synced to org/public/core), never imported — so knip's
+      // unused-files check would flag the analyzable ones (e.g. .css).
+      "ignore": ["image/skills/*/examples/**"]
     },
-    "packages/typegen": {}
+    "packages/typegen": {},
+    "packages/e2e": {
+      // Standalone mock servers spawned by Playwright's `webServer` via a
+      // `bun run fixtures/...` command string — knip can't trace a process
+      // launch, so without this entry it flags the file as unused.
+      "entry": ["fixtures/commerce-upgrade-mock.ts"]
+    }
   },
   "ignoreDependencies": ["@types/*"],
   // TODO(@camudo): Remove this config once I fix all unused type exports

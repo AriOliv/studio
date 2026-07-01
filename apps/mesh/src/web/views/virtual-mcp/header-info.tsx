@@ -1,20 +1,26 @@
 import type { VirtualMCPEntity } from "@decocms/mesh-sdk/types";
+import { agentShowsGithubHeaderActions } from "@/web/lib/agent-capabilities";
 import { HeaderActions } from "../../components/thread/github/header-actions.tsx";
+import { DevAgentControl } from "../../components/dev-agent/dev-agent-control.tsx";
 import { Toolbar } from "../../layouts/agent-shell-layout/toolbar.tsx";
 
 export function VirtualMcpHeaderInfo({
   virtualMcp,
+  inline = false,
 }: {
   virtualMcp: VirtualMCPEntity;
+  /** When true, skip the toolbar portal (mobile header has no Toolbar shell). */
+  inline?: boolean;
 }) {
-  const githubRepo = virtualMcp.metadata?.githubRepo ?? null;
-  const showActions = !!githubRepo?.connectionId;
-
-  if (!showActions) return null;
-
-  return (
-    <Toolbar.Right>
-      <HeaderActions virtualMcpId={virtualMcp.id} />
-    </Toolbar.Right>
+  const content = (
+    <div className="flex items-center gap-2">
+      <DevAgentControl virtualMcp={virtualMcp} />
+      {agentShowsGithubHeaderActions(virtualMcp) ? (
+        <HeaderActions virtualMcpId={virtualMcp.id} />
+      ) : null}
+    </div>
   );
+  if (inline) return content;
+
+  return <Toolbar.Right>{content}</Toolbar.Right>;
 }

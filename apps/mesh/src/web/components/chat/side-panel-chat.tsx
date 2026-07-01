@@ -1,79 +1,19 @@
-import { IntegrationIcon } from "@/web/components/integration-icon";
-import { authClient } from "@/web/lib/auth-client";
 import { cn } from "@deco/ui/lib/utils.ts";
-import {
-  getWellKnownDecopilotVirtualMCP,
-  useProjectContext,
-  useVirtualMCP,
-} from "@decocms/mesh-sdk";
-import { Users03 } from "@untitledui/icons";
+import { useProjectContext } from "@decocms/mesh-sdk";
 import { Suspense, useState } from "react";
 import { ErrorBoundary } from "../error-boundary";
 
 import { Chat } from "./index";
-import { useChatStream, useChatPrefs, useChatTask } from "./context";
+import { useChatStream } from "./context";
 import { ChatContextPanel } from "./context-panel";
+import { CenteredComposer } from "./centered-composer";
+import { ThreadFilesPanel } from "./thread-files-panel";
 import { wasCreditsEmptyDismissed } from "./credits-empty-state";
-import { BranchPicker } from "../thread/github/branch-picker.tsx";
 
+import { hasLocalCliHarness } from "@/web/lib/agent-capabilities";
 import { useAiProviderKeys } from "@/web/hooks/collections/use-ai-providers";
+import { useCurrentLink } from "@/web/hooks/use-current-link";
 import { useDecoCredits } from "@/web/hooks/use-deco-credits";
-
-// ---------- Default sidebar empty state ----------
-
-function SidebarEmptyState() {
-  const { org } = useProjectContext();
-  const { selectedVirtualMcp } = useChatPrefs();
-  const { data: session } = authClient.useSession();
-  const { currentBranch, setCurrentTaskBranch } = useChatTask();
-
-  const defaultAgent = getWellKnownDecopilotVirtualMCP(org.id);
-  const displayAgent = selectedVirtualMcp ?? defaultAgent;
-  const fullVm = useVirtualMCP(displayAgent.id);
-
-  const userId = session?.user?.id ?? "";
-  const githubRepo = fullVm?.metadata?.githubRepo ?? null;
-  const showBranchPicker = !!githubRepo?.connectionId && !!userId;
-
-  return (
-    <div className="h-full w-full flex flex-col items-center justify-center gap-6 px-4">
-      <div className="flex flex-col items-center justify-center gap-2 md:gap-4 text-center">
-        <IntegrationIcon
-          icon={displayAgent.icon}
-          name={displayAgent.title}
-          size="lg"
-          fallbackIcon={<Users03 size={32} />}
-          className="size-10 min-w-10 md:size-[60px]! md:min-w-[60px] rounded-xl md:rounded-[18px]!"
-        />
-        <h3 className="text-base md:text-xl font-medium text-foreground">
-          {displayAgent.title}
-        </h3>
-        <div className="text-muted-foreground text-center text-base max-w-md line-clamp-2">
-          {displayAgent.description ??
-            "Ask anything about configuring model providers or using MCP Mesh."}
-        </div>
-        {showBranchPicker && (
-          <div className="mt-2">
-            <BranchPicker
-              orgId={org.id}
-              orgSlug={org.slug}
-              userId={userId}
-              connectionId={githubRepo.connectionId!}
-              owner={githubRepo.owner}
-              repo={githubRepo.name}
-              vmMap={fullVm?.metadata?.vmMap}
-              value={currentBranch ?? undefined}
-              onChange={setCurrentTaskBranch}
-            />
-          </div>
-        )}
-      </div>
-      <div className="w-full max-w-3xl mx-auto">
-        <Chat.IceBreakers />
-      </div>
-    </div>
-  );
-}
 
 // ---------- Panel content ----------
 
@@ -83,8 +23,14 @@ function ChatPanelContent() {
   const { isChatEmpty } = useChatStream();
   const [activePanel, setActivePanel] = useState<"chat" | "context">("chat");
   const deco = useDecoCredits();
+  const link = useCurrentLink();
 
-  if (allKeys.length === 0) {
+  // No cloud provider key needed when an online desktop CLI harness
+  // (Claude Code / Codex) can back the chat instead.
+  const showProviderEmptyState =
+    allKeys.length === 0 && !hasLocalCliHarness(link);
+
+  if (showProviderEmptyState) {
     return (
       <Chat className="animate-in fade-in-0 duration-200">
         <Chat.Main className="flex flex-col items-center">
@@ -119,21 +65,22 @@ function ChatPanelContent() {
             : "opacity-100",
         )}
       >
-        {!isChatEmpty ? (
-          <>
-            <Chat.Main>
-              <Chat.Messages />
-            </Chat.Main>
-            <Chat.Footer>
-              <Chat.Input
-                onOpenContextPanel={() => setActivePanel("context")}
-              />
-            </Chat.Footer>
-          </>
+        {isChatEmpty ? (
+          <Chat.Main>
+            <CenteredComposer
+              onOpenContextPanel={() => setActivePanel("context")}
+            />
+          </Chat.Main>
         ) : (
           <>
-            <Chat.Main>
-              <SidebarEmptyState />
+            {/* @container: the files panel floats in the right gutter on
+                wide chats and becomes an in-flow topbar (flex row above
+                the scroller) when the gutter can't fit it */}
+            <Chat.Main className="relative flex flex-col overflow-hidden @container">
+              <ThreadFilesPanel />
+              <div className="min-h-0 flex-1">
+                <Chat.Messages />
+              </div>
             </Chat.Main>
             <Chat.Footer>
               <Chat.Input

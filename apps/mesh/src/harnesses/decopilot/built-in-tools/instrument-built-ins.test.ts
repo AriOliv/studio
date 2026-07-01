@@ -15,12 +15,16 @@ import { instrumentBuiltIns, type BuiltinToolParams } from "./index";
 
 const mockParams: BuiltinToolParams = {
   provider: null,
+  imageProvider: null,
+  webSearchProvider: null,
+  deepResearchProvider: null,
   organization: { id: "org_test" } as never,
   models: { connectionId: "conn_test", thinking: { id: "m" } } as never,
   toolOutputMap: new Map(),
   pendingImages: [],
   passthroughClient: {} as never,
   taskId: "task_test",
+  agentId: "agent-test",
 };
 
 const mockCtx = { auth: { user: { id: "user_test" } } } as never;

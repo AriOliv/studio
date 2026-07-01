@@ -114,7 +114,7 @@ bun run --cwd=apps/mesh start
 
 ### Core Abstractions
 
-**MeshContext** (`apps/mesh/src/core/mesh-context.ts`)
+**StudioContext** (`apps/mesh/src/core/studio-context.ts`)
 The central runtime interface injected into all tools. Provides:
 - `auth`: Authentication state (user, session, organization)
 - `access`: Access control layer (RBAC checks)
@@ -123,7 +123,7 @@ The central runtime interface injected into all tools. Provides:
 - `tracer`: OpenTelemetry distributed tracing
 - `meter`: OpenTelemetry metrics collection
 
-Tools NEVER access HTTP objects, database drivers, or environment variables directly—all dependencies flow through MeshContext.
+Tools NEVER access HTTP objects, database drivers, or environment variables directly—all dependencies flow through StudioContext.
 
 **defineTool()** (`apps/mesh/src/core/define-tool.ts`)
 Declarative API for creating type-safe, auditable MCP tools. Automatically provides:
@@ -155,7 +155,7 @@ The workspace is managed via Bun workspaces. The main application lives in `apps
 **apps/mesh/** - Main full-stack application
 - `src/api/` - Hono HTTP routes + MCP proxy routes
 - `src/auth/` - Better Auth (OAuth 2.1 + SSO + API keys)
-- `src/core/` - MeshContext, AccessControl, defineTool
+- `src/core/` - StudioContext, AccessControl, defineTool
 - `src/tools/` - Built-in MCP management tools (organized by domain)
 - `src/storage/` - Kysely database adapters and operations
 - `src/event-bus/` - Pub/sub event delivery system (CloudEvents v1.0)
@@ -168,7 +168,6 @@ The workspace is managed via Bun workspaces. The main application lives in `apps
 - `packages/bindings/` - Core MCP bindings and connection abstractions (defines standardized interfaces)
 - `packages/runtime/` - Runtime utilities for MCP proxy, OAuth, and tools
 - `packages/ui/` - Shared React components (shadcn-based design system)
-- `packages/vite-plugin-deco/` - Vite plugin for Deco projects
 - `packages/create-deco/` - Project scaffolding tool (npm init)
 
 Database migrations live in `apps/mesh/migrations/`, code quality plugins in `plugins/`, and infrastructure/deploy configs in `deploy/`.
@@ -288,6 +287,32 @@ Database schema key concepts:
 
 ## Coding Style & Naming Conventions
 
+### Async primitives — use `@decocms/std`, never hand-roll
+
+`@decocms/std` (`packages/std`) is the ONE canonical home for these — a small,
+zero-dependency, isomorphic (Node / Bun / browser) package ported from Deno std.
+It was consolidated from ~9 ad-hoc backoff copies and ~9 ad-hoc `sleep` copies.
+Do NOT write another `Math.min(base * 2 ** attempt, cap)` formula, jitter
+expression, `for`/`while` retry loop, `new Promise(r => setTimeout(r, ms))`, or
+`Bun.sleep` (Bun-only — defeats portability).
+
+- **`sleep(ms, { signal? })`** / **`delay(...)`** (same function) — wait `ms`,
+  optionally cancellable via `AbortSignal` (rejects with the signal's reason on
+  abort; `.catch(() => {})` if you want resolve-on-abort).
+- **`retry(fn, opts)`** — call a possibly-async function until it succeeds.
+  Supports `maxAttempts`, `minTimeout`/`maxTimeout`, `multiplier`, `jitter`
+  (0–1), an `isRetriable(err)` predicate (e.g. retry only 5xx), and an
+  `AbortSignal`. Throws `RetryError` (with `.cause`) on exhaustion.
+- **`exponentialBackoffWithJitter(cap, base, attempt, multiplier, jitter)`** —
+  the pure delay calculator, for stateful loops that can't be a single function
+  (WebSocket/SSE reconnect, durable event delivery). `jitter`: `0` = none,
+  `0.5` = equal `[exp/2, exp]`, `1` = full `[0, exp]`.
+
+All consumers (`apps/mesh` + packages) import via `@decocms/std`. If you think
+you need a new retry/sleep mechanism, you don't — extend the options or ask. The
+circuit breaker (`mcp-clients/circuit-breaker.ts`) is a different pattern (fault
+isolation) and is intentionally separate.
+
 ### Style & Formatting
 - **Biome** enforces two-space indentation and double quotes
 - **ALWAYS** run `bun run fmt` after making code changes (pre-commit hook via lefthook)
@@ -308,27 +333,54 @@ Located in `plugins/`:
 - `ban-use-effect.ts` - ban useEffect
 - `ban-memoization.ts` - ban useMemo/useCallback/memo
 - `ensure-tailwind-design-system-tokens.ts` - enforce Tailwind consistency
+- `ban-e2e-app-imports.js` - deny-by-default import allowlist for the `packages/e2e` suite (see E2E isolation below)
 
 ### TypeScript
 - Favor explicit types over `any`
 - Use Zod for runtime validation and schema definitions
 - TypeScript 5.9+ with strict mode enabled
 
-## Testing Guidelines
+## Testing
 
-- **Bun test runner** for all tests
-- Co-locate test files: `*.test.ts` or `*.test.tsx` next to source
-- Run `bun test` before submitting PRs
-- Add integration tests for API endpoints and database operations
-- Test files use Bun's built-in test framework
-- Document any intentional coverage gaps in PR descriptions
+See [`TESTING.md`](./TESTING.md) for the testing philosophy and rules.
+
+**Short version:** two tiers, no third.
+- **Unit (`bun test`)** — pure logic only. No mocks, no DB, no network. Co-located `*.test.ts` next to source.
+- **E2E (Playwright)** — everything else. Real Postgres + NATS + Better Auth. Lives in `packages/e2e/tests/` (the isolated `@decocms/e2e` workspace).
+
+If a test needs `vi.mock`, `mock.module`, a stubbed `StudioContext`, or a fake `fetch` — it's not a unit test. Move it to e2e.
+
+### E2E isolation (black-box contract)
+
+The e2e suite is a **black-box contract** over HTTP + DB: spin the server, hit it over the wire,
+assert on responses. It must stay decoupled from the implementation so a component can be rewritten
+— even in another language — and the same suite still holds. The in-sandbox daemon's suite
+(`packages/sandbox/daemon/daemon.e2e.*.test.ts`) already works this way: it spawns the built binary
+(swap it via the `DAEMON_E2E_CMD` env) and asserts only over HTTP. The mesh suite lives in the
+dedicated `packages/e2e` (`@decocms/e2e`) workspace behind the same wall — its Playwright config
+spawns the app dev server from `apps/mesh` via `webServer.cwd` (a process boundary, not an import).
+
+Rules:
+- **No imports from `apps/*/src/**` and no `@/` mesh alias** in `packages/e2e`. Enforced by
+  `plugins/ban-e2e-app-imports.js` (oxlint, `error`, deny-by-default) + a `paths: {}` override in
+  `packages/e2e/tsconfig.json`. Only a small explicit allowlist of published packages is permitted
+  (any unlisted `@decocms/*` is denied too, so app code creeping into `packages/` can't silently
+  widen the test surface).
+- **Do not silence this lint.** If a test needs a value, either **inline the expected shape** (a
+  black-box test owning its contract is correct, not duplication — a divergence from the app is a
+  wire-contract regression *signal*) or add the dep to **both** `packages/e2e/package.json` and the
+  plugin allowlist, with justification.
+- **Tenant-scope every DB assertion** (per-test org/user/thread/run) — that's what makes
+  `fullyParallel` safe. Never assert on values shared across runs; the one global namespace is email
+  domain (use a unique domain per run). Playwright's worker count is effectively the Postgres
+  connection budget.
 
 ## Working with Tools
 
 When creating new MCP tools:
 1. Use `defineTool()` from `apps/mesh/src/core/define-tool.ts`
 2. Place tools in appropriate domain folder under `apps/mesh/src/tools/`
-3. Always inject `MeshContext` as second parameter
+3. Always inject `StudioContext` as second parameter
 4. Call `await ctx.access.check()` for authorization
 5. Use `ctx.storage` for database operations (never access Kysely directly)
 6. Define Zod schemas for input/output validation
@@ -370,8 +422,8 @@ PRs should include:
 
 ## Common Gotchas
 
-1. **Never access environment variables directly in tools**—use MeshContext
-2. **Never access HTTP context in tools**—use MeshContext for all state
+1. **Never access environment variables directly in tools**—use StudioContext
+2. **Never access HTTP context in tools**—use StudioContext for all state
 3. **Database migrations**: Remember to run both Kysely migrations (`bun run migrate`) and Better Auth migrations (`bun run better-auth:migrate`)
 4. **Event bus**: The worker doesn't poll internally—it relies on NotifyStrategy to trigger processing
 5. **Formatting**: The pre-commit hook will reject commits if code isn't formatted with Biome
@@ -406,3 +458,4 @@ Sustainable Use License (SUL):
 - ⚠️ Commercial license required for SaaS or revenue-generating production systems
 
 See LICENSE.md for details. Questions: contact@decocms.com
+

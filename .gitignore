@@ -1,6 +1,12 @@
 # GSD workflow state
 .planning/
 
+# Local-only architecture diagram tooling (generates the standalone html
+# from architecture-model.ts; the committed docs use ArchitectureDiagram.astro).
+/architecture.html
+apps/docs/scripts/gen-architecture-html.ts
+apps/docs/scripts/architecture-runtime.js
+
 # Logs
 logs
 *.log
@@ -22,6 +28,9 @@ dist-ssr
 
 # Environment files
 .env
+
+# Operator-local backfill mapping (org/team ids) for scripts/backfill-org-sites.ts
+mapping.json
 **/.env
 
 # Editor directories and files
@@ -61,6 +70,8 @@ deploy/test*
 
 # Data Test files
 apps/benchmark/data
+# Local DevObjectStorage scratch dir (org-fs / skill-catalog integration tests)
+data/
 
 # AI planning files (root-level only, not docs/plans/)
 /plans
@@ -79,9 +90,16 @@ studio-demo/
 # Playwright
 apps/mesh/test-results/
 apps/mesh/playwright-report/
+apps/mesh/screenshots/
+packages/e2e/test-results/
+packages/e2e/playwright-report/
 
-# Generated docs (root-level only, not apps/docs/)
-/docs
+# Generated docs (root-level only, not apps/docs/). Use /docs/* not /docs
+# so we can un-ignore specific subdirs below — git won't traverse into an
+# ignored directory.
+/docs/*
+# Superpowers workspace artifacts (brainstorming + writing-plans output)
+# are kept local to the working tree, not committed.
 
 # Local dev data directory
 .deco

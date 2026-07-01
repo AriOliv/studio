@@ -7,8 +7,8 @@
 
 import { describe, expect, test } from "bun:test";
 import {
-  buildSubagentSystemPrompt,
   createSubtaskTool,
+  resolveSubtaskCodingWorkspace,
   SubtaskInputSchema,
   type SubtaskParams,
 } from "./subtask";
@@ -114,13 +114,13 @@ describe("SubtaskInputSchema", () => {
       expect(result.success).toBe(false);
     });
 
-    test("rejects missing agent_id", () => {
+    test("accepts missing agent_id (clone-self: omit agent_id)", () => {
       const input = {
         prompt: "Do something",
       };
 
       const result = SubtaskInputSchema.safeParse(input);
-      expect(result.success).toBe(false);
+      expect(result.success).toBe(true);
     });
   });
 });
@@ -146,41 +146,104 @@ describe("createSubtaskTool", () => {
     const tool = createSubtaskTool(mockWriter, mockParams, mockCtx);
 
     expect(tool.description).toBeDefined();
-    expect(tool.description).toContain("Delegate");
+    expect(tool.description).toContain("subagent");
     expect(tool.inputSchema).toBeDefined();
   });
 });
 
-describe("buildSubagentSystemPrompt", () => {
-  test("returns array with base prompt when no agent instructions provided", () => {
-    const prompts = buildSubagentSystemPrompt();
+describe("resolveSubtaskCodingWorkspace", () => {
+  test("uses target repo facts while inheriting branch and cwd from parent workspace", () => {
+    const result = resolveSubtaskCodingWorkspace(
+      {
+        repo: {
+          owner: "deco",
+          name: "site",
+          connectionId: "conn-1",
+        } as never,
+      },
+      {
+        repo: {
+          owner: "deco",
+          name: "other",
+          connectedGithub: true,
+        },
+        branch: "main",
+        cwd: "/repo",
+        workspaceKind: "github",
+      },
+    );
 
-    expect(prompts).toHaveLength(1);
-    expect(prompts[0]).toContain("focused subtask agent");
-    expect(prompts[0]).toContain("Assess the Task");
-    expect(prompts[0]).toContain("When Done: Report");
-    expect(prompts[0]).toContain("Rules (non-negotiable)");
+    expect(result).toEqual({
+      repo: {
+        owner: "deco",
+        name: "site",
+        connectedGithub: true,
+      },
+      branch: "main",
+      cwd: "/repo",
+      workspaceKind: "github",
+    });
   });
 
-  test("returns array with base and agent instructions when provided", () => {
-    const agentInstructions = "Always use the search tool first.";
-    const prompts = buildSubagentSystemPrompt(agentInstructions);
+  test("marks target public clone repo as not connected to GitHub", () => {
+    const result = resolveSubtaskCodingWorkspace(
+      {
+        repo: {
+          owner: "deco",
+          name: "public-site",
+        },
+      },
+      {
+        branch: "main",
+        cwd: "/repo",
+        workspaceKind: "github",
+      },
+    );
 
-    expect(prompts).toHaveLength(2);
-    expect(prompts[0]).toContain("focused subtask agent");
-    expect(prompts[1]).toBe("Always use the search tool first.");
+    expect(result).toEqual({
+      repo: {
+        owner: "deco",
+        name: "public-site",
+        connectedGithub: false,
+      },
+      branch: "main",
+      cwd: "/repo",
+      workspaceKind: "github",
+    });
   });
 
-  test("excludes agent instructions when empty string", () => {
-    const prompts = buildSubagentSystemPrompt("");
+  test("passes parent workspace through for self-clone targets with no repo", () => {
+    const parentWorkspace = {
+      cwd: "/repo",
+      workspaceKind: "local" as const,
+    };
 
-    expect(prompts).toHaveLength(1);
+    const result = resolveSubtaskCodingWorkspace(
+      {
+        repo: undefined,
+      },
+      parentWorkspace,
+      true,
+    );
+
+    expect(result).toBe(parentWorkspace);
   });
 
-  test("excludes agent instructions when whitespace-only", () => {
-    const prompts = buildSubagentSystemPrompt("   \n  ");
+  test("clears parent workspace for cross-agent targets with no repo", () => {
+    const parentWorkspace = {
+      cwd: "/repo",
+      workspaceKind: "local" as const,
+    };
 
-    expect(prompts).toHaveLength(1);
+    const result = resolveSubtaskCodingWorkspace(
+      {
+        repo: undefined,
+      },
+      parentWorkspace,
+      false,
+    );
+
+    expect(result).toBeUndefined();
   });
 });
 
@@ -202,7 +265,7 @@ describe("metadata isolation", () => {
   });
 });
 
-describe("toModelOutput", () => {
+describe("toModelOutput (new runAgentLoop-based contract)", () => {
   const tool = createSubtaskTool(mockWriter, mockParams, mockCtx);
   const toModelOutput = tool.toModelOutput!;
 
@@ -211,79 +274,120 @@ describe("toModelOutput", () => {
     input: { prompt: "test", agent_id: "vir_test" } as const,
   };
 
-  test("returns fallback when message is null", () => {
-    const result = toModelOutput({ ...baseArgs, output: null as never });
-
-    expect(result).toEqual({
-      type: "text",
-      value: "Subtask completed (no output).",
-    });
-  });
-
-  test("returns fallback when message is undefined", () => {
-    const result = toModelOutput({ ...baseArgs, output: undefined as never });
-
-    expect(result).toEqual({
-      type: "text",
-      value: "Subtask completed (no output).",
-    });
-  });
-
-  test("returns fallback when parts is empty", () => {
-    const result = toModelOutput({
-      ...baseArgs,
-      output: { parts: [] } as never,
-    });
-
-    expect(result).toEqual({
-      type: "text",
-      value: "Subtask completed (no output).",
-    });
-  });
-
-  test("returns fallback when no text parts", () => {
+  test("returns text when output has text and no error", () => {
     const result = toModelOutput({
       ...baseArgs,
       output: {
-        parts: [{ type: "tool-call", toolCallId: "tc_1", toolName: "foo" }],
+        text: "**Result**: 12 unused connections.",
+        error: undefined,
+        finishReason: "stop",
       } as never,
     });
+    expect(result).toEqual({
+      type: "text",
+      value: "**Result**: 12 unused connections.",
+    });
+  });
 
+  test("returns error-text when output has an error", () => {
+    const result = toModelOutput({
+      ...baseArgs,
+      output: {
+        text: "I'll start by listing...",
+        error: "AI_APICallError: prompt is too long",
+        finishReason: "error",
+      } as never,
+    }) as { type: string; value: string };
+    expect(result.type).toBe("error-text");
+    expect(result.value).toContain("Subtask failed:");
+    expect(result.value).toContain("prompt is too long");
+  });
+
+  test("error takes precedence over text", () => {
+    const result = toModelOutput({
+      ...baseArgs,
+      output: {
+        text: "Step 1 done.",
+        error: "Context window exceeded",
+        finishReason: "error",
+      } as never,
+    }) as { type: string; value: string };
+    expect(result.type).toBe("error-text");
+  });
+
+  test("prefixes text with step-limit notice when finishReason is 'length'", () => {
+    const result = toModelOutput({
+      ...baseArgs,
+      output: {
+        text: "Partial report.",
+        error: undefined,
+        finishReason: "length",
+      } as never,
+    }) as { type: string; value: string };
+    expect(result.type).toBe("text");
+    expect(result.value).toContain("[Subtask hit step limit");
+    expect(result.value).toContain("Partial report.");
+  });
+
+  test("returns fallback when output is undefined", () => {
+    const result = toModelOutput({
+      ...baseArgs,
+      output: undefined as never,
+    });
     expect(result).toEqual({
       type: "text",
       value: "Subtask completed (no output).",
     });
   });
 
-  test("returns last text part when present", () => {
+  test("returns fallback when output is null", () => {
     const result = toModelOutput({
       ...baseArgs,
-      output: {
-        parts: [
-          { type: "text", text: "First part" },
-          { type: "text", text: "Second part" },
-          { type: "text", text: "Final summary" },
-        ],
-      } as never,
+      output: null as never,
     });
-
     expect(result).toEqual({
       type: "text",
-      value: "Final summary",
+      value: "Subtask completed (no output).",
     });
   });
 
-  test("returns single text part", () => {
+  test("returns fallback when output has empty text and no error", () => {
+    const result = toModelOutput({
+      ...baseArgs,
+      output: { text: "", error: undefined, finishReason: "stop" } as never,
+    });
+    expect(result).toEqual({
+      type: "text",
+      value: "Subtask completed (no output).",
+    });
+  });
+
+  test("returns fallback when output has only whitespace text", () => {
     const result = toModelOutput({
       ...baseArgs,
       output: {
-        parts: [{ type: "text", text: "The task is done." }],
+        text: "   \n  ",
+        error: undefined,
+        finishReason: "stop",
       } as never,
     });
-
     expect(result).toEqual({
       type: "text",
-      value: "The task is done.",
+      value: "Subtask completed (no output).",
     });
+  });
+
+  test("returns step-limit notice when finishReason is 'length' and text is empty", () => {
+    const result = toModelOutput({
+      ...baseArgs,
+      output: {
+        text: "",
+        error: undefined,
+        finishReason: "length",
+      } as never,
+    }) as { type: string; value: string };
+    expect(result.type).toBe("text");
+    expect(result.value).toContain("step limit");
+    expect(result.value).toContain("ran out of steps");
   });
 });

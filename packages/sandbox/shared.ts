@@ -13,21 +13,31 @@ export const PLUGIN_DESCRIPTION =
   "Isolated per-user sandboxes for MCP tool execution";
 
 export const DAEMON_PORT = 9000;
-export const DEFAULT_IMAGE = "studio-sandbox:local";
+
+/** Auto-start script priority — first match in the manifest wins. */
+export const WELL_KNOWN_STARTERS = ["dev", "start"] as const;
 
 /** Shell-quote a value for safe inclusion in a `bash -lc` script. */
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// Re-exported from the shared std package so existing importers
+// (`@decocms/sandbox/shared`) keep using the one canonical impl.
+export { sleep } from "@decocms/std";
 
 /** Prepend to any clone script; callers own the clone strategy themselves. */
 export function gitIdentityScript(userName: string, userEmail: string): string {
   return `git config --global user.name ${shellQuote(userName)} && git config --global user.email ${shellQuote(userEmail)}`;
 }
+
+export {
+  appendCoAuthorToPullRequestBody,
+  appendCoAuthorTrailer,
+  normalizeCoAuthorIdentity,
+  stripCoAuthorTrailers,
+  type CoAuthorIdentity,
+} from "./git-co-author";
 
 /**
  * Injected into proxied dev-server HTML. Two jobs:

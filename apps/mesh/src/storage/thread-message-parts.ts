@@ -1,0 +1,235 @@
+import type { Kysely } from "kysely";
+import {
+  foldParts,
+  type FoldedMessage,
+  type ThreadMessagePart,
+} from "./fold-parts";
+import type { Database, ThreadMessage } from "./types";
+
+export class SqlThreadMessagePartStorage {
+  constructor(private db: Kysely<Database>) {}
+
+  private serializeParts(parts: ThreadMessagePart[]): {
+    rows: Array<{
+      id: string;
+      seq: number;
+      org_id: string;
+      thread_id: string;
+      run_id: string;
+      message_id: string;
+      role: ThreadMessagePart["role"];
+      kind: ThreadMessagePart["kind"];
+      payload: string;
+      payload_ref: string | null;
+      metadata: string | null;
+      created_at: string;
+    }>;
+    partsById: Map<string, ThreadMessagePart>;
+  } {
+    const seen = new Set<string>();
+    const rows: Array<{
+      id: string;
+      seq: number;
+      org_id: string;
+      thread_id: string;
+      run_id: string;
+      message_id: string;
+      role: ThreadMessagePart["role"];
+      kind: ThreadMessagePart["kind"];
+      payload: string;
+      payload_ref: string | null;
+      metadata: string | null;
+      created_at: string;
+    }> = [];
+    const partsById = new Map<string, ThreadMessagePart>();
+    for (const p of parts) {
+      if (seen.has(p.id)) continue; // can't affect same row twice in one INSERT
+      seen.add(p.id);
+      partsById.set(p.id, p);
+      rows.push({
+        id: p.id,
+        seq: p.seq,
+        org_id: p.org_id,
+        thread_id: p.thread_id,
+        run_id: p.run_id,
+        message_id: p.message_id,
+        role: p.role,
+        kind: p.kind,
+        payload: JSON.stringify(p.payload),
+        payload_ref: p.payload_ref ?? null,
+        metadata: p.metadata != null ? JSON.stringify(p.metadata) : null,
+        created_at: p.created_at,
+      });
+    }
+    return { rows, partsById };
+  }
+
+  /** Idempotent append; rows are immutable (ON CONFLICT (id) DO NOTHING). */
+  async appendParts(parts: ThreadMessagePart[]): Promise<ThreadMessagePart[]> {
+    if (parts.length === 0) return [];
+    const { rows, partsById } = this.serializeParts(parts);
+    const inserted = await this.db
+      .insertInto("thread_message_parts")
+      .values(rows)
+      .onConflict((oc) => oc.column("id").doNothing())
+      .returning("id")
+      .execute();
+    return inserted
+      .map((row) => partsById.get(row.id))
+      .filter((part): part is ThreadMessagePart => part !== undefined);
+  }
+
+  /**
+   * Replace one folded message snapshot. Used only by the `/messages` request
+   * boundary, where an assistant approval/tool continuation re-posts the same
+   * message id with newer request-state parts. Projection writes remain
+   * append-only via `appendParts`.
+   */
+  async replaceMessageParts(
+    threadId: string,
+    messageId: string,
+    parts: ThreadMessagePart[],
+  ): Promise<ThreadMessagePart[]> {
+    const { rows } = this.serializeParts(parts);
+    await this.db.transaction().execute(async (trx) => {
+      const existing = await trx
+        .selectFrom("thread_message_parts")
+        .select((eb) => eb.fn.min("created_at").as("created_at"))
+        .where("thread_id", "=", threadId)
+        .where("message_id", "=", messageId)
+        .executeTakeFirst();
+      const existingBase =
+        existing?.created_at != null
+          ? new Date(existing.created_at as unknown as string).getTime()
+          : null;
+      const rowsToInsert =
+        existingBase != null && Number.isFinite(existingBase)
+          ? rows.map((row) => ({
+              ...row,
+              created_at: new Date(existingBase + row.seq).toISOString(),
+            }))
+          : rows;
+      await trx
+        .deleteFrom("thread_message_parts")
+        .where("thread_id", "=", threadId)
+        .where("message_id", "=", messageId)
+        .execute();
+      if (rowsToInsert.length > 0) {
+        await trx
+          .insertInto("thread_message_parts")
+          .values(rowsToInsert)
+          .execute();
+      }
+    });
+    return parts;
+  }
+
+  /**
+   * Highest `created_at` (epoch ms) already persisted for a run, or null when
+   * the run has no parts yet. The projector uses this as its PartEmitter base
+   * so a freshly-projected message sorts AFTER everything already in the thread
+   * (its own user message + prior turns) even when the durable projection runs
+   * far behind wall-clock — `created_at` is `base + seq`, and ordering across
+   * messages keys on the first part's `created_at`.
+   */
+  async maxCreatedAtMsForRun(runId: string): Promise<number | null> {
+    const row = await this.db
+      .selectFrom("thread_message_parts")
+      .select((eb) => eb.fn.max("created_at").as("max"))
+      .where("run_id", "=", runId)
+      .executeTakeFirst();
+    if (!row?.max) return null;
+    const ms = new Date(row.max as unknown as string).getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  /**
+   * Windowed read: page over the one-per-message `finish` anchors (newest
+   * first), then fetch+fold the parts of exactly those messages. `total` is the
+   * count of completed messages. The whole-thread fold is never executed.
+   */
+  async loadWindow(
+    threadId: string,
+    options: { limit: number; offset?: number },
+  ): Promise<{ messages: FoldedMessage[]; total: number }> {
+    const anchors = await this.db
+      .selectFrom("thread_message_parts")
+      .select(["message_id"])
+      .where("thread_id", "=", threadId)
+      .where("kind", "=", "finish")
+      .orderBy("created_at", "desc")
+      .orderBy("id", "desc")
+      .limit(options.limit)
+      .offset(options.offset ?? 0)
+      .execute();
+
+    const totalRow = await this.db
+      .selectFrom("thread_message_parts")
+      .select((eb) => eb.fn.count<string>("id").as("count"))
+      .where("thread_id", "=", threadId)
+      .where("kind", "=", "finish")
+      .executeTakeFirst();
+    const total = Number(totalRow?.count ?? 0);
+
+    const messageIds = anchors.map((a) => a.message_id);
+    if (messageIds.length === 0) return { messages: [], total };
+
+    const rows = await this.db
+      .selectFrom("thread_message_parts")
+      .selectAll()
+      .where("thread_id", "=", threadId)
+      .where("message_id", "in", messageIds)
+      .orderBy("seq", "asc")
+      .execute();
+
+    return {
+      messages: foldParts(rows as unknown as ThreadMessagePart[]),
+      total,
+    };
+  }
+
+  /**
+   * Upgrade-on-touch: synthesize final-only parts from a v1 thread's messages.
+   * Deterministic ids (`backfill:<message_id>:content|finish`) → re-running is a
+   * no-op via ON CONFLICT DO NOTHING (R18 convergence). Preserves id/role/parts/
+   * created_at/order (R16); accepted loss is sub-message granularity.
+   */
+  async backfillFromMessages(
+    messages: ThreadMessage[],
+    ctx: { runId: string; orgId: string; threadId: string },
+  ): Promise<void> {
+    const parts: ThreadMessagePart[] = [];
+    let seq = 0;
+    for (const m of messages) {
+      parts.push({
+        id: `${ctx.runId}:${m.id}:content`,
+        seq: seq++,
+        org_id: ctx.orgId,
+        thread_id: ctx.threadId,
+        run_id: ctx.runId,
+        message_id: m.id,
+        role: m.role,
+        kind: "text",
+        payload: m.parts,
+        payload_ref: null,
+        metadata: m.metadata ?? null,
+        created_at: m.created_at,
+      });
+      parts.push({
+        id: `${ctx.runId}:${m.id}:finish`,
+        seq: seq++,
+        org_id: ctx.orgId,
+        thread_id: ctx.threadId,
+        run_id: ctx.runId,
+        message_id: m.id,
+        role: m.role,
+        kind: "finish",
+        payload: {},
+        payload_ref: null,
+        metadata: null,
+        created_at: m.created_at,
+      });
+    }
+    await this.appendParts(parts);
+  }
+}

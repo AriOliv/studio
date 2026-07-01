@@ -25,6 +25,7 @@ export {
 // MCP client hook and factory
 export {
   createMCPClient,
+  mcpClientQueryOptions,
   useMCPClient,
   useMCPClientOptional,
   type CreateMcpClientOptions,
@@ -53,9 +54,12 @@ export {
   useMCPResourcesList,
   useMCPResourcesListQuery,
   useMCPReadResource,
+  useUiResourceHtml,
+  UI_RESOURCE_HTML_KEY,
   type UseMcpResourcesListOptions,
   type UseMcpResourcesListQueryOptions,
   type UseMcpReadResourceOptions,
+  type UseUiResourceHtmlOptions,
 } from "./use-mcp-resources";
 
 // MCP prompts hooks and helpers
@@ -74,7 +78,10 @@ export {
 export {
   useVirtualMCPs,
   useVirtualMCP,
+  virtualMcpItemQueryOptions,
   useVirtualMCPActions,
+  useVirtualMCPsLastUsed,
   type VirtualMCPFilter,
   type UseVirtualMCPsOptions,
+  type VirtualMCPLastUsed,
 } from "./use-virtual-mcp";

@@ -1,9 +1,9 @@
 import { markClaimed } from "../activity";
 import type { TenantConfigStore } from "../config-store";
-import type { ApplyResult } from "../config-store/types";
+import type { ApplyResult, ConfigPatch } from "../config-store/types";
 import type { Phase } from "../process/phase-manager";
 import type { TenantConfig } from "../types";
-import { jsonResponse, parseBase64JsonBody } from "./body-parser";
+import { jsonResponse, parseJsonBody } from "./body-parser";
 
 export interface DaemonState {
   orchestrator: { running: boolean; pending: number };
@@ -30,6 +30,8 @@ export interface ConfigDeps {
   getState?: () => DaemonState;
   /** Recent setup phases for LLM context. */
   getTasks?: () => Phase[];
+  /** Local repo directory path (exposed so the frontend can offer "Open in IDE"). */
+  repoDir?: string;
 }
 
 /** Wire-only — never persisted to TenantConfig. Stripped before `store.apply`. */
@@ -37,7 +39,7 @@ interface AuthPatch {
   rotateToken?: string;
 }
 
-interface ConfigPatchWire extends Partial<TenantConfig> {
+interface ConfigPatchWire extends ConfigPatch {
   auth?: AuthPatch;
 }
 
@@ -45,7 +47,7 @@ const TOKEN_MIN_LENGTH = 32;
 const TOKEN_MAX_LENGTH = 256;
 
 /**
- * GET /_decopilot_vm/config — current TenantConfig plus live daemon state.
+ * GET /_sandbox/config — current TenantConfig plus live daemon state.
  * Always returns 200 (config is null when not yet set) so callers get full
  * state context even on a fresh daemon before the first PUT /config.
  */
@@ -56,15 +58,17 @@ export function makeConfigReadHandler(deps: ConfigDeps) {
     return jsonResponse({
       bootId: deps.daemonBootId,
       config: tenant ? stripDerived(tenant) : null,
+      envKeys: tenant?.env ? Object.keys(tenant.env).sort() : [],
       orchestrator: state?.orchestrator,
       ready: state?.ready ?? false,
       tasks: deps.getTasks?.(),
+      repoDir: deps.repoDir ?? null,
     });
   };
 }
 
 /**
- * POST /_decopilot_vm/config — set initial tenant config. PUT/POST share
+ * POST /_sandbox/config — set initial tenant config. PUT/POST share
  * the same handler shape: both deep-merge into current. POST is the
  * conventional first-set; PUT is the conventional patch.
  *
@@ -79,7 +83,7 @@ export function makeConfigUpdateHandler(deps: ConfigDeps) {
   return async (req: Request): Promise<Response> => {
     let raw: unknown;
     try {
-      raw = await parseBase64JsonBody(req);
+      raw = await parseJsonBody(req);
     } catch (e) {
       return jsonResponse({ error: `bad body: ${(e as Error).message}` }, 400);
     }
@@ -96,7 +100,7 @@ export function makeConfigUpdateHandler(deps: ConfigDeps) {
       }
     }
     const { auth: _strip, ...patch } = wire;
-    const result = await deps.store.apply(patch as Partial<TenantConfig>);
+    const result = await deps.store.apply(patch);
     if (result.kind !== "rejected") markClaimed();
     return makeApplyResponse(deps.daemonBootId, result);
   };
@@ -158,6 +162,7 @@ function stripDerived(
   if (!enriched) return null;
   return {
     git: enriched.git,
+    operator: enriched.operator,
     application: enriched.application,
   };
 }

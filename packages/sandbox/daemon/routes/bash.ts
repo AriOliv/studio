@@ -1,5 +1,5 @@
 import type { TaskManager } from "../process/task-manager";
-import { jsonResponse, parseBase64JsonBody } from "./body-parser";
+import { jsonResponse, parseJsonBody } from "./body-parser";
 import { awaitTaskResponse } from "./tasks";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -27,13 +27,13 @@ interface BashBody {
  *   - "await" (default): runs to completion and returns the full
  *     stdout/stderr/exitCode body. This is the legacy bash behavior.
  *   - "background": returns the taskId immediately. Caller can poll
- *     /_decopilot_vm/tasks/:id, stream output, or kill via the tasks API.
+ *     /_sandbox/tasks/:id, stream output, or kill via the tasks API.
  */
 export function makeBashHandler(deps: BashDeps) {
   return async (req: Request): Promise<Response> => {
     let body: BashBody;
     try {
-      body = (await parseBase64JsonBody(req)) as BashBody;
+      body = (await parseJsonBody(req)) as BashBody;
     } catch (e) {
       return jsonResponse({ error: (e as Error).message }, 400);
     }

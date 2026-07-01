@@ -1,7 +1,7 @@
 import z from "zod";
 import { posthog } from "../../posthog";
 import { defineTool } from "../../core/define-tool";
-import { requireAuth, requireOrganization } from "../../core/mesh-context";
+import { requireAuth, requireOrganization } from "../../core/studio-context";
 import type {
   SimpleModeConfig,
   SimpleModeModelSlot,
@@ -22,7 +22,8 @@ const clearSlotsForKey = (
       smart: clearSlotIfMatches(config.tiers.smart, keyId),
       thinking: clearSlotIfMatches(config.tiers.thinking, keyId),
       image: clearSlotIfMatches(config.tiers.image, keyId),
-      web_research: clearSlotIfMatches(config.tiers.web_research, keyId),
+      web_search: clearSlotIfMatches(config.tiers.web_search, keyId),
+      deep_research: clearSlotIfMatches(config.tiers.deep_research, keyId),
     },
   };
   const changed =
@@ -30,7 +31,8 @@ const clearSlotsForKey = (
     next.tiers.smart !== config.tiers.smart ||
     next.tiers.thinking !== config.tiers.thinking ||
     next.tiers.image !== config.tiers.image ||
-    next.tiers.web_research !== config.tiers.web_research;
+    next.tiers.web_search !== config.tiers.web_search ||
+    next.tiers.deep_research !== config.tiers.deep_research;
   return { config: next, changed };
 };
 

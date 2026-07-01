@@ -10,7 +10,10 @@
  * This adapter is read-only — it queries NDJSON files on disk or a ClickHouse table.
  */
 
-import type { QueryEngine } from "../monitoring/query-engine";
+import type {
+  MonitoringDateRange,
+  QueryEngine,
+} from "../monitoring/query-engine";
 import type { MonitoringLog } from "./types";
 import type {
   AggregationParams,
@@ -49,6 +52,16 @@ function toISOBucket(bucket: unknown): string {
 function esc(value: string): string {
   // oxlint-disable-next-line no-control-regex
   return value.replace(/\0/g, "").replace(/\\/g, "\\\\").replace(/'/g, "''");
+}
+
+/**
+ * Coerce a query value to a finite number, defaulting to 0.
+ * ClickHouse quantile()/avg() over an empty set return NaN, which would
+ * otherwise leak to the UI as NaN.
+ */
+function finiteOrZero(value: unknown): number {
+  const n = Number(value ?? 0);
+  return Number.isFinite(n) ? n : 0;
 }
 
 /** Allowed groupByColumn values. */
@@ -159,6 +172,22 @@ function jsonExtractFloat(
   }
   const chKeys = jsonPathToChKeys(jsonPath);
   return `JSONExtractFloat(${col}, ${chKeys})`;
+}
+
+/**
+ * Extract a number stored as a JSON *string* (e.g. properties values, which are
+ * always strings). Returns NULL/0 when absent or unparseable — never throws.
+ */
+function jsonExtractNumericString(
+  col: string,
+  jsonPath: string,
+  dialect: SqlDialect,
+): string {
+  if (dialect === "duckdb") {
+    return `TRY_CAST(json_extract_string(${col}, '${jsonPath}') AS DOUBLE)`;
+  }
+  const chKeys = jsonPathToChKeys(jsonPath);
+  return `toFloat64OrZero(JSONExtractString(${col}, ${chKeys}))`;
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +404,14 @@ function tsLte(
  */
 const DEFAULT_LOOKBACK_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * Tighter lookback for thread-usage queries. These always target a specific,
+ * recent set of decopilot thread IDs, so the 30-day default just scans (and
+ * materializes the wide `LogAttributes`/`properties` column for) weeks of
+ * irrelevant rows — the dominant cost behind the queryThreadUsage OOMs.
+ */
+const THREAD_USAGE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+
 function applyStartDateBound(
   where: string[],
   startDate: Date | undefined,
@@ -397,10 +434,23 @@ function applyStartDateBound(
 export class SqlMonitoringStorage implements MonitoringStorage {
   constructor(
     private engine: QueryEngine,
-    private sourceFactory: (organizationId: string) => string,
+    // The range lets the GCS OTLP source prune its bucket glob to the relevant
+    // Hive day partitions; other source factories ignore it.
+    private sourceFactory: (
+      organizationId: string,
+      range?: MonitoringDateRange,
+    ) => string,
     private metricEngine: QueryEngine,
-    private metricSourceFactory: (organizationId: string) => string,
+    private metricSourceFactory: (
+      organizationId: string,
+      range?: MonitoringDateRange,
+    ) => string,
     private dialect: SqlDialect = "clickhouse",
+    // When true (DuckDB reading OTLP flat-log rows from GCS), metrics are
+    // derived from the log rows (count/avg/quantile over duration_ms + is_error)
+    // instead of the pre-aggregated histogram MetricRow columns the local-NDJSON
+    // path uses. Default false preserves the local histogram path.
+    private metricsFromLogs: boolean = false,
   ) {}
 
   async query(filters: {
@@ -420,7 +470,10 @@ export class SqlMonitoringStorage implements MonitoringStorage {
       throw new Error("organizationId is required");
     }
 
-    const source = this.sourceFactory(filters.organizationId);
+    const source = this.sourceFactory(filters.organizationId, {
+      startDate: filters.startDate,
+      endDate: filters.endDate,
+    });
 
     const where: string[] = [
       `organization_id = '${esc(filters.organizationId)}'`,
@@ -491,6 +544,9 @@ export class SqlMonitoringStorage implements MonitoringStorage {
   ): Promise<MonitoringLog | null> {
     if (!organizationId || !id) return null;
 
+    // No date range available (lookup is by random span id), so the GCS OTLP
+    // path can't partition-prune here and reads the whole prefix. Acceptable:
+    // single-row detail open, far rarer than the date-ranged list/timeseries.
     const source = this.sourceFactory(organizationId);
     const sql = `SELECT * FROM ${source} WHERE organization_id = '${esc(organizationId)}' AND id = '${esc(id)}' LIMIT 1`;
     const rows = await this.engine.query(sql);
@@ -511,7 +567,10 @@ export class SqlMonitoringStorage implements MonitoringStorage {
       throw new Error("organizationId is required");
     }
 
-    const source = this.sourceFactory(filters.organizationId);
+    const source = this.sourceFactory(filters.organizationId, {
+      startDate: filters.startDate,
+      endDate: filters.endDate,
+    });
 
     const where: string[] = [
       `organization_id = '${esc(filters.organizationId)}'`,
@@ -534,12 +593,306 @@ export class SqlMonitoringStorage implements MonitoringStorage {
     };
   }
 
+  /**
+   * Aggregate LLM-call usage (tokens + USD cost) from the raw log rows.
+   *
+   * Each LLM completion is a single log row whose `output` JSON holds the
+   * token usage and (for ai-gateway / OpenRouter) cost. Reading from the log
+   * source — rather than the pre-aggregated metric histograms — lets us SUM
+   * those JSON values and filter by `user_id`. Works for both dialects since
+   * the log source carries `output` + `user_id` in either case.
+   */
+  async queryLlmUsageStats(params: {
+    organizationId: string;
+    interval: string;
+    connectionId: string;
+    startDate?: Date;
+    endDate?: Date;
+    userIds?: string[];
+    topN?: number;
+  }): Promise<{
+    totalCalls: number;
+    totalErrors: number;
+    avgDurationMs: number;
+    p50DurationMs: number;
+    p95DurationMs: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalTokens: number;
+    totalCostUsd: number;
+    topTools: Array<{
+      toolName: string;
+      connectionId: string | null;
+      calls: number;
+      inputTokens: number;
+      outputTokens: number;
+      costUsd: number;
+    }>;
+    timeseries: Array<{
+      timestamp: string;
+      calls: number;
+      errors: number;
+      errorRate: number;
+      avg: number;
+      p50: number;
+      p95: number;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      costUsd: number;
+    }>;
+  }> {
+    const emptyResult = {
+      totalCalls: 0,
+      totalErrors: 0,
+      avgDurationMs: 0,
+      p50DurationMs: 0,
+      p95DurationMs: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalTokens: 0,
+      totalCostUsd: 0,
+      topTools: [] as Array<{
+        toolName: string;
+        connectionId: string | null;
+        calls: number;
+        inputTokens: number;
+        outputTokens: number;
+        costUsd: number;
+      }>,
+      timeseries: [] as Array<{
+        timestamp: string;
+        calls: number;
+        errors: number;
+        errorRate: number;
+        avg: number;
+        p50: number;
+        p95: number;
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        costUsd: number;
+      }>,
+    };
+
+    if (!params.organizationId || !params.connectionId) return emptyResult;
+
+    const dialect = this.dialect;
+    const isCh = dialect === "clickhouse";
+    const source = this.sourceFactory(params.organizationId, {
+      startDate: params.startDate,
+      endDate: params.endDate,
+    });
+    const bucketExpr = intervalToSQL(params.interval, dialect, "timestamp");
+
+    // Tokens/cost are read from `properties` (small, never truncated) rather
+    // than `output` (capped at 64KB → malformed JSON on large responses).
+    const num = (key: string) =>
+      `coalesce(${jsonExtractNumericString("properties", `$.${key}`, dialect)}, 0)`;
+    const callsExpr = isCh ? "count()" : "count(*)";
+    const errExpr = isCh
+      ? "countIf(is_error = 1)"
+      : "count(*) FILTER (WHERE is_error = 1)";
+    const pExpr = (q: number) =>
+      isCh ? `quantile(${q})(duration_ms)` : `quantile_cont(duration_ms, ${q})`;
+
+    const where: string[] = [
+      `organization_id = '${esc(params.organizationId)}'`,
+      `connection_id = '${esc(params.connectionId)}'`,
+    ];
+    applyStartDateBound(where, params.startDate, dialect);
+    if (params.endDate) {
+      where.push(tsLte(params.endDate, dialect));
+    }
+    if (params.userIds?.length) {
+      const ids = params.userIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`user_id IN (${ids})`);
+    }
+    const whereClause = where.join(" AND ");
+    const topN = Math.min(Math.max(1, Math.floor(params.topN ?? 5)), 20);
+
+    const aggCols = `${callsExpr} AS calls,
+  ${errExpr} AS errors,
+  avg(duration_ms) AS avg,
+  sum(${num("input_tokens")}) AS in_tok,
+  sum(${num("output_tokens")}) AS out_tok,
+  sum(${num("total_tokens")}) AS tot_tok,
+  sum(${num("cost")}) AS cost`;
+
+    const totalsSql = `SELECT ${aggCols},
+  ${pExpr(0.5)} AS p50,
+  ${pExpr(0.95)} AS p95
+FROM ${source}
+WHERE ${whereClause}`;
+
+    const timeseriesSql = `SELECT ${bucketExpr} AS bucket,
+  ${aggCols},
+  ${pExpr(0.5)} AS p50,
+  ${pExpr(0.95)} AS p95
+FROM ${source}
+WHERE ${whereClause}
+GROUP BY bucket
+ORDER BY bucket ASC`;
+
+    const topToolsSql = `SELECT tool_name,
+  ${callsExpr} AS calls,
+  sum(${num("input_tokens")}) AS in_tok,
+  sum(${num("output_tokens")}) AS out_tok,
+  sum(${num("cost")}) AS cost
+FROM ${source}
+WHERE ${whereClause} AND tool_name != ''
+GROUP BY tool_name
+ORDER BY calls DESC
+LIMIT ${topN}`;
+
+    try {
+      const [totalsRows, tsRows, topToolRows] = await Promise.all([
+        this.engine.query(totalsSql),
+        this.engine.query(timeseriesSql),
+        this.engine.query(topToolsSql),
+      ]);
+
+      const totals = totalsRows[0] ?? {};
+
+      return {
+        totalCalls: Number(totals.calls ?? 0),
+        totalErrors: Number(totals.errors ?? 0),
+        avgDurationMs: finiteOrZero(totals.avg),
+        p50DurationMs: finiteOrZero(totals.p50),
+        p95DurationMs: finiteOrZero(totals.p95),
+        totalInputTokens: finiteOrZero(totals.in_tok),
+        totalOutputTokens: finiteOrZero(totals.out_tok),
+        totalTokens: finiteOrZero(totals.tot_tok),
+        totalCostUsd: finiteOrZero(totals.cost),
+        topTools: topToolRows.map((row) => ({
+          toolName: String(row.tool_name ?? ""),
+          connectionId: params.connectionId,
+          calls: Number(row.calls ?? 0),
+          inputTokens: finiteOrZero(row.in_tok),
+          outputTokens: finiteOrZero(row.out_tok),
+          costUsd: finiteOrZero(row.cost),
+        })),
+        timeseries: tsRows.map((row) => {
+          const calls = Number(row.calls ?? 0);
+          const errors = Number(row.errors ?? 0);
+          return {
+            timestamp: toISOBucket(row.bucket),
+            calls,
+            errors,
+            errorRate: calls > 0 ? errors / calls : 0,
+            avg: finiteOrZero(row.avg),
+            p50: finiteOrZero(row.p50),
+            p95: finiteOrZero(row.p95),
+            inputTokens: finiteOrZero(row.in_tok),
+            outputTokens: finiteOrZero(row.out_tok),
+            totalTokens: finiteOrZero(row.tot_tok),
+            costUsd: finiteOrZero(row.cost),
+          };
+        }),
+      };
+    } catch (err) {
+      console.error("queryLlmUsageStats failed:", err);
+      throw new Error("Monitoring stats unavailable", { cause: err });
+    }
+  }
+
+  async queryThreadUsage(params: {
+    organizationId: string;
+    connectionId: string;
+    threadIds: string[];
+    startDate?: Date;
+    endDate?: Date;
+  }): Promise<
+    Array<{
+      threadId: string;
+      calls: number;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      costUsd: number;
+    }>
+  > {
+    if (
+      !params.organizationId ||
+      !params.connectionId ||
+      params.threadIds.length === 0
+    ) {
+      return [];
+    }
+
+    const dialect = this.dialect;
+    const isCh = dialect === "clickhouse";
+    const source = this.sourceFactory(params.organizationId, {
+      startDate: params.startDate,
+      endDate: params.endDate,
+    });
+    const threadExpr = jsonExtractString("properties", "$.thread_id", dialect);
+    // Tokens/cost from `properties` (never truncated), not `output` (64KB cap).
+    const num = (key: string) =>
+      `coalesce(${jsonExtractNumericString("properties", `$.${key}`, dialect)}, 0)`;
+    const callsExpr = isCh ? "count()" : "count(*)";
+
+    const ids = params.threadIds
+      .slice(0, 500)
+      .map((id) => `'${esc(id)}'`)
+      .join(",");
+
+    const where: string[] = [
+      `organization_id = '${esc(params.organizationId)}'`,
+      `connection_id = '${esc(params.connectionId)}'`,
+      `${threadExpr} IN (${ids})`,
+    ];
+    // ClickHouse-only tighter default: applyStartDateBound otherwise falls back
+    // to the 30-day DEFAULT_LOOKBACK_MS, which scans far more of otel_logs than
+    // these recent-thread lookups ever need. DuckDB stays unbounded (local files).
+    const startDate =
+      params.startDate ??
+      (isCh ? new Date(Date.now() - THREAD_USAGE_LOOKBACK_MS) : undefined);
+    applyStartDateBound(where, startDate, dialect);
+    if (params.endDate) {
+      where.push(tsLte(params.endDate, dialect));
+    }
+
+    const sql = `SELECT ${threadExpr} AS thread_id,
+  ${callsExpr} AS calls,
+  sum(${num("input_tokens")}) AS in_tok,
+  sum(${num("output_tokens")}) AS out_tok,
+  sum(${num("total_tokens")}) AS tot_tok,
+  sum(${num("cost")}) AS cost
+FROM ${source}
+WHERE ${where.join(" AND ")}
+GROUP BY thread_id`;
+
+    try {
+      const rows = await this.engine.query(sql);
+      return rows
+        .filter((row) => row.thread_id)
+        .map((row) => ({
+          threadId: String(row.thread_id),
+          calls: Number(row.calls ?? 0),
+          inputTokens: finiteOrZero(row.in_tok),
+          outputTokens: finiteOrZero(row.out_tok),
+          totalTokens: finiteOrZero(row.tot_tok),
+          costUsd: finiteOrZero(row.cost),
+        }));
+    } catch (err) {
+      console.error("queryThreadUsage failed:", err);
+      throw new Error("Monitoring stats unavailable", { cause: err });
+    }
+  }
+
   async aggregate(params: AggregationParams): Promise<AggregationResult> {
     if (!params.organizationId) {
       throw new Error("organizationId is required");
     }
 
-    const source = this.sourceFactory(params.organizationId);
+    const source = this.sourceFactory(params.organizationId, {
+      startDate: params.filters?.startDate,
+      endDate: params.filters?.endDate,
+    });
     const jsonPath = validateJsonPath(params.path);
     const sourceCol = params.from === "input" ? "input" : "output";
 
@@ -653,7 +1006,10 @@ export class SqlMonitoringStorage implements MonitoringStorage {
       throw new Error("organizationId is required");
     }
 
-    const source = this.sourceFactory(params.organizationId);
+    const source = this.sourceFactory(params.organizationId, {
+      startDate: params.filters?.startDate,
+      endDate: params.filters?.endDate,
+    });
     const jsonPath = validateJsonPath(params.path);
     const sourceCol = params.from === "input" ? "input" : "output";
     const extractExpr = jsonExtractString(sourceCol, jsonPath, this.dialect);
@@ -718,65 +1074,64 @@ export class SqlMonitoringStorage implements MonitoringStorage {
       return emptyResult;
     }
 
-    const metricSource = this.metricSourceFactory(params.organizationId);
-    const isRollup =
-      this.dialect === "clickhouse" &&
-      metricSource === "monitoring_metrics_rollup_1m";
+    // ClickHouse derives metrics from the otel_logs view (count/avg/quantile
+    // over duration_ms + is_error) — no separate metrics table. The DuckDB path
+    // below still reads pre-aggregated histograms from local NDJSON files.
+    if (this.dialect === "clickhouse") {
+      return this.queryMetricTimeseriesClickHouse(params, emptyResult);
+    }
+    if (this.metricsFromLogs) {
+      return this.queryMetricTimeseriesDuckDBLogs(params, emptyResult);
+    }
 
-    // Try rollup table first; if it fails (e.g. table doesn't exist),
-    // fall back to the raw monitoring_metrics table.
-    const sources = isRollup
-      ? [metricSource, "monitoring_metrics"]
-      : [metricSource];
+    // ── DuckDB path (local NDJSON, pre-aggregated histograms) ──────────────
+    const source = this.metricSourceFactory(params.organizationId, {
+      startDate: params.startDate,
+      endDate: params.endDate,
+    });
+    const bucketExpr = intervalToSQL(
+      params.interval,
+      this.dialect,
+      "timestamp",
+    );
 
-    for (const source of sources) {
-      try {
-        const usingRollup =
-          this.dialect === "clickhouse" &&
-          source === "monitoring_metrics_rollup_1m";
-        // For ClickHouse rollup table, use "bucket" column; otherwise "timestamp"
-        const tsCol = usingRollup ? "bucket" : "timestamp";
-        const bucketExpr = intervalToSQL(params.interval, this.dialect, tsCol);
+    const where: string[] = [
+      `organization_id = '${esc(params.organizationId)}'`,
+    ];
 
-        const where: string[] = [
-          `organization_id = '${esc(params.organizationId)}'`,
-        ];
+    applyStartDateBound(where, params.startDate, this.dialect);
+    if (params.endDate) {
+      where.push(tsLte(params.endDate, this.dialect));
+    }
+    if (params.filters?.toolNames?.length) {
+      const names = params.filters.toolNames
+        .slice(0, 100)
+        .map((n) => `'${esc(n)}'`)
+        .join(",");
+      where.push(`tool_name IN (${names})`);
+    }
+    if (params.filters?.connectionIds?.length) {
+      const ids = params.filters.connectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id IN (${ids})`);
+    }
+    if (params.filters?.excludeConnectionIds?.length) {
+      const ids = params.filters.excludeConnectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id NOT IN (${ids})`);
+    }
+    // NOTE: status is intentionally NOT added to the WHERE clause here.
+    // The errors and errorRate aggregations use SUM FILTER (WHERE ...),
+    // which would always return 0 if WHERE already filters to status = 'success'.
 
-        applyStartDateBound(where, params.startDate, this.dialect, tsCol);
-        if (params.endDate) {
-          where.push(tsLte(params.endDate, this.dialect, tsCol));
-        }
-        if (params.filters?.toolNames?.length) {
-          const names = params.filters.toolNames
-            .slice(0, 100)
-            .map((n) => `'${esc(n)}'`)
-            .join(",");
-          where.push(`tool_name IN (${names})`);
-        }
-        if (params.filters?.connectionIds?.length) {
-          const ids = params.filters.connectionIds
-            .slice(0, 100)
-            .map((id) => `'${esc(id)}'`)
-            .join(",");
-          where.push(`connection_id IN (${ids})`);
-        }
-        if (params.filters?.excludeConnectionIds?.length) {
-          const ids = params.filters.excludeConnectionIds
-            .slice(0, 100)
-            .map((id) => `'${esc(id)}'`)
-            .join(",");
-          where.push(`connection_id NOT IN (${ids})`);
-        }
-        // NOTE: status is intentionally NOT added to the WHERE clause here.
-        // The errors and errorRate aggregations use sumIf/SUM FILTER (WHERE ...),
-        // which would always return 0 if WHERE already filters to status = 'success'
-        // (and conversely, errorRate would always be 100% when filtering to 'error').
+    const whereClause = where.join(" AND ");
 
-        const whereClause = where.join(" AND ");
-
-        let sql: string;
-        if (this.dialect === "duckdb") {
-          sql = `SELECT
+    try {
+      const sql = `SELECT
   ${bucketExpr} AS bucket,
   SUM(value) FILTER (WHERE name = 'tool.execution.count') AS calls,
   SUM(value) FILTER (WHERE name = 'tool.execution.count' AND status = 'error') AS errors,
@@ -788,39 +1143,10 @@ FROM ${source}
 WHERE ${whereClause}
 GROUP BY bucket
 ORDER BY bucket ASC`;
-        } else if (usingRollup) {
-          sql = `SELECT
-  ${bucketExpr} AS bucket,
-  sumIf(value, name = 'tool.execution.count') AS calls,
-  sumIf(value, name = 'tool.execution.count' AND status = 'error') AS errors,
-  sumIf(hist_sum, name = 'tool.execution.duration') AS total_hist_sum,
-  sumIf(hist_count, name = 'tool.execution.duration') AS total_hist_count,
-  anyIf(hist_boundaries, name = 'tool.execution.duration') AS boundaries_arr,
-  sumForEachMergeIf(hist_bucket_counts, name = 'tool.execution.duration') AS bucket_counts_arr
-FROM ${source}
-WHERE ${whereClause}
-GROUP BY bucket
-ORDER BY bucket ASC`;
-        } else {
-          sql = `SELECT
-  ${bucketExpr} AS bucket,
-  sumIf(value, name = 'tool.execution.count') AS calls,
-  sumIf(value, name = 'tool.execution.count' AND status = 'error') AS errors,
-  sumIf(hist_sum, name = 'tool.execution.duration') AS total_hist_sum,
-  sumIf(hist_count, name = 'tool.execution.duration') AS total_hist_count,
-  anyIf(JSONExtract(hist_boundaries, 'Array(Float64)'), name = 'tool.execution.duration') AS boundaries_arr,
-  sumForEachIf(JSONExtract(hist_bucket_counts, 'Array(Float64)'), name = 'tool.execution.duration') AS bucket_counts_arr
-FROM ${source}
-WHERE ${whereClause}
-GROUP BY bucket
-ORDER BY bucket ASC`;
-        }
 
-        const rows = await this.metricEngine.query(sql);
+      const rows = await this.metricEngine.query(sql);
 
-        let breakdownSql: string;
-        if (this.dialect === "duckdb") {
-          breakdownSql = `SELECT
+      const breakdownSql = `SELECT
   connection_id,
   SUM(value) FILTER (WHERE name = 'tool.execution.count') AS calls,
   SUM(value) FILTER (WHERE name = 'tool.execution.count' AND status = 'error') AS errors,
@@ -831,131 +1157,13 @@ WHERE ${whereClause} AND connection_id != ''
 GROUP BY connection_id
 ORDER BY calls DESC
 LIMIT 1000`;
-        } else {
-          breakdownSql = `SELECT
-  connection_id,
-  sumIf(value, name = 'tool.execution.count') AS calls,
-  sumIf(value, name = 'tool.execution.count' AND status = 'error') AS errors,
-  sumIf(hist_sum, name = 'tool.execution.duration') AS total_hist_sum,
-  sumIf(hist_count, name = 'tool.execution.duration') AS total_hist_count
-FROM ${source}
-WHERE ${whereClause} AND connection_id != ''
-GROUP BY connection_id
-ORDER BY calls DESC
-LIMIT 1000`;
-        }
 
-        const connectionBreakdownRows =
-          await this.metricEngine.query(breakdownSql);
+      const connectionBreakdownRows =
+        await this.metricEngine.query(breakdownSql);
 
-        if (rows.length === 0) {
-          return {
-            ...emptyResult,
-            connectionBreakdown: connectionBreakdownRows.map((row) => {
-              const calls = Number(row.calls ?? 0);
-              const errors = Number(row.errors ?? 0);
-              const totalHistSum = Number(row.total_hist_sum ?? 0);
-              const totalHistCount = Number(row.total_hist_count ?? 0);
-
-              return {
-                connectionId: String(row.connection_id ?? ""),
-                calls,
-                errors,
-                errorRate: calls > 0 ? (errors / calls) * 100 : 0,
-                avgDurationMs:
-                  totalHistCount > 0 ? totalHistSum / totalHistCount : 0,
-              };
-            }),
-          };
-        }
-
-        // Accumulate totals across all buckets
-        let totalCalls = 0;
-        let totalErrors = 0;
-        let totalHistSum = 0;
-        let totalHistCount = 0;
-        const allBoundaries: number[][] = [];
-        const allBucketCounts: number[][] = [];
-
-        const timeseries = rows.map((row) => {
-          const calls = Number(row.calls ?? 0);
-          const errors = Number(row.errors ?? 0);
-          const histSum = Number(row.total_hist_sum ?? 0);
-          const histCount = Number(row.total_hist_count ?? 0);
-          const avg = histCount > 0 ? histSum / histCount : 0;
-          const errorRate = calls > 0 ? errors / calls : 0;
-
-          totalCalls += calls;
-          totalErrors += errors;
-          totalHistSum += histSum;
-          totalHistCount += histCount;
-
-          // Parse and merge histogram data for percentile computation
-          let mergedBounds: number[];
-          let mergedCounts: number[];
-
-          if (this.dialect === "clickhouse") {
-            // ClickHouse: already merged via anyIf/sumForEachIf
-            mergedBounds = parseSingleArray(row.boundaries_arr);
-            mergedCounts = parseSingleArray(row.bucket_counts_arr);
-          } else {
-            // DuckDB: merge in JS
-            const boundariesArr = parseGroupedArrays(row.boundaries_arr);
-            const bucketCountsArr = parseGroupedArrays(row.bucket_counts_arr);
-            const merged = mergeHistogramBuckets(
-              boundariesArr,
-              bucketCountsArr,
-            );
-            mergedBounds = merged.boundaries;
-            mergedCounts = merged.counts;
-          }
-
-          // Accumulate for global percentiles
-          if (mergedBounds.length > 0) {
-            allBoundaries.push(mergedBounds);
-            allBucketCounts.push(mergedCounts);
-          }
-
-          const p50 = computePercentileFromHistogramBuckets(
-            mergedBounds,
-            mergedCounts,
-            0.5,
-          );
-          const p95 = computePercentileFromHistogramBuckets(
-            mergedBounds,
-            mergedCounts,
-            0.95,
-          );
-
-          return {
-            timestamp: toISOBucket(row.bucket),
-            calls,
-            errors,
-            errorRate,
-            avg,
-            p50,
-            p95,
-          };
-        });
-
-        // Global percentiles from merged histogram data
-        const { boundaries: globalBounds, counts: globalCounts } =
-          mergeHistogramBuckets(allBoundaries, allBucketCounts);
-
+      if (rows.length === 0) {
         return {
-          totalCalls,
-          totalErrors,
-          avgDurationMs: totalHistCount > 0 ? totalHistSum / totalHistCount : 0,
-          p50DurationMs: computePercentileFromHistogramBuckets(
-            globalBounds,
-            globalCounts,
-            0.5,
-          ),
-          p95DurationMs: computePercentileFromHistogramBuckets(
-            globalBounds,
-            globalCounts,
-            0.95,
-          ),
+          ...emptyResult,
           connectionBreakdown: connectionBreakdownRows.map((row) => {
             const calls = Number(row.calls ?? 0);
             const errors = Number(row.errors ?? 0);
@@ -971,22 +1179,420 @@ LIMIT 1000`;
                 totalHistCount > 0 ? totalHistSum / totalHistCount : 0,
             };
           }),
-          timeseries,
         };
-      } catch (err) {
-        if (source !== sources[sources.length - 1]) {
-          console.warn(
-            `queryMetricTimeseries: rollup table query failed, falling back to raw table:`,
-            err,
-          );
-          continue;
-        }
-        console.error("queryMetricTimeseries failed:", err);
-        return emptyResult;
       }
-    }
 
-    return emptyResult;
+      // Accumulate totals across all buckets
+      let totalCalls = 0;
+      let totalErrors = 0;
+      let totalHistSum = 0;
+      let totalHistCount = 0;
+      const allBoundaries: number[][] = [];
+      const allBucketCounts: number[][] = [];
+
+      const timeseries = rows.map((row) => {
+        const calls = Number(row.calls ?? 0);
+        const errors = Number(row.errors ?? 0);
+        const histSum = Number(row.total_hist_sum ?? 0);
+        const histCount = Number(row.total_hist_count ?? 0);
+        const avg = histCount > 0 ? histSum / histCount : 0;
+        const errorRate = calls > 0 ? errors / calls : 0;
+
+        totalCalls += calls;
+        totalErrors += errors;
+        totalHistSum += histSum;
+        totalHistCount += histCount;
+
+        // Merge per-group histogram arrays in JS, then compute percentiles.
+        const boundariesArr = parseGroupedArrays(row.boundaries_arr);
+        const bucketCountsArr = parseGroupedArrays(row.bucket_counts_arr);
+        const merged = mergeHistogramBuckets(boundariesArr, bucketCountsArr);
+        const mergedBounds = merged.boundaries;
+        const mergedCounts = merged.counts;
+
+        // Accumulate for global percentiles
+        if (mergedBounds.length > 0) {
+          allBoundaries.push(mergedBounds);
+          allBucketCounts.push(mergedCounts);
+        }
+
+        const p50 = computePercentileFromHistogramBuckets(
+          mergedBounds,
+          mergedCounts,
+          0.5,
+        );
+        const p95 = computePercentileFromHistogramBuckets(
+          mergedBounds,
+          mergedCounts,
+          0.95,
+        );
+
+        return {
+          timestamp: toISOBucket(row.bucket),
+          calls,
+          errors,
+          errorRate,
+          avg,
+          p50,
+          p95,
+        };
+      });
+
+      // Global percentiles from merged histogram data
+      const { boundaries: globalBounds, counts: globalCounts } =
+        mergeHistogramBuckets(allBoundaries, allBucketCounts);
+
+      return {
+        totalCalls,
+        totalErrors,
+        avgDurationMs: totalHistCount > 0 ? totalHistSum / totalHistCount : 0,
+        p50DurationMs: computePercentileFromHistogramBuckets(
+          globalBounds,
+          globalCounts,
+          0.5,
+        ),
+        p95DurationMs: computePercentileFromHistogramBuckets(
+          globalBounds,
+          globalCounts,
+          0.95,
+        ),
+        connectionBreakdown: connectionBreakdownRows.map((row) => {
+          const calls = Number(row.calls ?? 0);
+          const errors = Number(row.errors ?? 0);
+          const totalHistSum = Number(row.total_hist_sum ?? 0);
+          const totalHistCount = Number(row.total_hist_count ?? 0);
+
+          return {
+            connectionId: String(row.connection_id ?? ""),
+            calls,
+            errors,
+            errorRate: calls > 0 ? (errors / calls) * 100 : 0,
+            avgDurationMs:
+              totalHistCount > 0 ? totalHistSum / totalHistCount : 0,
+          };
+        }),
+        timeseries,
+      };
+    } catch (err) {
+      console.error("queryMetricTimeseries failed:", err);
+      throw new Error("Monitoring stats unavailable", { cause: err });
+    }
+  }
+
+  /**
+   * ClickHouse metric timeseries, derived directly from the otel_logs view.
+   * Each tool_call log row carries duration_ms + is_error, so counts, averages
+   * and exact percentiles come straight from the rows — no histogram buckets.
+   */
+  private async queryMetricTimeseriesClickHouse(
+    params: {
+      organizationId: string;
+      interval: string;
+      startDate?: Date;
+      endDate?: Date;
+      filters?: {
+        connectionIds?: string[];
+        excludeConnectionIds?: string[];
+        toolNames?: string[];
+        status?: "success" | "error";
+      };
+    },
+    emptyResult: {
+      totalCalls: number;
+      totalErrors: number;
+      avgDurationMs: number;
+      p50DurationMs: number;
+      p95DurationMs: number;
+      connectionBreakdown: Array<{
+        connectionId: string;
+        calls: number;
+        errors: number;
+        errorRate: number;
+        avgDurationMs: number;
+      }>;
+      timeseries: Array<{
+        timestamp: string;
+        calls: number;
+        errors: number;
+        errorRate: number;
+        avg: number;
+        p50: number;
+        p95: number;
+      }>;
+    },
+  ): Promise<typeof emptyResult> {
+    const source = this.metricSourceFactory(params.organizationId, {
+      startDate: params.startDate,
+      endDate: params.endDate,
+    });
+    const bucketExpr = intervalToSQL(
+      params.interval,
+      "clickhouse",
+      "timestamp",
+    );
+
+    const where: string[] = [
+      `organization_id = '${esc(params.organizationId)}'`,
+    ];
+    applyStartDateBound(where, params.startDate, "clickhouse");
+    if (params.endDate) {
+      where.push(tsLte(params.endDate, "clickhouse"));
+    }
+    if (params.filters?.toolNames?.length) {
+      const names = params.filters.toolNames
+        .slice(0, 100)
+        .map((n) => `'${esc(n)}'`)
+        .join(",");
+      where.push(`tool_name IN (${names})`);
+    }
+    if (params.filters?.connectionIds?.length) {
+      const ids = params.filters.connectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id IN (${ids})`);
+    }
+    if (params.filters?.excludeConnectionIds?.length) {
+      const ids = params.filters.excludeConnectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id NOT IN (${ids})`);
+    }
+    const whereClause = where.join(" AND ");
+
+    const timeseriesSql = `SELECT
+  ${bucketExpr} AS bucket,
+  count() AS calls,
+  countIf(is_error = 1) AS errors,
+  avg(duration_ms) AS avg,
+  quantile(0.5)(duration_ms) AS p50,
+  quantile(0.95)(duration_ms) AS p95
+FROM ${source}
+WHERE ${whereClause}
+GROUP BY bucket
+ORDER BY bucket ASC`;
+
+    const breakdownSql = `SELECT
+  connection_id,
+  count() AS calls,
+  countIf(is_error = 1) AS errors,
+  avg(duration_ms) AS avg
+FROM ${source}
+WHERE ${whereClause} AND connection_id != ''
+GROUP BY connection_id
+ORDER BY calls DESC
+LIMIT 1000`;
+
+    const totalsSql = `SELECT
+  count() AS calls,
+  countIf(is_error = 1) AS errors,
+  avg(duration_ms) AS avg,
+  quantile(0.5)(duration_ms) AS p50,
+  quantile(0.95)(duration_ms) AS p95
+FROM ${source}
+WHERE ${whereClause}`;
+
+    try {
+      const [tsRows, breakdownRows, totalsRows] = await Promise.all([
+        this.metricEngine.query(timeseriesSql),
+        this.metricEngine.query(breakdownSql),
+        this.metricEngine.query(totalsSql),
+      ]);
+
+      const totals = totalsRows[0] ?? {};
+
+      return {
+        totalCalls: Number(totals.calls ?? 0),
+        totalErrors: Number(totals.errors ?? 0),
+        avgDurationMs: finiteOrZero(totals.avg),
+        p50DurationMs: finiteOrZero(totals.p50),
+        p95DurationMs: finiteOrZero(totals.p95),
+        connectionBreakdown: breakdownRows.map((row) => {
+          const calls = Number(row.calls ?? 0);
+          const errors = Number(row.errors ?? 0);
+          return {
+            connectionId: String(row.connection_id ?? ""),
+            calls,
+            errors,
+            errorRate: calls > 0 ? (errors / calls) * 100 : 0,
+            avgDurationMs: finiteOrZero(row.avg),
+          };
+        }),
+        timeseries: tsRows.map((row) => {
+          const calls = Number(row.calls ?? 0);
+          const errors = Number(row.errors ?? 0);
+          return {
+            timestamp: toISOBucket(row.bucket),
+            calls,
+            errors,
+            errorRate: calls > 0 ? errors / calls : 0,
+            avg: finiteOrZero(row.avg),
+            p50: finiteOrZero(row.p50),
+            p95: finiteOrZero(row.p95),
+          };
+        }),
+      };
+    } catch (err) {
+      console.error("queryMetricTimeseries failed:", err);
+      throw new Error("Monitoring stats unavailable", { cause: err });
+    }
+  }
+
+  /**
+   * DuckDB metric timeseries derived from OTLP flat-log rows (count/avg/quantile
+   * over duration_ms + is_error). Same shape as the ClickHouse variant; DuckDB
+   * syntax (count(*) / FILTER / quantile_cont / time_bucket).
+   */
+  private async queryMetricTimeseriesDuckDBLogs(
+    params: {
+      organizationId: string;
+      interval: string;
+      startDate?: Date;
+      endDate?: Date;
+      filters?: {
+        connectionIds?: string[];
+        excludeConnectionIds?: string[];
+        toolNames?: string[];
+        status?: "success" | "error";
+      };
+    },
+    emptyResult: {
+      totalCalls: number;
+      totalErrors: number;
+      avgDurationMs: number;
+      p50DurationMs: number;
+      p95DurationMs: number;
+      connectionBreakdown: Array<{
+        connectionId: string;
+        calls: number;
+        errors: number;
+        errorRate: number;
+        avgDurationMs: number;
+      }>;
+      timeseries: Array<{
+        timestamp: string;
+        calls: number;
+        errors: number;
+        errorRate: number;
+        avg: number;
+        p50: number;
+        p95: number;
+      }>;
+    },
+  ): Promise<typeof emptyResult> {
+    const source = this.metricSourceFactory(params.organizationId, {
+      startDate: params.startDate,
+      endDate: params.endDate,
+    });
+    const bucketExpr = intervalToSQL(params.interval, "duckdb", "timestamp");
+
+    const where: string[] = [
+      `organization_id = '${esc(params.organizationId)}'`,
+    ];
+    applyStartDateBound(where, params.startDate, "duckdb");
+    if (params.endDate) {
+      where.push(tsLte(params.endDate, "duckdb"));
+    }
+    if (params.filters?.toolNames?.length) {
+      const names = params.filters.toolNames
+        .slice(0, 100)
+        .map((n) => `'${esc(n)}'`)
+        .join(",");
+      where.push(`tool_name IN (${names})`);
+    }
+    if (params.filters?.connectionIds?.length) {
+      const ids = params.filters.connectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id IN (${ids})`);
+    }
+    if (params.filters?.excludeConnectionIds?.length) {
+      const ids = params.filters.excludeConnectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id NOT IN (${ids})`);
+    }
+    const whereClause = where.join(" AND ");
+
+    const timeseriesSql = `SELECT
+  ${bucketExpr} AS bucket,
+  count(*) AS calls,
+  count(*) FILTER (WHERE is_error = 1) AS errors,
+  avg(duration_ms) AS avg,
+  quantile_cont(duration_ms, 0.5) AS p50,
+  quantile_cont(duration_ms, 0.95) AS p95
+FROM ${source}
+WHERE ${whereClause}
+GROUP BY bucket
+ORDER BY bucket ASC`;
+
+    const breakdownSql = `SELECT
+  connection_id,
+  count(*) AS calls,
+  count(*) FILTER (WHERE is_error = 1) AS errors,
+  avg(duration_ms) AS avg
+FROM ${source}
+WHERE ${whereClause} AND connection_id != ''
+GROUP BY connection_id
+ORDER BY calls DESC
+LIMIT 1000`;
+
+    const totalsSql = `SELECT
+  count(*) AS calls,
+  count(*) FILTER (WHERE is_error = 1) AS errors,
+  avg(duration_ms) AS avg,
+  quantile_cont(duration_ms, 0.5) AS p50,
+  quantile_cont(duration_ms, 0.95) AS p95
+FROM ${source}
+WHERE ${whereClause}`;
+
+    try {
+      const [tsRows, breakdownRows, totalsRows] = await Promise.all([
+        this.metricEngine.query(timeseriesSql),
+        this.metricEngine.query(breakdownSql),
+        this.metricEngine.query(totalsSql),
+      ]);
+
+      const totals = totalsRows[0] ?? {};
+
+      return {
+        totalCalls: Number(totals.calls ?? 0),
+        totalErrors: Number(totals.errors ?? 0),
+        avgDurationMs: finiteOrZero(totals.avg),
+        p50DurationMs: finiteOrZero(totals.p50),
+        p95DurationMs: finiteOrZero(totals.p95),
+        connectionBreakdown: breakdownRows.map((row) => {
+          const calls = Number(row.calls ?? 0);
+          const errors = Number(row.errors ?? 0);
+          return {
+            connectionId: String(row.connection_id ?? ""),
+            calls,
+            errors,
+            errorRate: calls > 0 ? (errors / calls) * 100 : 0,
+            avgDurationMs: finiteOrZero(row.avg),
+          };
+        }),
+        timeseries: tsRows.map((row) => {
+          const calls = Number(row.calls ?? 0);
+          const errors = Number(row.errors ?? 0);
+          return {
+            timestamp: toISOBucket(row.bucket),
+            calls,
+            errors,
+            errorRate: calls > 0 ? errors / calls : 0,
+            avg: finiteOrZero(row.avg),
+            p50: finiteOrZero(row.p50),
+            p95: finiteOrZero(row.p95),
+          };
+        }),
+      };
+    } catch (err) {
+      console.error("queryMetricTimeseries failed:", err);
+      throw new Error("Monitoring stats unavailable", { cause: err });
+    }
   }
 
   async queryMetricTopToolsTimeseries(params: {
@@ -1025,63 +1631,63 @@ LIMIT 1000`;
       return emptyResult;
     }
 
-    const metricSource = this.metricSourceFactory(params.organizationId);
-    const isRollup =
-      this.dialect === "clickhouse" &&
-      metricSource === "monitoring_metrics_rollup_1m";
+    // ClickHouse derives metrics from the otel_logs view; DuckDB path below
+    // reads pre-aggregated histograms from local NDJSON files.
+    if (this.dialect === "clickhouse") {
+      return this.queryMetricTopToolsTimeseriesClickHouse(params, emptyResult);
+    }
+    if (this.metricsFromLogs) {
+      return this.queryMetricTopToolsTimeseriesDuckDBLogs(params, emptyResult);
+    }
 
-    // Try rollup table first; if it fails (e.g. table doesn't exist),
-    // fall back to the raw monitoring_metrics table.
-    const sources = isRollup
-      ? [metricSource, "monitoring_metrics"]
-      : [metricSource];
+    // ── DuckDB path (local NDJSON, pre-aggregated histograms) ──────────────
+    const source = this.metricSourceFactory(params.organizationId, {
+      startDate: params.startDate,
+      endDate: params.endDate,
+    });
+    const bucketExpr = intervalToSQL(
+      params.interval,
+      this.dialect,
+      "timestamp",
+    );
+    const where: string[] = [
+      `organization_id = '${esc(params.organizationId)}'`,
+    ];
 
-    for (const source of sources) {
-      try {
-        const usingRollup =
-          this.dialect === "clickhouse" &&
-          source === "monitoring_metrics_rollup_1m";
-        const tsCol = usingRollup ? "bucket" : "timestamp";
-        const bucketExpr = intervalToSQL(params.interval, this.dialect, tsCol);
-        const where: string[] = [
-          `organization_id = '${esc(params.organizationId)}'`,
-        ];
+    applyStartDateBound(where, params.startDate, this.dialect);
+    if (params.endDate) {
+      where.push(tsLte(params.endDate, this.dialect));
+    }
+    if (params.filters?.toolNames?.length) {
+      const names = params.filters.toolNames
+        .slice(0, 100)
+        .map((n) => `'${esc(n)}'`)
+        .join(",");
+      where.push(`tool_name IN (${names})`);
+    }
+    if (params.filters?.connectionIds?.length) {
+      const ids = params.filters.connectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id IN (${ids})`);
+    }
+    if (params.filters?.excludeConnectionIds?.length) {
+      const ids = params.filters.excludeConnectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id NOT IN (${ids})`);
+    }
+    // NOTE: status is intentionally NOT added to the WHERE clause here.
+    // The errors aggregation uses SUM FILTER (WHERE ...), which would always
+    // return 0 if WHERE already filters to status = 'success'.
 
-        applyStartDateBound(where, params.startDate, this.dialect, tsCol);
-        if (params.endDate) {
-          where.push(tsLte(params.endDate, this.dialect, tsCol));
-        }
-        if (params.filters?.toolNames?.length) {
-          const names = params.filters.toolNames
-            .slice(0, 100)
-            .map((n) => `'${esc(n)}'`)
-            .join(",");
-          where.push(`tool_name IN (${names})`);
-        }
-        if (params.filters?.connectionIds?.length) {
-          const ids = params.filters.connectionIds
-            .slice(0, 100)
-            .map((id) => `'${esc(id)}'`)
-            .join(",");
-          where.push(`connection_id IN (${ids})`);
-        }
-        if (params.filters?.excludeConnectionIds?.length) {
-          const ids = params.filters.excludeConnectionIds
-            .slice(0, 100)
-            .map((id) => `'${esc(id)}'`)
-            .join(",");
-          where.push(`connection_id NOT IN (${ids})`);
-        }
-        // NOTE: status is intentionally NOT added to the WHERE clause here.
-        // The errors aggregation uses SUM FILTER (WHERE ...)/sumIf(... AND status = 'error'),
-        // which would always return 0 if WHERE already filters to status = 'success'.
+    const whereClause = where.join(" AND ");
+    const topN = Math.min(Math.max(1, Math.floor(params.topN ?? 10)), 20);
 
-        const whereClause = where.join(" AND ");
-        const topN = Math.min(Math.max(1, Math.floor(params.topN ?? 10)), 20);
-
-        let topToolsSql: string;
-        if (this.dialect === "duckdb") {
-          topToolsSql = `SELECT
+    try {
+      const topToolsSql = `SELECT
   tool_name,
   argMax(connection_id, connection_calls) AS connection_id,
   sum(connection_calls) AS calls
@@ -1097,41 +1703,21 @@ FROM (
 GROUP BY tool_name
 ORDER BY calls DESC
 LIMIT ${topN}`;
-        } else {
-          topToolsSql = `SELECT
-  tool_name,
-  argMax(connection_id, connection_calls) AS connection_id,
-  sum(connection_calls) AS calls
-FROM (
-  SELECT
-    tool_name,
-    connection_id,
-    sumIf(value, name = 'tool.execution.count') AS connection_calls
-  FROM ${source}
-  WHERE ${whereClause} AND tool_name != ''
-  GROUP BY tool_name, connection_id
-)
-GROUP BY tool_name
-ORDER BY calls DESC
-LIMIT ${topN}`;
-        }
 
-        const topToolRows = await this.metricEngine.query(topToolsSql);
+      const topToolRows = await this.metricEngine.query(topToolsSql);
 
-        if (topToolRows.length === 0) {
-          return emptyResult;
-        }
+      if (topToolRows.length === 0) {
+        return emptyResult;
+      }
 
-        const topToolNames = topToolRows
-          .map((row) => String(row.tool_name ?? ""))
-          .filter(Boolean);
-        const toolNamesSql = topToolNames
-          .map((name) => `'${esc(name)}'`)
-          .join(",");
+      const topToolNames = topToolRows
+        .map((row) => String(row.tool_name ?? ""))
+        .filter(Boolean);
+      const toolNamesSql = topToolNames
+        .map((name) => `'${esc(name)}'`)
+        .join(",");
 
-        let timeseriesSql: string;
-        if (this.dialect === "duckdb") {
-          timeseriesSql = `SELECT
+      const timeseriesSql = `SELECT
   ${bucketExpr} AS bucket,
   tool_name,
   SUM(value) FILTER (WHERE name = 'tool.execution.count') AS calls,
@@ -1144,119 +1730,320 @@ FROM ${source}
 WHERE ${whereClause} AND tool_name IN (${toolNamesSql})
 GROUP BY bucket, tool_name
 ORDER BY bucket ASC, tool_name ASC`;
-        } else if (usingRollup) {
-          timeseriesSql = `SELECT
-  ${bucketExpr} AS bucket,
-  tool_name,
-  sumIf(value, name = 'tool.execution.count') AS calls,
-  sumIf(value, name = 'tool.execution.count' AND status = 'error') AS errors,
-  sumIf(hist_sum, name = 'tool.execution.duration') AS total_hist_sum,
-  sumIf(hist_count, name = 'tool.execution.duration') AS total_hist_count,
-  anyIf(hist_boundaries, name = 'tool.execution.duration') AS boundaries_arr,
-  sumForEachMergeIf(hist_bucket_counts, name = 'tool.execution.duration') AS bucket_counts_arr
-FROM ${source}
-WHERE ${whereClause} AND tool_name IN (${toolNamesSql})
-GROUP BY bucket, tool_name
-ORDER BY bucket ASC, tool_name ASC`;
-        } else {
-          timeseriesSql = `SELECT
-  ${bucketExpr} AS bucket,
-  tool_name,
-  sumIf(value, name = 'tool.execution.count') AS calls,
-  sumIf(value, name = 'tool.execution.count' AND status = 'error') AS errors,
-  sumIf(hist_sum, name = 'tool.execution.duration') AS total_hist_sum,
-  sumIf(hist_count, name = 'tool.execution.duration') AS total_hist_count,
-  anyIf(JSONExtract(hist_boundaries, 'Array(Float64)'), name = 'tool.execution.duration') AS boundaries_arr,
-  sumForEachIf(JSONExtract(hist_bucket_counts, 'Array(Float64)'), name = 'tool.execution.duration') AS bucket_counts_arr
-FROM ${source}
-WHERE ${whereClause} AND tool_name IN (${toolNamesSql})
-GROUP BY bucket, tool_name
-ORDER BY bucket ASC, tool_name ASC`;
-        }
 
-        const rows = await this.metricEngine.query(timeseriesSql);
+      const rows = await this.metricEngine.query(timeseriesSql);
 
-        return {
-          topTools: topToolRows.map((row) => ({
+      return {
+        topTools: topToolRows.map((row) => ({
+          toolName: String(row.tool_name ?? ""),
+          connectionId:
+            row.connection_id != null ? String(row.connection_id) : null,
+          calls: Number(row.calls ?? 0),
+        })),
+        timeseries: rows.map((row) => {
+          const calls = Number(row.calls ?? 0);
+          const errors = Number(row.errors ?? 0);
+          const histSum = Number(row.total_hist_sum ?? 0);
+          const histCount = Number(row.total_hist_count ?? 0);
+          const boundariesArr = parseGroupedArrays(row.boundaries_arr);
+          const bucketCountsArr = parseGroupedArrays(row.bucket_counts_arr);
+          const merged = mergeHistogramBuckets(boundariesArr, bucketCountsArr);
+
+          return {
+            timestamp: toISOBucket(row.bucket),
             toolName: String(row.tool_name ?? ""),
-            connectionId:
-              row.connection_id != null ? String(row.connection_id) : null,
-            calls: Number(row.calls ?? 0),
-          })),
-          timeseries: rows.map((row) => {
-            const calls = Number(row.calls ?? 0);
-            const errors = Number(row.errors ?? 0);
-            const histSum = Number(row.total_hist_sum ?? 0);
-            const histCount = Number(row.total_hist_count ?? 0);
-            let boundaries: number[];
-            let counts: number[];
+            calls,
+            errors,
+            avg: histCount > 0 ? histSum / histCount : 0,
+            p95: computePercentileFromHistogramBuckets(
+              merged.boundaries,
+              merged.counts,
+              0.95,
+            ),
+          };
+        }),
+      };
+    } catch (err) {
+      console.error("queryMetricTopToolsTimeseries failed:", err);
+      throw new Error("Monitoring stats unavailable", { cause: err });
+    }
+  }
 
-            if (this.dialect === "clickhouse") {
-              boundaries = parseSingleArray(row.boundaries_arr);
-              counts = parseSingleArray(row.bucket_counts_arr);
-            } else {
-              const boundariesArr = parseGroupedArrays(row.boundaries_arr);
-              const bucketCountsArr = parseGroupedArrays(row.bucket_counts_arr);
-              const merged = mergeHistogramBuckets(
-                boundariesArr,
-                bucketCountsArr,
-              );
-              boundaries = merged.boundaries;
-              counts = merged.counts;
-            }
+  /**
+   * ClickHouse top-tools metric timeseries, derived from the otel_logs view
+   * (count/avg/quantile over duration_ms + is_error).
+   */
+  private async queryMetricTopToolsTimeseriesClickHouse(
+    params: {
+      organizationId: string;
+      interval: string;
+      startDate?: Date;
+      endDate?: Date;
+      topN?: number;
+      filters?: {
+        connectionIds?: string[];
+        excludeConnectionIds?: string[];
+        toolNames?: string[];
+        status?: "success" | "error";
+      };
+    },
+    emptyResult: {
+      topTools: Array<{
+        toolName: string;
+        connectionId: string | null;
+        calls: number;
+      }>;
+      timeseries: Array<{
+        timestamp: string;
+        toolName: string;
+        calls: number;
+        errors: number;
+        avg: number;
+        p95: number;
+      }>;
+    },
+  ): Promise<typeof emptyResult> {
+    const source = this.metricSourceFactory(params.organizationId, {
+      startDate: params.startDate,
+      endDate: params.endDate,
+    });
+    const bucketExpr = intervalToSQL(
+      params.interval,
+      "clickhouse",
+      "timestamp",
+    );
+    const where: string[] = [
+      `organization_id = '${esc(params.organizationId)}'`,
+    ];
+    applyStartDateBound(where, params.startDate, "clickhouse");
+    if (params.endDate) {
+      where.push(tsLte(params.endDate, "clickhouse"));
+    }
+    if (params.filters?.toolNames?.length) {
+      const names = params.filters.toolNames
+        .slice(0, 100)
+        .map((n) => `'${esc(n)}'`)
+        .join(",");
+      where.push(`tool_name IN (${names})`);
+    }
+    if (params.filters?.connectionIds?.length) {
+      const ids = params.filters.connectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id IN (${ids})`);
+    }
+    if (params.filters?.excludeConnectionIds?.length) {
+      const ids = params.filters.excludeConnectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id NOT IN (${ids})`);
+    }
+    const whereClause = where.join(" AND ");
+    const topN = Math.min(Math.max(1, Math.floor(params.topN ?? 10)), 20);
 
-            return {
-              timestamp: toISOBucket(row.bucket),
-              toolName: String(row.tool_name ?? ""),
-              calls,
-              errors,
-              avg: histCount > 0 ? histSum / histCount : 0,
-              p95: computePercentileFromHistogramBuckets(
-                boundaries,
-                counts,
-                0.95,
-              ),
-            };
-          }),
-        };
-      } catch (err) {
-        if (source !== sources[sources.length - 1]) {
-          console.warn(
-            `queryMetricTopToolsTimeseries: rollup table query failed, falling back to raw table:`,
-            err,
-          );
-          continue;
-        }
-        console.error("queryMetricTopToolsTimeseries failed:", err);
+    try {
+      const topToolsSql = `SELECT
+  tool_name,
+  argMax(connection_id, conn_calls) AS connection_id,
+  sum(conn_calls) AS calls
+FROM (
+  SELECT tool_name, connection_id, count() AS conn_calls
+  FROM ${source}
+  WHERE ${whereClause} AND tool_name != ''
+  GROUP BY tool_name, connection_id
+)
+GROUP BY tool_name
+ORDER BY calls DESC
+LIMIT ${topN}`;
+
+      const topToolRows = await this.metricEngine.query(topToolsSql);
+      if (topToolRows.length === 0) {
         return emptyResult;
       }
-    }
 
-    return emptyResult;
+      const topToolNames = topToolRows
+        .map((row) => String(row.tool_name ?? ""))
+        .filter(Boolean);
+      const toolNamesSql = topToolNames
+        .map((name) => `'${esc(name)}'`)
+        .join(",");
+
+      const timeseriesSql = `SELECT
+  ${bucketExpr} AS bucket,
+  tool_name,
+  count() AS calls,
+  countIf(is_error = 1) AS errors,
+  avg(duration_ms) AS avg,
+  quantile(0.95)(duration_ms) AS p95
+FROM ${source}
+WHERE ${whereClause} AND tool_name IN (${toolNamesSql})
+GROUP BY bucket, tool_name
+ORDER BY bucket ASC, tool_name ASC`;
+
+      const rows = await this.metricEngine.query(timeseriesSql);
+
+      return {
+        topTools: topToolRows.map((row) => ({
+          toolName: String(row.tool_name ?? ""),
+          connectionId:
+            row.connection_id != null ? String(row.connection_id) : null,
+          calls: Number(row.calls ?? 0),
+        })),
+        timeseries: rows.map((row) => ({
+          timestamp: toISOBucket(row.bucket),
+          toolName: String(row.tool_name ?? ""),
+          calls: Number(row.calls ?? 0),
+          errors: Number(row.errors ?? 0),
+          avg: finiteOrZero(row.avg),
+          p95: finiteOrZero(row.p95),
+        })),
+      };
+    } catch (err) {
+      console.error("queryMetricTopToolsTimeseries failed:", err);
+      throw new Error("Monitoring stats unavailable", { cause: err });
+    }
+  }
+
+  /**
+   * DuckDB top-tools metric timeseries derived from OTLP flat-log rows. Same
+   * shape as the ClickHouse variant; DuckDB syntax (count(*) / FILTER /
+   * quantile_cont / arg_max / time_bucket).
+   */
+  private async queryMetricTopToolsTimeseriesDuckDBLogs(
+    params: {
+      organizationId: string;
+      interval: string;
+      startDate?: Date;
+      endDate?: Date;
+      topN?: number;
+      filters?: {
+        connectionIds?: string[];
+        excludeConnectionIds?: string[];
+        toolNames?: string[];
+        status?: "success" | "error";
+      };
+    },
+    emptyResult: {
+      topTools: Array<{
+        toolName: string;
+        connectionId: string | null;
+        calls: number;
+      }>;
+      timeseries: Array<{
+        timestamp: string;
+        toolName: string;
+        calls: number;
+        errors: number;
+        avg: number;
+        p95: number;
+      }>;
+    },
+  ): Promise<typeof emptyResult> {
+    const source = this.metricSourceFactory(params.organizationId, {
+      startDate: params.startDate,
+      endDate: params.endDate,
+    });
+    const bucketExpr = intervalToSQL(params.interval, "duckdb", "timestamp");
+    const where: string[] = [
+      `organization_id = '${esc(params.organizationId)}'`,
+    ];
+    applyStartDateBound(where, params.startDate, "duckdb");
+    if (params.endDate) {
+      where.push(tsLte(params.endDate, "duckdb"));
+    }
+    if (params.filters?.toolNames?.length) {
+      const names = params.filters.toolNames
+        .slice(0, 100)
+        .map((n) => `'${esc(n)}'`)
+        .join(",");
+      where.push(`tool_name IN (${names})`);
+    }
+    if (params.filters?.connectionIds?.length) {
+      const ids = params.filters.connectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id IN (${ids})`);
+    }
+    if (params.filters?.excludeConnectionIds?.length) {
+      const ids = params.filters.excludeConnectionIds
+        .slice(0, 100)
+        .map((id) => `'${esc(id)}'`)
+        .join(",");
+      where.push(`connection_id NOT IN (${ids})`);
+    }
+    const whereClause = where.join(" AND ");
+    const topN = Math.min(Math.max(1, Math.floor(params.topN ?? 10)), 20);
+
+    try {
+      const topToolsSql = `SELECT
+  tool_name,
+  arg_max(connection_id, conn_calls) AS connection_id,
+  sum(conn_calls) AS calls
+FROM (
+  SELECT tool_name, connection_id, count(*) AS conn_calls
+  FROM ${source}
+  WHERE ${whereClause} AND tool_name != ''
+  GROUP BY tool_name, connection_id
+)
+GROUP BY tool_name
+ORDER BY calls DESC
+LIMIT ${topN}`;
+
+      const topToolRows = await this.metricEngine.query(topToolsSql);
+      if (topToolRows.length === 0) {
+        return emptyResult;
+      }
+
+      const topToolNames = topToolRows
+        .map((row) => String(row.tool_name ?? ""))
+        .filter(Boolean);
+      const toolNamesSql = topToolNames
+        .map((name) => `'${esc(name)}'`)
+        .join(",");
+
+      const timeseriesSql = `SELECT
+  ${bucketExpr} AS bucket,
+  tool_name,
+  count(*) AS calls,
+  count(*) FILTER (WHERE is_error = 1) AS errors,
+  avg(duration_ms) AS avg,
+  quantile_cont(duration_ms, 0.95) AS p95
+FROM ${source}
+WHERE ${whereClause} AND tool_name IN (${toolNamesSql})
+GROUP BY bucket, tool_name
+ORDER BY bucket ASC, tool_name ASC`;
+
+      const rows = await this.metricEngine.query(timeseriesSql);
+
+      return {
+        topTools: topToolRows.map((row) => ({
+          toolName: String(row.tool_name ?? ""),
+          connectionId:
+            row.connection_id != null ? String(row.connection_id) : null,
+          calls: Number(row.calls ?? 0),
+        })),
+        timeseries: rows.map((row) => ({
+          timestamp: toISOBucket(row.bucket),
+          toolName: String(row.tool_name ?? ""),
+          calls: Number(row.calls ?? 0),
+          errors: Number(row.errors ?? 0),
+          avg: finiteOrZero(row.avg),
+          p95: finiteOrZero(row.p95),
+        })),
+      };
+    } catch (err) {
+      console.error("queryMetricTopToolsTimeseries failed:", err);
+      throw new Error("Monitoring stats unavailable", { cause: err });
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
 // Histogram helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Parse a single pre-merged array from ClickHouse (anyIf / sumForEachIf result).
- * Returns a flat number[].
- */
-function parseSingleArray(val: unknown): number[] {
-  if (!val) return [];
-  if (Array.isArray(val)) return val.map(Number);
-  if (typeof val === "string") {
-    try {
-      const parsed = JSON.parse(val);
-      if (Array.isArray(parsed)) return parsed.map(Number);
-    } catch {
-      return [];
-    }
-  }
-  return [];
-}
 
 /**
  * Parse grouped array results from DuckDB.

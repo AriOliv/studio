@@ -14,15 +14,22 @@ export const LOCALSTORAGE_KEYS = {
     `mesh:chat:selectedMode:${locator}`,
   chatSelectedImageModel: (locator: ProjectLocator) =>
     `mesh:chat:selectedImageModel:${locator}`,
+  chatSelectedWebSearchModel: (locator: ProjectLocator) =>
+    `mesh:chat:selectedWebSearchModel:${locator}`,
   chatSelectedDeepResearchModel: (locator: ProjectLocator) =>
     `mesh:chat:selectedDeepResearchModel:${locator}`,
   chatSimpleModeTier: (locator: ProjectLocator) =>
     `mesh:chat:simpleModeTier:${locator}`,
+  chatLastAgentOption: (locator: ProjectLocator) =>
+    `mesh:chat:lastAgentOption:${locator}`,
   chatAutosend: (locator: ProjectLocator | string, taskId: string) =>
     `mesh:chat:autosend:${locator}:${taskId}`,
+  chatDraft: (locator: ProjectLocator | string, taskKey: string) =>
+    `mesh:chat:draft:${locator}:${taskKey}`,
   assistantChatActiveTask: (locator: ProjectLocator) =>
     `mesh:assistant-chat:active-task:${locator}`,
   decoChatPanelWidth: () => `mesh:decochat:panel-width`,
+  tasksPanelWidth: () => `mesh:tasks-panel:width`,
   sidebarOpen: () => `mesh:sidebar-open`,
   orgHomeQuickstart: (org: string) => `mesh:org-home:quickstart:${org}`,
   storeShowStdio: () => `mesh:store:show-stdio`,
@@ -30,7 +37,11 @@ export const LOCALSTORAGE_KEYS = {
   pluginConnection: (org: string, pluginId: string) =>
     `mesh:plugin:connection:${org}:${pluginId}`,
   lastOrgSlug: () => `mesh:last-org-slug`,
+  lastLocation: () => `mesh:last-location`,
   connectionsTab: (org: string) => `mesh:connections:tab:${org}`,
   taskLastViewed: (locator: ProjectLocator) =>
     `mesh:chat:task-last-viewed:${locator}`,
+  sidebarGroupOrder: (orgId: string, userId: string) =>
+    `sidebar.group-order.${orgId}.${userId}`,
+  sidebarOrgPinnedOrder: (orgId: string) => `sidebar.org-pinned-order.${orgId}`,
 } as const;

@@ -1,11 +1,28 @@
-import type { MiddlewareHandler } from "hono";
-import type { MeshContext } from "../../core/mesh-context";
-import { createBoundObjectStorage } from "../../object-storage/bound-object-storage";
-import { DevObjectStorage } from "../../object-storage/dev-object-storage";
-import { getObjectStorageS3Service } from "../../object-storage/factory";
+import type { Context, MiddlewareHandler } from "hono";
+import type { StudioContext } from "../../core/studio-context";
+import { rebindOrgScope } from "../../core/context-factory";
+import { isOrgArchived } from "../../core/org-archived";
+
+import { isBrowserNavigation } from "../utils/browser-navigation";
+
+/**
+ * Public-share endpoints a non-member must still reach: the read proxy
+ * (`GET .../fs/:volume/read`, serves public/password files) and the password
+ * unlock (`POST .../fs/:volume/unlock`). The membership gate below defers to
+ * these; the routes themselves serve only shared content and still gate
+ * everything else on ORG_FS_READ (a non-member fails → 403). Every other
+ * org-scoped route stays member-gated.
+ */
+function isPublicSharePath(c: Context): boolean {
+  const p = c.req.path;
+  return (
+    (c.req.method === "GET" && /\/fs\/[^/]+\/read$/.test(p)) ||
+    (c.req.method === "POST" && /\/fs\/[^/]+\/unlock$/.test(p))
+  );
+}
 
 export const resolveOrgFromPath: MiddlewareHandler<{
-  Variables: { meshContext: MeshContext };
+  Variables: { meshContext: StudioContext };
 }> = async (c, next) => {
   const slug = c.req.param("org");
   if (!slug) {
@@ -20,11 +37,27 @@ export const resolveOrgFromPath: MiddlewareHandler<{
 
   const org = await db
     .selectFrom("organization")
-    .select(["id", "slug", "name"])
+    .select(["id", "slug", "name", "metadata"])
     .where("slug", "=", slug)
     .executeTakeFirst();
 
   if (!org) {
+    // Bounce browser navigations into the SPA so OrgAccessGate shows the
+    // "Organization not found" screen instead of raw JSON.
+    if (isBrowserNavigation(c)) {
+      return c.redirect(`/${encodeURIComponent(slug)}`, 302);
+    }
+    return c.json({ error: `organization "${slug}" not found` }, 404);
+  }
+
+  // Archived (soft-deleted) orgs are invisible to the API. Treat them exactly
+  // like a missing org: bounce browser navigations into the SPA (the shell
+  // shows the branded "Organization unavailable" screen), and return JSON 404
+  // to machine clients such as the self-MCP proxy POST.
+  if (isOrgArchived(org)) {
+    if (isBrowserNavigation(c)) {
+      return c.redirect(`/${encodeURIComponent(slug)}`, 302);
+    }
     return c.json({ error: `organization "${slug}" not found` }, 404);
   }
 
@@ -51,9 +84,26 @@ export const resolveOrgFromPath: MiddlewareHandler<{
       .executeTakeFirst();
 
     if (!membership) {
-      return c.json({ error: "forbidden: not a member of organization" }, 403);
+      // Public-share reads + password unlock are reachable by anyone, incl.
+      // signed-in non-members — let them fall through to the route (which serves
+      // only shared content and 403s the rest). All other routes stay gated.
+      if (!isPublicSharePath(c)) {
+        // Bounce browser navigations into the SPA so OrgAccessGate shows the
+        // styled "No access" screen (with invite/auto-join handling) instead of
+        // raw JSON in the address bar.
+        if (isBrowserNavigation(c)) {
+          return c.redirect(`/${encodeURIComponent(org.slug)}`, 302);
+        }
+        return c.json(
+          { error: "forbidden: not a member of organization" },
+          403,
+        );
+      }
+      // pathRole stays undefined; the org is still resolved + rebound below so
+      // the read route can stat the file and serve it if it's public.
+    } else {
+      pathRole = membership.role;
     }
-    pathRole = membership.role;
   }
 
   ctx.organization = {
@@ -73,20 +123,12 @@ export const resolveOrgFromPath: MiddlewareHandler<{
   // different org — or when there's no active org and the role was undefined
   // — the bypass silently fails and owners get spurious 403s on tool calls.
   ctx.access.setRole(pathRole);
-  // Rebind org-scoped storage that was constructed eagerly with `undefined`
-  // when meshContext was created (no `x-org-id` header on the new path
-  // means `organization` was not yet resolved). Without this, any thread
-  // operation throws "thread operations require an authenticated organization".
-  ctx.storage.threads.setOrganizationId(org.id);
-  // objectStorage is also constructed eagerly (null when no org). Rebuild it
-  // here using the same logic as context-factory so OBJECT_STORAGE binding
-  // resolves on the new path family.
-  if (!ctx.objectStorage) {
-    const s3Service = getObjectStorageS3Service();
-    ctx.objectStorage = s3Service
-      ? createBoundObjectStorage(s3Service, org.id)
-      : new DevObjectStorage(org.id, ctx.baseUrl);
-  }
+  // Everything org-scoped on the context (thread storage, object storage,
+  // org-fs, asset hoisters) was constructed eagerly from the session's active
+  // org — or from no org at all. Rebind it all to the path-resolved org so
+  // cross-org navigation (session active=A, URL targets B) reads and writes
+  // B's tenant scope, never A's.
+  rebindOrgScope(ctx, org);
 
   return await next();
 };

@@ -68,7 +68,7 @@ import {
   useOptionalChatPrefs,
 } from "@/web/components/chat/context.tsx";
 import { usePanelActions } from "@/web/layouts/shell-layout";
-import { MonacoCodeEditor } from "./workflow/components/monaco-editor";
+import { MonacoCodeEditor } from "../monaco-editor";
 
 export interface ToolDetailsViewProps {
   itemId: string;
@@ -292,6 +292,18 @@ function ToolDetailsAuthenticated({
                 args[key] = JSON.parse(args[key]);
               } catch {
                 // Parsing failed, send as string (will likely fail validation but let server handle it)
+              }
+            } else if (
+              (prop.type === "number" || prop.type === "integer") &&
+              typeof args[key] === "string" &&
+              args[key] !== ""
+            ) {
+              // Text inputs yield strings; coerce numeric fields so the tool's
+              // schema (e.g. z.number()) doesn't reject "7776000". Leave
+              // non-numeric strings untouched for the server to reject.
+              const n = Number(args[key]);
+              if (!Number.isNaN(n)) {
+                args[key] = n;
               }
             }
           },
