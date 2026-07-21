@@ -122,7 +122,7 @@ import * as migration120orgfsreadpublic from "./120-org-fs-read-public.ts";
 import * as migration121orgfssharepassword from "./121-org-fs-share-password.ts";
 import * as migration122splitwebresearchtier from "./122-split-web-research-tier.ts";
 import * as migration123connectioncredentialvault from "./123-connection-credential-vault.ts";
-import * as migration124peruseroauth from "./124-per-user-oauth.ts";
+import * as migration123peruseroauth from "./123-per-user-oauth.ts";
 import * as migration124dropthreadprojectedseq from "./124-drop-thread-projected-seq.ts";
 import * as migration125githubchildsingleparent from "./125-github-child-single-parent.ts";
 import * as migration126taskboard from "./126-task-board.ts";
@@ -283,7 +283,7 @@ const migrations: Record<string, Migration> = {
   "121-org-fs-share-password": migration121orgfssharepassword,
   "122-split-web-research-tier": migration122splitwebresearchtier,
   "123-connection-credential-vault": migration123connectioncredentialvault,
-  "124-per-user-oauth": migration124peruseroauth,
+  "123-per-user-oauth": migration123peruseroauth,
   "124-drop-thread-projected-seq": migration124dropthreadprojectedseq,
   "125-github-child-single-parent": migration125githubchildsingleparent,
   "126-task-board": migration126taskboard,
