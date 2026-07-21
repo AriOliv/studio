@@ -8,6 +8,7 @@ import type { Prompt } from "@modelcontextprotocol/sdk/types.js";
 import { Suspense } from "react";
 import {
   getHomeTiles,
+  isStudioPackAgent,
   mcpClientQueryOptions,
   useMCPClient,
   useMCPToolsListQuery,
@@ -38,16 +39,22 @@ import { KEYS } from "@/web/lib/query-keys";
 import { TileBoard } from "./tile-board/tile-board";
 import { useBoardLayout } from "./tile-board/use-board-layout";
 import type { TileInstance } from "./tile-board/types";
+import {
+  NATIVE_TILES,
+  NativeTile,
+  type NativeTileDef,
+  nativeCandidateId,
+} from "./native-tiles";
 
 interface HomeGridProps {
   isEditMode: boolean;
 }
 
-// Shared so HomeGrid and useHomeGridStats agree on what "a tile" looks
-// like before the user resizes it.
-const TILE_DEFAULT_SIZE = { w: 2, h: 4 } as const;
+// Default tile footprint before the user resizes it. w:3 keeps agent tiles at
+// half width on the 6-column grid (see tile-board/constants).
+const TILE_DEFAULT_SIZE = { w: 3, h: 4 } as const;
 const TILE_MIN_SIZE = { w: 1, h: 2 } as const;
-const PROMPT_DEFAULT_SIZE = { w: 1, h: 1 } as const;
+const PROMPT_DEFAULT_SIZE = { w: 2, h: 1 } as const;
 
 /** Stable, deterministic id so the persisted layout matches the same item
  *  on the next render. */
@@ -144,7 +151,13 @@ interface TileCandidate {
   data: HomeTileEntry;
 }
 
-type Candidate = PromptCandidate | TileCandidate;
+interface NativeCandidate {
+  kind: "native";
+  id: string;
+  data: NativeTileDef;
+}
+
+type Candidate = PromptCandidate | TileCandidate | NativeCandidate;
 
 function PromptTile({
   entry,
@@ -402,7 +415,16 @@ function TileErrorFallback({
 
 export function HomeGrid({ isEditMode }: HomeGridProps) {
   const { org } = useProjectContext();
-  const { isLoading, prompts, tiles } = useHomeNextActions(org.slug);
+  const {
+    isLoading,
+    prompts: allPrompts,
+    tiles: allTiles,
+  } = useHomeNextActions(org.slug);
+  // Studio Pack onboarding agents (Brand Manager et al.) are no longer part of
+  // the default board — their prompt/tile cards are filtered out so the board
+  // is the native product tiles (Tasks / Coding / Analytics / Sales).
+  const prompts = allPrompts.filter((p) => !isStudioPackAgent(p.agentId));
+  const tiles = allTiles.filter((t) => !isStudioPackAgent(t.agentId));
   const homeIds = useDefaultHomeAgents()?.ids ?? [];
   const pinnedAgentIds = new Set(homeIds);
   const homeWriter = useHomeAgentsWriter();
@@ -421,7 +443,10 @@ export function HomeGrid({ isEditMode }: HomeGridProps) {
   const loosePrompts = prompts.filter((p) => !tileAgentIds.has(p.agentId));
 
   // Build unified candidate list. Tile agents bring their prompts inline,
-  // so only loose prompts become standalone grid cards.
+  // so only loose prompts become standalone grid cards. Native tiles (built-in
+  // views like recent conversations) are always candidates; the board's
+  // `hidden` set governs whether they're on the board, so they show by default
+  // and can be removed / re-added like anything else.
   const candidates: Candidate[] = [
     ...tiles.map<TileCandidate>((t) => ({
       kind: "tile",
@@ -433,19 +458,37 @@ export function HomeGrid({ isEditMode }: HomeGridProps) {
       id: promptCandidateId(p),
       data: p,
     })),
+    // Native tiles auto-place last so they flow to the bottom — the first fold
+    // stays the agent tiles / prompts. A stored position (drag) overrides this.
+    ...NATIVE_TILES.map<NativeCandidate>((t) => ({
+      kind: "native",
+      id: nativeCandidateId(t.id),
+      data: t,
+    })),
   ];
   const candidatesById = new Map(candidates.map((c) => [c.id, c] as const));
 
   const layout = useBoardLayout(
-    candidates.map((c) => ({
-      id: c.id,
-      defaultSize: c.kind === "tile" ? TILE_DEFAULT_SIZE : PROMPT_DEFAULT_SIZE,
-      // Agent UI tiles need at least 2 rows to leave the iframe room
-      // under the header — at 1 row the embedded UI collapses to a
-      // sliver. Prompt tiles can stay at 1×1.
-      minSize: c.kind === "tile" ? TILE_MIN_SIZE : undefined,
-      pinned: pinnedAgentIds.has(c.data.agentId),
-    })),
+    candidates.map((c) => {
+      if (c.kind === "native") {
+        return {
+          id: c.id,
+          defaultSize: c.data.defaultSize,
+          minSize: c.data.minSize,
+          defaultHidden: c.data.defaultHidden,
+        };
+      }
+      return {
+        id: c.id,
+        defaultSize:
+          c.kind === "tile" ? TILE_DEFAULT_SIZE : PROMPT_DEFAULT_SIZE,
+        // Agent UI tiles need at least 2 rows to leave the iframe room
+        // under the header — at 1 row the embedded UI collapses to a
+        // sliver. Prompt tiles can stay at 1×1.
+        minSize: c.kind === "tile" ? TILE_MIN_SIZE : undefined,
+        pinned: pinnedAgentIds.has(c.data.agentId),
+      };
+    }),
   );
 
   // Removing a card. For a pinned agent (managed by the drawer) we drop it
@@ -515,6 +558,13 @@ export function HomeGrid({ isEditMode }: HomeGridProps) {
     const candidate = candidatesById.get(id);
     if (!candidate) return;
 
+    // Native tiles aren't agents — removing one just drops it from the board
+    // (the `hidden` set), and the add-tile drawer can bring it back.
+    if (candidate.kind === "native") {
+      layout.hideTile(id);
+      return;
+    }
+
     if (!pinnedAgentIds.has(candidate.data.agentId)) {
       layout.hideTile(id);
       return;
@@ -530,6 +580,9 @@ export function HomeGrid({ isEditMode }: HomeGridProps) {
   const renderTile = (instance: TileInstance) => {
     const candidate = candidatesById.get(instance.id);
     if (!candidate) return null;
+    if (candidate.kind === "native") {
+      return <NativeTile nativeId={candidate.data.id} />;
+    }
     if (candidate.kind === "tile") {
       const agentPrompts = promptsByAgentId.get(candidate.data.agentId) ?? [];
       return (
@@ -584,20 +637,4 @@ export function HomeGrid({ isEditMode }: HomeGridProps) {
       />
     </div>
   );
-}
-
-/**
- * Lightweight presence signal for the home page layout. We avoid
- * running the full board-layout computation here — that would double
- * up auto-placement work and risk disagreeing with `HomeGrid` if the
- * two ever drifted on defaults. Honoring the user's hidden-list isn't
- * worth that cost for what's ultimately a `pt-32` vs centered toggle.
- */
-export function useHomeGridStats(orgSlug: string): {
-  hasVisibleTiles: boolean;
-} {
-  const { prompts, tiles } = useHomeNextActions(orgSlug);
-  return {
-    hasVisibleTiles: tiles.length > 0 || prompts.length > 0,
-  };
 }

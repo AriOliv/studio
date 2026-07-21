@@ -3,7 +3,7 @@
  * ones (Claude Code, Codex) that only read real files — sees them at
  * `<appRoot>/org/<volume>`, kext-free.
  *
- * Per volume: serve the WebDAV layer (over the mesh `/api/:org/fs` client) on a
+ * Per volume: serve the WebDAV layer (over the studio `/api/:org/fs` client) on a
  * loopback port, then hand that URL to a `Mounter` which has the OS mount it
  * (rclone nfsmount on macOS / rclone mount on Linux — see mounter.ts). The
  * `Mounter` is injected so this orchestration is unit-testable without a real
@@ -11,7 +11,7 @@
  *
  * Boot-safety: a mount is purely additive. Every step is wrapped so a failure
  * logs and is skipped — it never breaks the daemon, the dev server, the fs
- * routes, or the harnesses. Mounting only happens when the mesh pushes
+ * routes, or the harnesses. Mounting only happens when the studio pushes
  * `TenantConfig.orgFs` (it won't for cluster pods, whose security posture
  * blocks mounts — desktop links are the target).
  */
@@ -20,7 +20,7 @@ import { mkdirSync } from "node:fs";
 import * as net from "node:net";
 import { join, isAbsolute } from "node:path";
 import { safePath } from "../paths";
-// Portable serve-layer leaves from the mesh workspace (same cross-package
+// Portable serve-layer leaves from the studio workspace (same cross-package
 // import style entry.ts uses for harness factories).
 import { OrgFsClient } from "../../../../apps/mesh/src/file-storage/mount/client";
 import { createWebdavHandler } from "../../../../apps/mesh/src/file-storage/mount/webdav";
@@ -63,7 +63,7 @@ export interface VolumeInvalidator {
 /**
  * Starts near-realtime invalidation for a freshly-mounted volume. Injected so
  * MountManager's orchestration is unit-testable without a real rclone rc or
- * mesh (mirrors the `Mounter` seam).
+ * studio (mirrors the `Mounter` seam).
  */
 export type InvalidatorFactory = (opts: {
   client: OrgFsClient;
@@ -126,8 +126,12 @@ function freePort(): Promise<number> {
  */
 export function resolveMountPath(appRoot: string, p: string): string | null {
   const orgRoot = join(appRoot, "org");
+  // Route absolute paths through the same resolve-then-clamp check relative
+  // paths get below — a raw `startsWith(appRoot)` never normalizes `..`
+  // segments, so e.g. "<appRoot>/../../etc" passes the prefix check while
+  // actually resolving outside appRoot.
   if (isAbsolute(p)) {
-    return p.startsWith(`${appRoot}/`) || p === appRoot ? p : null;
+    return safePath(appRoot, appRoot, p);
   }
   return safePath(appRoot, orgRoot, p);
 }
@@ -143,6 +147,14 @@ export class MountManager {
     private readonly log: (msg: string, err?: unknown) => void = (m, e) =>
       e ? console.warn(`[org-fs] ${m}`, e) : console.log(`[org-fs] ${m}`),
     private readonly startInvalidator: InvalidatorFactory = defaultInvalidatorFactory,
+    /**
+     * Injectable for tests; defaults to the real OS. Gated here (not just in
+     * mounter.ts) so a Windows daemon never calls `mountOne` at all — `active`
+     * stays empty and `list()` returns `[]`, which is what entry.ts's
+     * per-run link gate (see its docblock) relies on to keep it off rather
+     * than symlinking into an unbacked directory.
+     */
+    private readonly platform: string = process.platform,
   ) {}
 
   /** Serve + mount every configured volume. Never throws. */
@@ -150,6 +162,12 @@ export class MountManager {
     this.config = config;
     this.appRoot = appRoot;
     this.stopped = false;
+    if (this.platform === "win32") {
+      this.log(
+        `org file mounts are not supported on Windows — skipping ${config.mounts.length} volume(s) (files remain available via the Studio UI)`,
+      );
+      return;
+    }
     for (const m of config.mounts) {
       await this.mountOne(m);
     }

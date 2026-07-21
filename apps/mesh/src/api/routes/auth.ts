@@ -17,6 +17,7 @@ import {
 } from "../../auth";
 import { getDb } from "../../database";
 import { ensureUserOrganization } from "../../auth/ensure-user-organization";
+import { isAlreadyMemberError } from "../../auth/is-already-member-error";
 import { extractBrandFromDomain } from "../../auth/extract-brand";
 import { isDiscoverableDomainRecord } from "../../auth/org-assurance-policy";
 import {
@@ -24,7 +25,7 @@ import {
   findEmailProvider,
 } from "../../auth/email-providers";
 import { emailButton, emailTemplate } from "../../auth/email-template";
-import { ADMIN_ROLES } from "../../auth/roles";
+import { ADMIN_ROLES, hasAdminRole } from "../../auth/roles";
 import { isOrgArchived } from "../../core/org-archived";
 import { getBaseUrl } from "../../core/server-constants";
 import { BrandContextStorage } from "../../storage/brand-context";
@@ -245,7 +246,11 @@ app.get("/my-capabilities/:slug", async (c) => {
   }
 
   // owner / admin bypass every permission check — match AccessControl.
-  if (role === "owner" || role === "admin") {
+  // `role` can be Better Auth's comma-joined multi-role string (e.g.
+  // "admin,billing-manager"); a plain `=== "admin"` would silently deny a
+  // multi-role owner/admin the bypass, same failure mode `hasAdminRole`
+  // already guards against for AccessControl.
+  if (hasAdminRole(role)) {
     return c.json({ role, capabilities: allCapabilitiesGranted() });
   }
 
@@ -491,11 +496,9 @@ app.post("/domain-join", async (c) => {
           role: "user",
           organizationId: org.id,
         },
-      } as any);
+      } as unknown as Parameters<typeof auth.api.addMember>[0]);
     } catch (addError) {
-      const msg =
-        addError instanceof Error ? addError.message.toLowerCase() : "";
-      if (!msg.includes("already a member")) {
+      if (!isAlreadyMemberError(addError)) {
         console.error("[Auth] Domain join addMember failed:", addError);
         return c.json(
           { success: false, error: "Failed to join organization" },
@@ -636,7 +639,9 @@ app.post("/domain-setup", async (c) => {
               slug: orgSlug,
               userId: session.user.id,
             },
-          } as any)) as unknown as { id: string; slug: string } | null;
+          } as unknown as Parameters<
+            typeof auth.api.createOrganization
+          >[0])) as unknown as { id: string; slug: string } | null;
           break;
         } catch (createError) {
           const isConflict =

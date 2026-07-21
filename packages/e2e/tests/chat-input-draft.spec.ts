@@ -43,11 +43,30 @@ async function waitForChatInput(page: Page): Promise<void> {
  */
 async function typeInComposer(page: Page, text: string): Promise<void> {
   const input = page.locator(CHAT_INPUT);
-  await input.click();
-  await page.keyboard.type(text);
-  // Tiptap may take time to render the typed text, especially under load.
-  // Use a more generous timeout to avoid flakiness in CI.
-  await expect(input).toHaveText(text, { timeout: 15_000 });
+  // Tiptap can drop keystrokes typed while the editor re-renders under CI
+  // load (observed on main: "thread b" landing as "threa" — the tail of the
+  // burst swallowed mid-render, identically across all Playwright retries,
+  // so a longer timeout alone can't save an assertion once keys are lost).
+  // Self-heal instead: every attempt replaces the WHOLE content (select-all
+  // + delete + retype — every call site types full replacement text, never
+  // appends), verifies quickly, and only the last attempt fails the test.
+  const ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    await input.click();
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.press("Delete");
+    // A small inter-key delay yields to the event loop between keystrokes,
+    // shrinking the window where a re-render can eat the rest of the burst.
+    await page.keyboard.type(text, { delay: 10 });
+    try {
+      await expect(input).toHaveText(text, {
+        timeout: attempt < ATTEMPTS ? 3_000 : 15_000,
+      });
+      return;
+    } catch (error) {
+      if (attempt === ATTEMPTS) throw error;
+    }
+  }
 }
 
 /** Read the visible text content of the chat input. */
@@ -284,16 +303,24 @@ test.describe("chat input draft persistence", () => {
 
   test("drafts are isolated per thread", async ({ authedPage }) => {
     const { page, orgSlug } = authedPage;
-    const taskA = await openNewThread(page, orgSlug, "thread a");
-    await gotoThreadIdle(page, orgSlug, taskA);
+    // Two distinct, client-minted thread ids reached by direct navigation
+    // instead of two home-composer submits. The org-home resolver reuses the
+    // Super Agent's existing untitled "New chat" (findReusableNewChat), and a
+    // thread only gets titled after a real model turn — which never happens in
+    // e2e — so a second home submit would land back on the FIRST thread and
+    // collapse this test to one. Direct navigation guarantees two separate
+    // threads, which is all per-thread draft isolation (sessionStorage keyed by
+    // thread id) actually needs; no submit required.
+    const taskA = crypto.randomUUID();
+    const taskB = crypto.randomUUID();
+
+    await page.goto(`/${orgSlug}/${taskA}`);
+    await waitForChatInput(page);
     await clearComposer(page);
     await typeInComposer(page, "draft for A");
 
-    // Start a second thread via the home composer. Then land on it in idle
-    // state so we can type without the streaming-disabled editor swallowing
-    // input.
-    const taskB = await openNewThread(page, orgSlug, "thread b");
-    await gotoThreadIdle(page, orgSlug, taskB);
+    await page.goto(`/${orgSlug}/${taskB}`);
+    await waitForChatInput(page);
     await clearComposer(page);
     await typeInComposer(page, "draft for B");
 

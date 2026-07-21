@@ -9,7 +9,7 @@ type McpCallTool = (req: {
 const REFRESH_GRANT_METADATA_ERROR =
   "GitHub MCP did not return refreshable repo grant metadata";
 
-function nonEmptyString(value: unknown): string | null {
+export function nonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
   }
@@ -17,7 +17,7 @@ function nonEmptyString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function isHttpTokenEndpoint(value: string): boolean {
+export function isHttpTokenEndpoint(value: string): boolean {
   try {
     const url = new URL(value);
     return (
@@ -30,7 +30,7 @@ function isHttpTokenEndpoint(value: string): boolean {
   }
 }
 
-function normalizeRepositoryId(value: unknown): number | undefined {
+export function normalizeRepositoryId(value: unknown): number | undefined {
   return typeof value === "number" &&
     Number.isFinite(value) &&
     Number.isInteger(value) &&
@@ -47,6 +47,8 @@ export async function provisionRepoScopedGithubConnection(params: {
   repo: string;
   githubCallTool: McpCallTool;
   selfCallTool: McpCallTool;
+  /** Mark the connection as available to every agent ("Add repo" flow). */
+  orgShared?: boolean;
 }): Promise<{ childConnectionId: string }> {
   const {
     orgSlug,
@@ -56,6 +58,7 @@ export async function provisionRepoScopedGithubConnection(params: {
     repo,
     githubCallTool,
     selfCallTool,
+    orgShared,
   } = params;
 
   const mintRes = (await githubCallTool({
@@ -140,6 +143,7 @@ export async function provisionRepoScopedGithubConnection(params: {
         connection_type: sourceConnection.connection_type,
         connection_url: sourceConnection.connection_url,
         metadata: {
+          ...(orgShared ? { orgShared: true } : {}),
           repoScope: {
             installationId,
             repositoryId,

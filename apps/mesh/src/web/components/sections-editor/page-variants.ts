@@ -8,6 +8,7 @@ import type { RawSection } from "./section-types";
 import {
   defaultVariantRule,
   PAGE_MULTIVARIATE_FLAG_RESOLVE_TYPE,
+  SECTION_MULTIVARIATE_RESOLVE_TYPE,
 } from "./section-types";
 
 const PAGE_RESOLVE_TYPES = new Set([
@@ -31,6 +32,26 @@ export function isPageMultivariateSectionArrayField(
         ref.schema?.properties?.variants?.items?.properties?.value;
       return valueField?.type === "array";
     }) ?? false
+  );
+}
+
+/**
+ * True when a value is a section-level multivariate flag wrapper —
+ * `{ __resolveType: "website/flags/multivariate/section.ts", variants: [...] }`.
+ *
+ * This is the shape a saved/global block takes when it wraps a single section
+ * in variants (each `{ value: Section, rule: Matcher }`). It must render with
+ * the variant editor, not the generic array editor.
+ */
+export function isSectionMultivariateWrapperValue(value: unknown): value is {
+  __resolveType: string;
+  variants: Array<Record<string, unknown>>;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  return (
+    obj.__resolveType === SECTION_MULTIVARIATE_RESOLVE_TYPE &&
+    Array.isArray(obj.variants)
   );
 }
 
@@ -213,6 +234,22 @@ export function getLastVariantIndex(
 ): number {
   const variants = updatedSections.variants;
   return Array.isArray(variants) ? variants.length - 1 : 1;
+}
+
+/**
+ * Insert a clone of the variant at `variantIndex` immediately after it (rule and
+ * sections included). Returns the next variants array, or null when the source
+ * variant is missing.
+ */
+export function duplicatePageVariantEntry(
+  variants: Array<Record<string, unknown>>,
+  variantIndex: number,
+): Array<Record<string, unknown>> | null {
+  const source = variants[variantIndex];
+  if (!source) return null;
+  const next = [...variants];
+  next.splice(variantIndex + 1, 0, structuredClone(source));
+  return next;
 }
 
 /** Returns true when the variant entry carries a targeting rule. */

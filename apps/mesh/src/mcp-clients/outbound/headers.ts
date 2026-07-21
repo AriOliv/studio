@@ -63,7 +63,7 @@ function stripBindingMetadata(
  * Handles configuration token issuance and OAuth token refresh
  *
  * @param connection - Connection entity from database
- * @param ctx - Mesh context
+ * @param ctx - Studio context
  * @param superUser - Whether to use superuser mode for background processes
  * @returns Headers object ready to be used in HTTP requests
  */
@@ -159,6 +159,15 @@ async function _buildRequestHeaders(
     ...(ctx.metadata.wellKnownForwardableHeaders ?? {}),
     "x-request-id": ctx.metadata.requestId,
   };
+
+  // Forward per-run metadata (e.g. from a webhook trigger) so a downstream MCP
+  // server can read run-scoped context from the request instead of a tool arg.
+  if (
+    ctx.metadata.runMetadata &&
+    Object.keys(ctx.metadata.runMetadata).length > 0
+  ) {
+    headers["x-mesh-run-metadata"] = JSON.stringify(ctx.metadata.runMetadata);
+  }
 
   // Try to get cached token from downstream_tokens first
   // This supports OAuth token refresh for connections that use OAuth

@@ -4,8 +4,14 @@ import {
   blockComponentName,
   buildBlogBlock,
   discoverBlogBlockTypes,
+  emptyBlogPayload,
   listPostsWithMeta,
+  missingPostFields,
+  relationPickerState,
+  removeCategoryFromPost,
+  renameCategoryOnPost,
   replaceCategoryOnPost,
+  stampPostModified,
 } from "./blog-data";
 import type { LiveMeta } from "@/web/components/sections-editor/resolve-schema";
 
@@ -227,6 +233,8 @@ describe("listPostsWithMeta", () => {
         date: "2024-01-02",
         categorySlugs: ["news"],
         authorEmails: ["ada@x.com"],
+        // no excerpt or cover image on this fixture
+        missing: ["Excerpt", "Cover image"],
       },
     ]);
   });
@@ -271,6 +279,214 @@ describe("listPostsWithMeta", () => {
     expect(listPostsWithMeta(decofile).map((p) => p.key)).toEqual([
       "collections/blog/posts/a",
     ]);
+  });
+});
+
+describe("missingPostFields", () => {
+  test("returns empty for a complete post", () => {
+    expect(
+      missingPostFields({
+        title: "Hello",
+        slug: "hello",
+        categories: [{ name: "News", slug: "news" }],
+        excerpt: "A short summary.",
+        image: "https://cdn/cover.jpg",
+      }),
+    ).toEqual([]);
+  });
+
+  test("lists every missing required field in order", () => {
+    expect(missingPostFields({})).toEqual([
+      "Title",
+      "Slug",
+      "Category",
+      "Excerpt",
+      "Cover image",
+    ]);
+  });
+
+  test("treats whitespace-only strings as missing", () => {
+    expect(
+      missingPostFields({
+        title: "   ",
+        slug: "hello",
+        categories: [{ slug: "news" }],
+        excerpt: "\n\t ",
+        image: "https://cdn/cover.jpg",
+      }),
+    ).toEqual(["Title", "Excerpt"]);
+  });
+
+  test("needs at least one category with a slug", () => {
+    expect(
+      missingPostFields({
+        title: "T",
+        slug: "s",
+        categories: [{ name: "No slug" }],
+        excerpt: "e",
+        image: "https://cdn/cover.jpg",
+      }),
+    ).toEqual(["Category"]);
+  });
+
+  test("requires a cover image", () => {
+    expect(
+      missingPostFields({
+        title: "T",
+        slug: "s",
+        categories: ["news"],
+        excerpt: "e",
+      }),
+    ).toEqual(["Cover image"]);
+  });
+
+  test("accepts plain-string categories", () => {
+    expect(
+      missingPostFields({
+        title: "T",
+        slug: "s",
+        categories: ["news"],
+        excerpt: "e",
+        image: "https://cdn/cover.jpg",
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe("relationPickerState", () => {
+  const records = [
+    {
+      key: "collections/blog/authors/a",
+      payload: {
+        name: "Ada",
+        type: "Person",
+        email: "ada@x.com",
+        jobTitle: "Engineer",
+        company: "Acme",
+        avatar: "ada.png",
+      },
+    },
+    {
+      key: "collections/blog/authors/b",
+      payload: { name: "No Mail", email: "" },
+    },
+  ];
+  const args = {
+    records,
+    valueField: "email",
+    toRef: (payload: Record<string, unknown>) => ({ ...payload }),
+  };
+
+  test("options are keyed by record key and labeled by name", () => {
+    const { options } = relationPickerState({ ...args, selected: [] });
+    expect(options).toEqual([
+      { value: "collections/blog/authors/a", label: "Ada" },
+      { value: "collections/blog/authors/b", label: "No Mail" },
+    ]);
+  });
+
+  test("resolves a selected ref by its identity field", () => {
+    const { selectedValues } = relationPickerState({
+      ...args,
+      selected: [{ name: "Stale Name", email: "ada@x.com" }],
+    });
+    expect(selectedValues).toEqual(["collections/blog/authors/a"]);
+  });
+
+  test("falls back to the name when the identity field is empty", () => {
+    const { selectedValues } = relationPickerState({
+      ...args,
+      selected: [{ name: "No Mail", email: "" }],
+    });
+    expect(selectedValues).toEqual(["collections/blog/authors/b"]);
+  });
+
+  test("tolerates plain-string refs (categories store bare slugs)", () => {
+    const { selectedValues } = relationPickerState({
+      records: [
+        {
+          key: "collections/blog/categories/c",
+          payload: { name: "News", slug: "news" },
+        },
+      ],
+      valueField: "slug",
+      toRef: (payload: Record<string, unknown>) => ({
+        name: payload.name,
+        slug: payload.slug,
+      }),
+      selected: ["news"],
+    });
+    expect(selectedValues).toEqual(["collections/blog/categories/c"]);
+  });
+
+  test("maps picked keys back through toRef — full record for authors", () => {
+    const { refsForValues } = relationPickerState({ ...args, selected: [] });
+    expect(
+      refsForValues([
+        "collections/blog/authors/a",
+        "collections/blog/authors/b",
+      ]),
+    ).toEqual([
+      {
+        name: "Ada",
+        type: "Person",
+        email: "ada@x.com",
+        jobTitle: "Engineer",
+        company: "Acme",
+        avatar: "ada.png",
+      },
+      { name: "No Mail", email: "" },
+    ]);
+  });
+
+  test("keeps unresolvable refs visible and round-trips them unchanged", () => {
+    const ghost = { name: "Deleted Author", email: "ghost@x.com" };
+    const { options, selectedValues, refsForValues } = relationPickerState({
+      ...args,
+      selected: [ghost],
+    });
+    expect(selectedValues).toEqual(["unresolved:0"]);
+    expect(options).toContainEqual({
+      value: "unresolved:0",
+      label: "Deleted Author",
+    });
+    const refs = refsForValues(["unresolved:0", "collections/blog/authors/a"]);
+    expect(refs[0]).toEqual(ghost);
+    expect(refs[1]).toEqual(records[0]!.payload);
+  });
+
+  test("dedupes refs that resolve to the same record", () => {
+    const { selectedValues } = relationPickerState({
+      ...args,
+      selected: [
+        { name: "Ada", email: "ada@x.com" },
+        { name: "Ada Again", email: "ada@x.com" },
+      ],
+    });
+    expect(selectedValues).toEqual(["collections/blog/authors/a"]);
+  });
+});
+
+describe("stampPostModified", () => {
+  test("sets dateModified to an ISO date-time, preserving other fields", () => {
+    const next = stampPostModified({ title: "P", slug: "p" });
+    expect(next.title).toBe("P");
+    expect(next.slug).toBe("p");
+    expect(typeof next.dateModified).toBe("string");
+    const stamp = String(next.dateModified);
+    expect(new Date(stamp).toISOString()).toBe(stamp);
+  });
+
+  test("does not mutate the input payload", () => {
+    const payload = { title: "P" };
+    stampPostModified(payload);
+    expect(payload).toEqual({ title: "P" });
+  });
+});
+
+describe("emptyBlogPayload", () => {
+  test("new authors default to type Person", () => {
+    expect(emptyBlogPayload("authors").type).toBe("Person");
   });
 });
 
@@ -333,5 +549,108 @@ describe("replaceCategoryOnPost", () => {
     expect(replaceCategoryOnPost(payload, { name: "News", slug: "news" })).toBe(
       payload,
     );
+  });
+});
+
+describe("renameCategoryOnPost", () => {
+  test("rewrites the matching slug and name, preserving others and order", () => {
+    const payload = {
+      title: "P",
+      categories: [
+        { name: "News", slug: "news" },
+        { name: "Old", slug: "old" },
+        { name: "Tips", slug: "tips" },
+      ],
+    };
+    const next = renameCategoryOnPost(payload, "old", {
+      name: "Fresh",
+      slug: "fresh",
+    });
+    expect(next.categories).toEqual([
+      { name: "News", slug: "news" },
+      { name: "Fresh", slug: "fresh" },
+      { name: "Tips", slug: "tips" },
+    ]);
+  });
+
+  test("tolerates plain-string category references", () => {
+    const payload = { categories: ["old", "tips"] };
+    const next = renameCategoryOnPost(payload, "old", {
+      name: "Fresh",
+      slug: "fresh",
+    });
+    expect(next.categories).toEqual([{ name: "Fresh", slug: "fresh" }, "tips"]);
+  });
+
+  test("collapses the duplicate when the post already had the new slug", () => {
+    const payload = {
+      categories: [
+        { name: "Old", slug: "old" },
+        { name: "Fresh", slug: "fresh" },
+      ],
+    };
+    const next = renameCategoryOnPost(payload, "old", {
+      name: "Fresh",
+      slug: "fresh",
+    });
+    expect(next.categories).toEqual([{ name: "Fresh", slug: "fresh" }]);
+  });
+
+  test("refreshes the denormalized name when the new slug precedes the old", () => {
+    const payload = {
+      categories: [
+        { name: "Stale", slug: "fresh" },
+        { name: "Old", slug: "old" },
+      ],
+    };
+    const next = renameCategoryOnPost(payload, "old", {
+      name: "Fresh",
+      slug: "fresh",
+    });
+    expect(next.categories).toEqual([{ name: "Fresh", slug: "fresh" }]);
+  });
+
+  test("is a no-op (same reference) when the old slug is absent", () => {
+    const payload = { categories: [{ name: "News", slug: "news" }] };
+    expect(
+      renameCategoryOnPost(payload, "old", { name: "Fresh", slug: "fresh" }),
+    ).toBe(payload);
+  });
+
+  test("does not mutate the input payload", () => {
+    const payload = { categories: [{ name: "Old", slug: "old" }] };
+    renameCategoryOnPost(payload, "old", { name: "Fresh", slug: "fresh" });
+    expect(payload.categories).toEqual([{ name: "Old", slug: "old" }]);
+  });
+});
+
+describe("removeCategoryFromPost", () => {
+  test("drops the matching category, keeping the rest", () => {
+    const payload = {
+      title: "P",
+      categories: [
+        { name: "News", slug: "news" },
+        { name: "Old", slug: "old" },
+      ],
+    };
+    const next = removeCategoryFromPost(payload, "old");
+    expect(next.categories).toEqual([{ name: "News", slug: "news" }]);
+  });
+
+  test("tolerates plain-string category references", () => {
+    const payload = { categories: ["news", "old"] };
+    const next = removeCategoryFromPost(payload, "old");
+    expect(next.categories).toEqual(["news"]);
+  });
+
+  test("is a no-op (same reference) when the slug is absent", () => {
+    const payload = { categories: [{ name: "News", slug: "news" }] };
+    expect(removeCategoryFromPost(payload, "old")).toBe(payload);
+  });
+
+  test("does not mutate the input payload", () => {
+    const payload = { categories: [{ name: "Old", slug: "old" }] };
+    removeCategoryFromPost(payload, "old");
+    expect(payload.categories).toEqual([{ name: "Old", slug: "old" }]);
   });
 });

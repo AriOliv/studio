@@ -40,6 +40,7 @@ import {
   buildLoaderInvokeUrl,
   parseLoaderInvokeRequest,
 } from "../../lib/loader-invoke";
+import { loopbackPreviewTarget } from "../../lib/loopback-preview";
 import {
   GitPushAuthError,
   parseGithubRepoFromMetadata,
@@ -50,7 +51,7 @@ import {
 
 interface VmClaim {
   claimName: string;
-  /** Null when no sandbox runner is configured on this mesh instance. */
+  /** Null when no sandbox runner is configured on this studio instance. */
   runner: SandboxProvider | null;
   virtualMcpId: string;
   branch: string;
@@ -65,14 +66,21 @@ type VmEnv = Env & { Variables: Env["Variables"] & { vmClaim: VmClaim } };
 const SANDBOX_BRANCH_NAME = /^[a-zA-Z0-9][a-zA-Z0-9/._-]*$/;
 
 function assertSandboxBranchParam(branch: string): void {
+  // "thread:<id>" is a synthetic sandbox-identity branch (bound by `load_repo`
+  // for thread-scoped repos) — the daemon accepts it and never checks it out as
+  // a git ref, so the ':' is legal here even though the git-ref charset below
+  // forbids it. Validate the id part after the prefix.
+  const ref = branch.startsWith("thread:")
+    ? branch.slice("thread:".length)
+    : branch;
   if (
-    !branch ||
-    branch.length > 255 ||
-    branch.includes("..") ||
-    branch.startsWith("/") ||
-    branch.endsWith("/") ||
-    branch.endsWith(".lock") ||
-    !SANDBOX_BRANCH_NAME.test(branch)
+    !ref ||
+    ref.length > 255 ||
+    ref.includes("..") ||
+    ref.startsWith("/") ||
+    ref.endsWith("/") ||
+    ref.endsWith(".lock") ||
+    !SANDBOX_BRANCH_NAME.test(ref)
   ) {
     throw new Error(`Invalid branch name: ${branch}`);
   }
@@ -115,7 +123,7 @@ function quickFileOpSignal(c: Context<VmEnv>): AbortSignal {
  * that case; other handlers return 503 JSON via `requireRunner()`.
  */
 const resolveVmClaim = createMiddleware<VmEnv>(async (c, next) => {
-  const ctx = c.var.meshContext;
+  const ctx = c.var.studioContext;
   try {
     requireAuth(ctx);
   } catch {
@@ -228,6 +236,16 @@ async function proxyDaemon(
     signal?: AbortSignal;
     /** Map 404 to 410 (sandbox needs re-provision). */
     map404to410?: boolean;
+    /**
+     * Null out `repoDir` in the JSON response unless the resolved runner is
+     * `user-desktop`. Every daemon reports `repoDir` as its own
+     * container-internal path (`/app/repo` on agent-sandbox); only a desktop
+     * link daemon's path exists on the user's machine. The frontend uses this
+     * to build `vscode://file<repoDir>` deep links — surfacing a container path
+     * pops a "Path does not exist" error. Authoritative because it keys off the
+     * resolved runner, immune to a stale/racing frontend provider-kind.
+     */
+    redactRepoDirUnlessDesktop?: boolean;
   },
 ) {
   const runner = requireRunner(c);
@@ -308,7 +326,11 @@ async function proxyDaemon(
       }
     }
 
-    const text = await upstream.text();
+    const rawText = await upstream.text();
+    const text =
+      opts?.redactRepoDirUnlessDesktop && runner.kind !== "user-desktop"
+        ? redactRepoDir(rawText)
+        : rawText;
     const contentType =
       upstream.headers.get("content-type") ?? "application/json";
     return new Response(text, {
@@ -346,6 +368,28 @@ async function proxyDaemon(
     const message = err instanceof Error ? err.message : String(err);
     return c.json({ error: `Daemon unreachable: ${message}` }, 502);
   }
+}
+
+/**
+ * Set `repoDir` to null in a daemon config JSON payload. Returns the input
+ * unchanged if it isn't a JSON object with a `repoDir` key, so a non-JSON or
+ * error body passes through untouched.
+ */
+export function redactRepoDir(text: string): string {
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      "repoDir" in parsed
+    ) {
+      return JSON.stringify({ ...parsed, repoDir: null });
+    }
+  } catch {
+    /* not JSON — leave as-is */
+  }
+  return text;
 }
 
 async function fetchDaemonJson<T>(
@@ -456,6 +500,12 @@ export const createSandboxRoutes = () => {
       signal: quickFileOpSignal(c),
     }),
   );
+  app.post("/:virtualMcpId/:branch/grep", (c) =>
+    proxyDaemon(c, "/_sandbox/grep", {
+      forwardJsonBody: true,
+      signal: quickFileOpSignal(c),
+    }),
+  );
 
   // -- Script exec/kill -----------------------------------------------------
   app.post("/:virtualMcpId/:branch/exec/:script", (c) => {
@@ -475,6 +525,9 @@ export const createSandboxRoutes = () => {
     proxyDaemon(c, "/_sandbox/config", {
       method: "GET",
       map404to410: true,
+      // A container path (`/app/repo`) is never openable on the user's
+      // machine — only surface `repoDir` for the desktop link daemon.
+      redactRepoDirUnlessDesktop: true,
     }),
   );
   app.put("/:virtualMcpId/:branch/config", (c) =>
@@ -482,6 +535,9 @@ export const createSandboxRoutes = () => {
       method: "PUT",
       forwardJsonBody: true,
       map404to410: true,
+      // No `redactRepoDirUnlessDesktop` here: the PUT response echoes the
+      // written TenantConfig (git/operator/application), which carries no
+      // `repoDir` — only the GET read handler surfaces it.
     }),
   );
 
@@ -502,11 +558,11 @@ export const createSandboxRoutes = () => {
     if (step === "start") {
       const claim = c.get("vmClaim");
       if (claim.runner) {
-        const organization = requireOrganization(c.var.meshContext);
+        const organization = requireOrganization(c.var.studioContext);
         const entries = readValidatedRuntimeEnv(claim.virtualMcpMetadata);
         try {
           await resolveAndPushEnv({
-            ctx: c.var.meshContext,
+            ctx: c.var.studioContext,
             runner: claim.runner,
             handle: claim.claimName,
             orgId: organization.id,
@@ -541,14 +597,14 @@ export const createSandboxRoutes = () => {
           data: JSON.stringify({
             kind: "failed",
             reason: "unknown",
-            message: "No sandbox runner configured on this mesh.",
+            message: "No sandbox runner configured on this studio instance.",
           } satisfies ClaimPhase),
         });
       });
     }
 
     return handleVmEvents(c as unknown as Context<Env>, {
-      ctx: c.var.meshContext,
+      ctx: c.var.studioContext,
       claimName: claim.claimName,
       runner: claim.runner,
       virtualMcpId: claim.virtualMcpId,
@@ -590,7 +646,7 @@ export const createSandboxRoutes = () => {
     if (runner instanceof Response) return runner;
 
     const { claimName, virtualMcpMetadata, connectionIds } = c.get("vmClaim");
-    const ctx = c.var.meshContext;
+    const ctx = c.var.studioContext;
 
     try {
       await patchSandboxOperator(ctx, runner, claimName);
@@ -625,7 +681,7 @@ export const createSandboxRoutes = () => {
     if (runner instanceof Response) return runner;
 
     const { claimName } = c.get("vmClaim");
-    const ctx = c.var.meshContext;
+    const ctx = c.var.studioContext;
 
     try {
       await patchSandboxOperator(ctx, runner, claimName);
@@ -655,7 +711,7 @@ export const createSandboxRoutes = () => {
       if (runner instanceof Response) return runner;
 
       const { claimName, userId, projectRef } = c.get("vmClaim");
-      const ctx = c.var.meshContext;
+      const ctx = c.var.studioContext;
 
       try {
         const body = (await c.req.json().catch(() => ({}))) as {
@@ -733,9 +789,12 @@ export const createSandboxRoutes = () => {
     }
 
     const base = previewUrl.replace(/\/+$/, "");
+    const loopback = loopbackPreviewTarget(`${base}${path}`);
     let upstream: Response;
     try {
-      upstream = await fetch(`${base}${path}`);
+      upstream = await fetch(loopback?.url ?? `${base}${path}`, {
+        ...(loopback ? { headers: { host: loopback.hostHeader } } : {}),
+      });
     } catch {
       return c.json({ error: "Preview unreachable" }, 502);
     }
@@ -793,17 +852,19 @@ export const createSandboxRoutes = () => {
         return c.json({ error: "Invalid or missing __resolveType" }, 400);
       }
 
+      const invokeUrl = buildLoaderInvokeUrl(previewUrl, invoke.resolveType);
+      const loopback = loopbackPreviewTarget(invokeUrl);
       let upstream: Response;
       try {
-        upstream = await fetch(
-          buildLoaderInvokeUrl(previewUrl, invoke.resolveType),
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(invoke.payload),
-            signal: AbortSignal.timeout(30_000),
+        upstream = await fetch(loopback?.url ?? invokeUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(loopback ? { host: loopback.hostHeader } : {}),
           },
-        );
+          body: JSON.stringify(invoke.payload),
+          signal: AbortSignal.timeout(30_000),
+        });
       } catch {
         return c.json({ error: "Preview unreachable" }, 502);
       }

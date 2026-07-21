@@ -49,6 +49,15 @@ function domainHref(domain: string): string {
   return domain.startsWith("http") ? domain : `https://${domain}`;
 }
 
+function getColorEntries(
+  colors?: BrandColors | null,
+): Array<[keyof BrandColors, string]> {
+  if (!colors) return [];
+  return (Object.entries(colors) as Array<[keyof BrandColors, string]>).filter(
+    ([, v]) => typeof v === "string" && v.trim().length > 0,
+  );
+}
+
 function SectionLabel({ children }: { children: string }) {
   return (
     <span className="text-sm font-medium text-foreground">{children}</span>
@@ -120,9 +129,7 @@ function BrandLogo({
 }
 
 function ColorStrip({ colors }: { colors: BrandColors }) {
-  const entries = (
-    Object.entries(colors) as Array<[keyof BrandColors, string]>
-  ).filter(([, v]) => typeof v === "string" && v.trim().length > 0);
+  const entries = getColorEntries(colors);
   if (entries.length === 0) return null;
   return (
     <div className="flex h-1.5">
@@ -160,11 +167,7 @@ function BrandCard({
   showDefaultBadge?: boolean;
   isDefault?: boolean;
 }) {
-  const colorEntries = colors
-    ? (Object.entries(colors) as Array<[keyof BrandColors, string]>).filter(
-        ([, v]) => typeof v === "string" && v.trim().length > 0,
-      )
-    : [];
+  const colorEntries = getColorEntries(colors);
   const fontEntries = fonts
     ? (Object.entries(fonts) as Array<[keyof BrandFonts, string]>).filter(
         ([, v]) => typeof v === "string" && v.trim().length > 0,
@@ -261,11 +264,7 @@ export function BrandContextPart({ part, latency }: BrandContextPartProps) {
         title="Brand extraction failed"
         summary={result?.error ?? "Unknown error"}
         state="error"
-        trailing={
-          latency != null && latency > 0 ? (
-            <LatencyLabel latency={latency} />
-          ) : undefined
-        }
+        trailing={<LatencyLabel latency={latency} />}
       />
     );
   }
@@ -277,11 +276,7 @@ export function BrandContextPart({ part, latency }: BrandContextPartProps) {
         title={result?.name ? `Brand set: ${result.name}` : "Brand context set"}
         summary={result?.domain}
         state="idle"
-        trailing={
-          latency != null && latency > 0 ? (
-            <LatencyLabel latency={latency} />
-          ) : undefined
-        }
+        trailing={<LatencyLabel latency={latency} />}
       />
       <BrandCard
         logo={result?.logo}
@@ -341,11 +336,7 @@ export function BrandContextGetPart({
         icon={<Palette />}
         title="Couldn't load brand"
         state="error"
-        trailing={
-          latency != null && latency > 0 ? (
-            <LatencyLabel latency={latency} />
-          ) : undefined
-        }
+        trailing={<LatencyLabel latency={latency} />}
       />
     );
   }
@@ -357,11 +348,7 @@ export function BrandContextGetPart({
         title={result.name ? `Brand · ${result.name}` : "Brand"}
         summary={result.domain}
         state="idle"
-        trailing={
-          latency != null && latency > 0 ? (
-            <LatencyLabel latency={latency} />
-          ) : undefined
-        }
+        trailing={<LatencyLabel latency={latency} />}
       />
       <BrandCard
         logo={result.logo}
@@ -413,11 +400,7 @@ export function BrandContextListPart({
         icon={<Palette />}
         title="Couldn't load brands"
         state="error"
-        trailing={
-          latency != null && latency > 0 ? (
-            <LatencyLabel latency={latency} />
-          ) : undefined
-        }
+        trailing={<LatencyLabel latency={latency} />}
       />
     );
   }
@@ -429,11 +412,7 @@ export function BrandContextListPart({
         title="No brands yet"
         summary="The organization hasn't set up any brand context."
         state="idle"
-        trailing={
-          latency != null && latency > 0 ? (
-            <LatencyLabel latency={latency} />
-          ) : undefined
-        }
+        trailing={<LatencyLabel latency={latency} />}
       />
     );
   }
@@ -444,21 +423,11 @@ export function BrandContextListPart({
         icon={<Palette className="text-fuchsia-500" />}
         title={items.length === 1 ? "1 brand" : `${items.length} brands`}
         state="idle"
-        trailing={
-          latency != null && latency > 0 ? (
-            <LatencyLabel latency={latency} />
-          ) : undefined
-        }
+        trailing={<LatencyLabel latency={latency} />}
       />
       <div className="mt-2 flex flex-col gap-1.5">
         {items.map((brand) => {
-          const colorEntries = brand.colors
-            ? (
-                Object.entries(brand.colors) as Array<
-                  [keyof BrandColors, string]
-                >
-              ).filter(([, v]) => typeof v === "string" && v.trim().length > 0)
-            : [];
+          const colorEntries = getColorEntries(brand.colors);
           return (
             <div
               key={brand.id ?? `${brand.name}-${brand.domain}`}

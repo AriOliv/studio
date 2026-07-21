@@ -25,6 +25,10 @@ import {
   GLOB_RESULT_LIMIT,
   GLOB_MAX_RESULT_LIMIT,
   resolveGlobResultLimit,
+  GREP_RESULT_LIMIT,
+  GREP_MAX_RESULT_LIMIT,
+  resolveGrepResultLimit,
+  toRepoRelativePath,
 } from "./fs";
 
 const hasRg = spawnSync("which", ["rg"]).status === 0;
@@ -277,6 +281,116 @@ describe("fs handlers", () => {
     expect(body.results).toContain("hello world");
   });
 
+  (hasRg ? it : it.skip)(
+    "grep: content rows use repo-relative paths",
+    async () => {
+      mkdirSync(join(appRoot, "src"), { recursive: true });
+      writeFileSync(join(appRoot, "src/needle.txt"), "hello world\n");
+      const h = makeGrepHandler({ appRoot, repoDir: appRoot });
+      const res = await h(
+        post("/_sandbox/grep", {
+          pattern: "hello",
+          output_mode: "content",
+        }),
+      );
+      const body = (await res.json()) as { results: string };
+      // Repo-relative (no absolute appRoot prefix), so the UI/agents can map
+      // the hit straight onto glob paths.
+      expect(body.results).toBe("src/needle.txt:1:hello world");
+    },
+  );
+
+  (hasRg ? it : it.skip)(
+    "grep: files mode uses repo-relative paths",
+    async () => {
+      mkdirSync(join(appRoot, "src"), { recursive: true });
+      writeFileSync(join(appRoot, "src/needle.txt"), "hello world\n");
+      const h = makeGrepHandler({ appRoot, repoDir: appRoot });
+      const res = await h(
+        post("/_sandbox/grep", { pattern: "hello", output_mode: "files" }),
+      );
+      const body = (await res.json()) as { results: string };
+      expect(body.results).toBe("src/needle.txt");
+    },
+  );
+
+  (hasRg ? it : it.skip)(
+    "grep: fixed_strings matches the pattern literally",
+    async () => {
+      writeFileSync(join(appRoot, "dots.txt"), "a.b\naxb\n");
+      const h = makeGrepHandler({ appRoot, repoDir: appRoot });
+      const res = await h(
+        post("/_sandbox/grep", {
+          pattern: "a.b",
+          output_mode: "content",
+          fixed_strings: true,
+        }),
+      );
+      const body = (await res.json()) as { results: string };
+      // Without -F the regexp "a.b" would also match "axb"; with it, only the
+      // literal "a.b" line matches.
+      expect(body.results).toBe("dots.txt:1:a.b");
+    },
+  );
+
+  (hasRg ? it : it.skip)(
+    "grep: content rows stay repoDir-relative (not searchPath-relative) when a subdir path is searched",
+    async () => {
+      mkdirSync(join(appRoot, "src"), { recursive: true });
+      writeFileSync(join(appRoot, "src/needle.txt"), "hello world\n");
+      const h = makeGrepHandler({ appRoot, repoDir: appRoot });
+      const res = await h(
+        post("/_sandbox/grep", {
+          pattern: "hello",
+          output_mode: "content",
+          path: "src",
+        }),
+      );
+      const body = (await res.json()) as { results: string };
+      // Relative to repoDir (the workspace root), not the narrower searchPath
+      // — so the "src/" prefix is kept and the row maps onto the same paths
+      // glob returns.
+      expect(body.results).toBe("src/needle.txt:1:hello world");
+    },
+  );
+
+  (hasRg ? it : it.skip)(
+    "grep: context rows (-C) are relativized despite their '-' separator",
+    async () => {
+      writeFileSync(join(appRoot, "ctx.txt"), "before\nhello world\nafter\n");
+      const h = makeGrepHandler({ appRoot, repoDir: appRoot });
+      const res = await h(
+        post("/_sandbox/grep", {
+          pattern: "hello",
+          output_mode: "content",
+          context: 1,
+        }),
+      );
+      const body = (await res.json()) as { results: string };
+      // rg emits context rows as `path-line-text` (vs `path:line:text` for the
+      // match itself) — every row's path must still be stripped to
+      // repo-relative, not just the ":"-delimited match row.
+      for (const row of body.results.split("\n")) {
+        if (row === "--") continue;
+        expect(row.startsWith(appRoot)).toBe(false);
+        expect(row.startsWith("ctx.txt")).toBe(true);
+      }
+    },
+  );
+
+  (hasRg ? it : it.skip)(
+    "grep: a colon in the filename doesn't defeat relativization",
+    async () => {
+      writeFileSync(join(appRoot, "foo:bar.txt"), "hello world\n");
+      const h = makeGrepHandler({ appRoot, repoDir: appRoot });
+      const res = await h(
+        post("/_sandbox/grep", { pattern: "hello", output_mode: "content" }),
+      );
+      const body = (await res.json()) as { results: string };
+      expect(body.results).toBe("foo:bar.txt:1:hello world");
+    },
+  );
+
   (hasRg ? it : it.skip)("glob: returns matching file names", async () => {
     writeFileSync(join(appRoot, "x.txt"), "");
     const h = makeGlobHandler({ appRoot, repoDir: appRoot });
@@ -378,6 +492,16 @@ describe("fs handlers", () => {
     );
   });
 
+  it("resolveGrepResultLimit caps at GREP_MAX_RESULT_LIMIT", () => {
+    expect(resolveGrepResultLimit(undefined)).toBe(GREP_RESULT_LIMIT);
+    expect(resolveGrepResultLimit(GREP_MAX_RESULT_LIMIT + 999)).toBe(
+      GREP_MAX_RESULT_LIMIT,
+    );
+    expect(resolveGrepResultLimit(0)).toBe(GREP_RESULT_LIMIT);
+    expect(resolveGrepResultLimit(-5)).toBe(GREP_RESULT_LIMIT);
+    expect(resolveGrepResultLimit(50)).toBe(50);
+  });
+
   it("glob: default limit remains GLOB_RESULT_LIMIT for agents", async () => {
     for (let i = 0; i < GLOB_RESULT_LIMIT + 5; i++) {
       writeFileSync(join(appRoot, `agent-${i}.txt`), "");
@@ -407,6 +531,47 @@ describe("fs handlers", () => {
     const dirs = new Set<string>();
     registerGlobAncestorDirectories("a/b/c/d", 3, dirs, false);
     expect([...dirs].sort()).toEqual(["a", "a/b", "a/b/c"]);
+  });
+
+  it("toRepoRelativePath: strips the repoDir prefix on POSIX-style paths", () => {
+    expect(toRepoRelativePath("/repo/needle.txt", "/repo", "/repo")).toBe(
+      "needle.txt",
+    );
+  });
+
+  it("toRepoRelativePath: strips a Windows-style backslash repoDir prefix", () => {
+    // Simulates what path.join/path.relative produce on win32, regardless
+    // of the host OS actually running this test — this is the exact shape
+    // that broke the naive `${repoDir}/`-prefixed startsWith check (mixed
+    // separators never matched, so the full absolute path leaked into the
+    // wire response instead of a repo-relative one).
+    expect(
+      toRepoRelativePath(
+        "C:\\Users\\runner\\repo\\needle.txt",
+        "C:\\Users\\runner\\repo",
+        "C:\\Users\\runner\\repo",
+      ),
+    ).toBe("needle.txt");
+  });
+
+  it("toRepoRelativePath: falls back to the searchPath prefix when abs is outside repoDir", () => {
+    expect(
+      toRepoRelativePath(
+        "C:\\Users\\runner\\app\\dev\\index.ts",
+        "C:\\Users\\runner\\app\\dev",
+        "C:\\Users\\runner\\app\\repo",
+      ),
+    ).toBe("index.ts");
+  });
+
+  it("toRepoRelativePath: normalizes nested Windows subdirectories to forward slashes", () => {
+    expect(
+      toRepoRelativePath(
+        "C:\\Users\\runner\\repo\\.deco\\tools\\ARCHIVE_EMAIL.json",
+        "C:\\Users\\runner\\repo",
+        "C:\\Users\\runner\\repo",
+      ),
+    ).toBe(".deco/tools/ARCHIVE_EMAIL.json");
   });
 
   it("collectEmptyDirectories ignores parents of nested directories", () => {

@@ -56,10 +56,12 @@ import {
   buildPublicOrgFs,
   getPublicSets,
   isPublicVolume,
+  publicVolumeForSet,
 } from "@/file-storage/public-sets";
+import { buildSkillCatalog } from "@/file-storage/skill-catalog";
 import { detectContentType } from "@/object-storage/key-utils";
 
-type Variables = { meshContext: StudioContext };
+type Variables = { studioContext: StudioContext };
 type Ctx = Context<{ Variables: Variables }>;
 
 /** Hard ceiling on a single uploaded body (matches the per-file quota). */
@@ -105,7 +107,11 @@ function byteResponse(
       : "private, max-age=0",
   };
   if (contentType.startsWith("text/html")) {
-    headers["Content-Security-Policy"] = "sandbox allow-scripts allow-modals";
+    // TEMP(demo 2026-07-08, REVERT): allow-same-origin gives previews a real
+    // origin so nested frame-ancestors checks pass — but re-enables
+    // credentialed same-origin API calls from member HTML.
+    headers["Content-Security-Policy"] =
+      "sandbox allow-scripts allow-modals allow-same-origin";
   }
   return c.body(Buffer.from(bytes), 200, headers);
 }
@@ -373,7 +379,7 @@ export const createOrgFsRoutes = (deps: OrgFsRoutesDeps = {}) => {
     volume: string,
     permission: "ORG_FS_READ" | "ORG_FS_WRITE",
   ): Promise<Resolved> => {
-    const ctx = c.get("meshContext");
+    const ctx = c.get("studioContext");
     if (!ctx.auth?.user?.id) {
       return { ok: false, res: c.json({ error: "Unauthorized" }, 401) };
     }
@@ -411,7 +417,7 @@ export const createOrgFsRoutes = (deps: OrgFsRoutesDeps = {}) => {
   // The deployment's configured public skill sets (names only — the UI's
   // root listing). Member-gated like any read.
   app.get("/public-sets", async (c) => {
-    const ctx = c.get("meshContext");
+    const ctx = c.get("studioContext");
     if (!ctx.auth?.user?.id) {
       return c.json({ error: "Unauthorized" }, 401);
     }
@@ -419,10 +425,10 @@ export const createOrgFsRoutes = (deps: OrgFsRoutesDeps = {}) => {
   });
 
   // Most recently written files across every volume, newest first — the
-  // Library page's "Recently added"/"All files" feed. Volume-less by design,
-  // so it lives above the `/:volume/*` routes.
+  // Library page's "Recently added" feed. Volume-less by design, so it
+  // lives above the `/:volume/*` routes.
   app.get("/recent", async (c) => {
-    const ctx = c.get("meshContext");
+    const ctx = c.get("studioContext");
     if (!ctx.auth?.user?.id) {
       return c.json({ error: "Unauthorized" }, 401);
     }
@@ -441,6 +447,78 @@ export const createOrgFsRoutes = (deps: OrgFsRoutesDeps = {}) => {
     try {
       return c.json({
         entries: await ctx.orgFs.recentWithEffectivePublic(limit),
+      });
+    } catch (err) {
+      return fsErrorResponse(c, err);
+    }
+  });
+
+  // Path search (case-insensitive substring) across every volume, newest
+  // first — the Library's search box. Volume-less by design, so it lives
+  // above the `/:volume/*` routes.
+  app.get("/search", async (c) => {
+    const ctx = c.get("studioContext");
+    if (!ctx.auth?.user?.id) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+    if (!ctx.organization?.id) {
+      return c.json({ error: "Organization required" }, 400);
+    }
+    const denied = await checkPermission(c, ctx, "ORG_FS_READ");
+    if (denied) return denied;
+    if (!ctx.orgFs) {
+      return c.json({ error: "Object storage not configured" }, 503);
+    }
+    const q = (c.req.query("q") ?? "").trim();
+    if (!q) return c.json({ entries: [] });
+    const limit = Math.min(
+      Math.max(Number(c.req.query("limit")) || DEFAULT_RECENT_LIMIT, 1),
+      MAX_RECENT_LIMIT,
+    );
+    try {
+      // Two manifests: the org's own volumes plus the deployment's shared
+      // public sets (pseudo-org, gated to the configured set volumes like
+      // the browse routes). `seq` is one global sequence, so interleaving
+      // by seq desc preserves write order across both.
+      const publicVolumes = getPublicSets().map((s) =>
+        publicVolumeForSet(s.set),
+      );
+      const [own, pub] = await Promise.all([
+        ctx.orgFs.searchWithEffectivePublic(q, limit),
+        publicVolumes.length > 0
+          ? buildPublicOrgFs(ctx).searchWithEffectivePublic(
+              q,
+              limit,
+              publicVolumes,
+            )
+          : [],
+      ]);
+      const entries = [...own, ...pub]
+        .sort((a, b) => Number(BigInt(b.seq) - BigInt(a.seq)))
+        .slice(0, limit);
+      return c.json({ entries });
+    } catch (err) {
+      return fsErrorResponse(c, err);
+    }
+  });
+
+  // Attachable skills — the SAME catalog the runtime surfaces in
+  // <available-skills> (buildSkillCatalog: home + home/skills + public sets), so
+  // the agent link picker and the run can never drift on what "a skill" is.
+  // Volume-less; lives above the `/:volume/*` routes. Member-gated read.
+  app.get("/skills", async (c) => {
+    const ctx = c.get("studioContext");
+    if (!ctx.auth?.user?.id) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+    if (!ctx.organization?.id) {
+      return c.json({ error: "Organization required" }, 400);
+    }
+    const denied = await checkPermission(c, ctx, "ORG_FS_READ");
+    if (denied) return denied;
+    try {
+      return c.json({
+        skills: await buildSkillCatalog(ctx, ctx.organization.id),
       });
     } catch (err) {
       return fsErrorResponse(c, err);
@@ -513,7 +591,7 @@ export const createOrgFsRoutes = (deps: OrgFsRoutesDeps = {}) => {
   });
 
   // Read a file: `?presign=1` returns a presigned URL (the mount's byte path);
-  // otherwise the bytes are streamed through mesh (convenient for the UI/dev).
+  // otherwise the bytes are streamed through studio (convenient for the UI/dev).
   //
   // Share fast-path: resolveOrgFromPath binds ctx.orgFs and lets anonymous /
   // non-member callers reach this route (its public-share carve-out). A
@@ -525,7 +603,7 @@ export const createOrgFsRoutes = (deps: OrgFsRoutesDeps = {}) => {
   app.get("/:volume/read", async (c) => {
     const volume = c.req.param("volume");
     const path = c.req.query("path") ?? "";
-    const ctx = c.get("meshContext");
+    const ctx = c.get("studioContext");
 
     let access: ReadAccess = { access: "private" };
     if (
@@ -798,7 +876,7 @@ export const createOrgFsRoutes = (deps: OrgFsRoutesDeps = {}) => {
     async (c) => {
       const volume = c.req.param("volume");
       const path = c.req.query("path") ?? "";
-      const ctx = c.get("meshContext");
+      const ctx = c.get("studioContext");
       const orgId = ctx.organization?.id;
       const orgSlug = ctx.organization?.slug ?? "";
       if (

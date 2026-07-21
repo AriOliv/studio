@@ -55,7 +55,47 @@ export function browsePathFor(
   return location.volume ? `${location.volume}/${entryPath}` : entryPath;
 }
 
+const PUBLIC_VOLUME_PREFIX = "public-";
+
+/** Set name for a `public-<set>` volume (a shared read-only set), else null. */
+export function publicSetOf(volume: string): string | null {
+  return volume.startsWith(PUBLIC_VOLUME_PREFIX)
+    ? volume.slice(PUBLIC_VOLUME_PREFIX.length)
+    : null;
+}
+
+/** Browse path for a cross-volume feed entry (search/recent): `public-<set>`
+ *  volumes map back to the `public/<set>` browse namespace. */
+export function browsePathForEntry(volume: string, entryPath: string): string {
+  const set = publicSetOf(volume);
+  return set ? `public/${set}/${entryPath}` : `${volume}/${entryPath}`;
+}
+
 export function basename(path: string): string {
   const i = path.lastIndexOf("/");
   return i === -1 ? path : path.slice(i + 1);
+}
+
+/**
+ * Sandbox mount path for a Library browse path — where the agent's file tools
+ * (`read`/`edit`/`grep`) actually reach the file: `org/home/…`,
+ * `org/public/<set>/…`, etc.
+ *
+ * Client mirror of the server's `orgFsSandboxPath`
+ * (`apps/mesh/src/file-storage/mount/provisioning.ts`); the browse-path →
+ * mount mapping must stay in sync with the mount table there. Returns null for
+ * the root / public-sets listing (no single file).
+ */
+export function orgFsMountPath(browsePath: string): string | null {
+  const { volume, dirPath } = parseLibraryPath(browsePath);
+  if (!volume) return null;
+  let base: string;
+  if (volume === "home") base = "org/home";
+  else if (volume === "outputs") base = "org/.outputs";
+  else if (volume === "uploads") base = "org/.uploads";
+  else {
+    const set = publicSetOf(volume);
+    base = set ? `org/public/${set}` : `org/${volume}`;
+  }
+  return dirPath ? `${base}/${dirPath}` : base;
 }

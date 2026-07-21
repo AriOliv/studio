@@ -96,7 +96,7 @@ export interface BoundAuthClient {
    * authorized SOLELY by the key's stored allowlist — it must NOT inherit the
    * owner's admin/owner role. Both `hasPermission` here and the role bypass in
    * `AccessControl.checkResource` read this single flag so every call site
-   * (REST + MCP) agrees. Absent/false for browser sessions, MCP OAuth, and mesh
+   * (REST + MCP) agrees. Absent/false for browser sessions, MCP OAuth, and studio
    * JWTs, which keep the role-based behavior.
    */
   isApiKeyPrincipal?: boolean;
@@ -142,6 +142,8 @@ export interface BoundAuthClient {
       organizationId?: string;
       limit?: number;
       offset?: number;
+      filterField?: string;
+      filterValue?: string;
     }): Promise<ListMembersResult>;
 
     updateMemberRole(data: {
@@ -250,6 +252,14 @@ export interface RequestMetadata {
   /** Custom properties from x-mesh-properties header (string key-value pairs) */
   properties?: Record<string, string>;
   wellKnownForwardableHeaders?: Record<string, string | null>;
+  /**
+   * Per-run metadata forwarded to downstream MCP tool calls as the
+   * `x-mesh-run-metadata` header (JSON). Set from a webhook trigger's
+   * `run_metadata` so a downstream server can read run-scoped context (e.g. the
+   * tenant a scheduled/triggered run acts on) without the agent passing it as a
+   * tool argument.
+   */
+  runMetadata?: Record<string, string>;
 }
 
 // ============================================================================
@@ -285,6 +295,7 @@ import { AIProviderKeyStorage } from "@/storage/ai-provider-keys";
 import { SecretStorage } from "@/storage/secrets";
 import { OrgFileConfigStorage } from "@/storage/org-file-configs";
 import { OrgSiteStorage } from "@/storage/org-sites";
+import type { TaskBoardStorage } from "@/storage/task-board";
 import type { OrgFsEntryStorage } from "@/storage/org-fs";
 import type { OrgFs } from "@/file-storage/org-fs";
 import type { KVStorage } from "@/storage/kv";
@@ -321,6 +332,7 @@ export interface MeshStorage {
   secrets: SecretStorage;
   orgFileConfigs: OrgFileConfigStorage;
   orgSites: OrgSiteStorage;
+  taskBoard: TaskBoardStorage;
   orgFsEntries: OrgFsEntryStorage;
   oauthPkceStates: OAuthPkceStateStorage;
   automations: AutomationsStorage;

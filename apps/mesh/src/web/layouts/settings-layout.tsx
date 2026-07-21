@@ -49,6 +49,7 @@ import {
   HardDrive,
 } from "@untitledui/icons";
 import { useProjectContext } from "@decocms/mesh-sdk";
+import { useT } from "@/web/i18n/use-t.ts";
 import { useCapabilities, type CapabilityId } from "@/web/hooks/use-capability";
 import { usePendingJoinRequests } from "@/web/hooks/use-join-requests";
 import { useIsMobile } from "@deco/ui/hooks/use-mobile.ts";
@@ -78,42 +79,46 @@ interface SettingsNavItem {
 }
 
 interface SettingsNavGroup {
+  /** Stable id for React keys and analytics — never localized. */
+  key: string;
   label: string;
   items: SettingsNavItem[];
 }
 
 function useSettingsSidebarGroups(): SettingsNavGroup[] {
+  const t = useT();
   const { capabilities, isPrivileged, loading, error } = useCapabilities();
   const joinRequestCount = usePendingJoinRequests().length;
 
   const groups: SettingsNavGroup[] = [
     {
-      label: "Organization",
+      key: "organization",
+      label: t("settings.nav.organization"),
       items: [
         {
           key: "general",
-          label: "General",
+          label: t("settings.nav.general"),
           icon: <Building02 size={14} />,
           to: "/$org/settings/general",
           requires: "org:manage",
         },
         {
           key: "brand-context",
-          label: "Brand Context",
+          label: t("settings.nav.brandContext"),
           icon: <BookOpen01 size={14} />,
           to: "/$org/settings/brand-context",
           requires: "org:manage",
         },
         {
           key: "ai-providers",
-          label: "AI Providers",
+          label: t("settings.nav.aiProviders"),
           icon: <CpuChip01 size={14} />,
           to: "/$org/settings/ai-providers",
           requires: "ai-providers:manage",
         },
         {
           key: "secrets",
-          label: "Secrets",
+          label: t("settings.nav.secrets"),
           icon: <Key01 size={14} />,
           to: "/$org/settings/secrets",
           requires: "secrets:manage",
@@ -122,7 +127,7 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
         // settings route redirects there.
         {
           key: "buckets",
-          label: "Buckets",
+          label: t("settings.nav.buckets"),
           icon: <HardDrive size={14} />,
           to: "/$org/settings/buckets",
           requires: "file-configs:manage",
@@ -130,30 +135,31 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
       ],
     },
     {
-      label: "Build",
+      key: "build",
+      label: t("settings.nav.build"),
       items: [
         {
           key: "connections",
-          label: "Connections",
+          label: t("settings.nav.connections"),
           icon: <ZapSquare size={14} />,
           to: "/$org/settings/connections",
         },
         {
           key: "agents",
-          label: "Agents",
+          label: t("settings.nav.agents"),
           icon: <Users03 size={14} />,
           to: "/$org/settings/agents",
         },
         {
           key: "automations",
-          label: "Automations",
+          label: t("settings.nav.automations"),
           icon: <Zap size={14} />,
           to: "/$org/settings/automations",
           requires: "automations:manage",
         },
         {
           key: "store",
-          label: "Store",
+          label: t("settings.nav.store"),
           icon: <PackageCheck size={14} />,
           to: "/$org/settings/store",
           requires: "registry:manage",
@@ -161,18 +167,19 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
       ],
     },
     {
-      label: "Manage",
+      key: "manage",
+      label: t("settings.nav.manage"),
       items: [
         {
           key: "monitor",
-          label: "Monitor",
+          label: t("settings.nav.monitor"),
           icon: <BarChart10 size={14} />,
           to: "/$org/settings/monitor",
           requires: "monitoring:view",
         },
         {
           key: "members",
-          label: "Members",
+          label: t("settings.nav.members"),
           icon: <Users03 size={14} />,
           to: "/$org/settings/members",
           requires: "members:manage",
@@ -180,7 +187,7 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
         },
         {
           key: "roles",
-          label: "Roles",
+          label: t("settings.nav.roles"),
           icon: <Shield01 size={14} />,
           to: "/$org/settings/roles",
           // Role management uses owner/admin-only Better Auth APIs.
@@ -188,7 +195,7 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
         },
         {
           key: "sso",
-          label: "Security",
+          label: t("settings.nav.security"),
           icon: <Lock01 size={14} />,
           to: "/$org/settings/sso",
           requires: "org:manage",
@@ -196,11 +203,12 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
       ],
     },
     {
-      label: "Account",
+      key: "account",
+      label: t("settings.nav.account"),
       items: [
         {
           key: "profile",
-          label: "Profile & Preferences",
+          label: t("settings.nav.profile"),
           icon: <User01 size={14} />,
           to: "/$org/settings/profile",
         },
@@ -228,8 +236,26 @@ function useSettingsSidebarGroups(): SettingsNavGroup[] {
     .filter((group) => group.items.length > 0);
 }
 
-export function SettingsSidebar() {
-  const groups = useSettingsSidebarGroups();
+/** Icon with an optional small notification dot, shared by the desktop and mobile nav item rendering. */
+function SettingsNavIcon({
+  icon,
+  badge,
+}: {
+  icon: React.ReactNode;
+  badge?: number;
+}) {
+  return (
+    <span className="relative shrink-0">
+      {icon}
+      {badge ? (
+        <span className="absolute -right-1 -top-1 size-2 rounded-full bg-destructive pointer-events-none" />
+      ) : null}
+    </span>
+  );
+}
+
+/** Resolves `$org`-templated `to` paths against the current org/pathname, shared by the desktop and mobile sidebars. */
+function useIsActiveSettingsPath() {
   const { org } = useParams({ from: "/shell/$org" });
   const pathname = useRouterState({
     select: (s) => s.location.pathname,
@@ -240,14 +266,19 @@ export function SettingsSidebar() {
     return pathname.startsWith(resolved);
   };
 
+  return { org, isActive };
+}
+
+export function SettingsSidebar() {
+  const t = useT();
+  const groups = useSettingsSidebarGroups();
+  const { org, isActive } = useIsActiveSettingsPath();
+
   return (
     <Sidebar variant="sidebar">
       <SidebarContent className="flex flex-col flex-1 mt-2 px-2 pb-2 gap-0 overflow-y-auto">
         {groups.map((group, i) => (
-          <SidebarGroup
-            key={`${group.label}-${i}`}
-            className="pt-0 pr-0 pb-0 pl-0"
-          >
+          <SidebarGroup key={group.key} className="pt-0 pr-0 pb-0 pl-0">
             {group.label && (
               <p
                 className={cn(
@@ -267,20 +298,15 @@ export function SettingsSidebar() {
                         to={item.to}
                         params={{ org }}
                         onClick={() =>
+                          // Track stable keys, not labels — labels are localized.
                           track("settings_nav_clicked", {
                             section_key: item.key,
-                            section_label: item.label,
-                            group_label: group.label || "main",
+                            group_key: group.key,
                           })
                         }
                         className="flex items-center gap-2.5 text-sm"
                       >
-                        <span className="relative shrink-0">
-                          {item.icon}
-                          {item.badge ? (
-                            <span className="absolute -right-1 -top-1 size-2 rounded-full bg-red-500 pointer-events-none" />
-                          ) : null}
-                        </span>
+                        <SettingsNavIcon icon={item.icon} badge={item.badge} />
                         <span className="truncate">{item.label}</span>
                       </Link>
                     </SidebarMenuButton>
@@ -308,7 +334,7 @@ export function SettingsSidebar() {
                   <span className="shrink-0">
                     <LogOut01 size={14} />
                   </span>
-                  <span className="truncate">Sign Out</span>
+                  <span className="truncate">{t("settings.nav.signOut")}</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
             </SidebarMenu>
@@ -327,22 +353,15 @@ export function SettingsSidebar() {
 }
 
 export function SettingsSidebarMobile({ onClose }: { onClose: () => void }) {
+  const t = useT();
   const groups = useSettingsSidebarGroups();
-  const { org } = useParams({ from: "/shell/$org" });
-  const pathname = useRouterState({
-    select: (s) => s.location.pathname,
-  });
-
-  const isActive = (to: string) => {
-    const resolved = to.replace("$org", org);
-    return pathname.startsWith(resolved);
-  };
+  const { org, isActive } = useIsActiveSettingsPath();
 
   return (
     <div className="flex flex-col h-full bg-sidebar">
       <div className="flex flex-col flex-1 overflow-y-auto px-2 py-2 gap-0.5">
         {groups.map((group, i) => (
-          <div key={`${group.label}-${i}`} className="flex flex-col gap-0.5">
+          <div key={group.key} className="flex flex-col gap-0.5">
             {group.label && (
               <p
                 className={cn(
@@ -366,12 +385,7 @@ export function SettingsSidebarMobile({ onClose }: { onClose: () => void }) {
                     : "text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground",
                 )}
               >
-                <span className="relative shrink-0">
-                  {item.icon}
-                  {item.badge ? (
-                    <span className="absolute -right-1 -top-1 size-2 rounded-full bg-red-500 pointer-events-none" />
-                  ) : null}
-                </span>
+                <SettingsNavIcon icon={item.icon} badge={item.badge} />
                 <span className="truncate">{item.label}</span>
               </Link>
             ))}
@@ -392,7 +406,7 @@ export function SettingsSidebarMobile({ onClose }: { onClose: () => void }) {
             <span className="shrink-0">
               <LogOut01 size={14} />
             </span>
-            <span className="truncate">Sign Out</span>
+            <span className="truncate">{t("settings.nav.signOut")}</span>
           </button>
         </div>
       </div>
@@ -474,9 +488,6 @@ export default function SettingsLayout() {
             <Toolbar.LeftColumn>
               <Toolbar.LogoLink />
               {isMobile && <SidebarTriggerButton />}
-              <span className="hidden md:contents">
-                <Toolbar.Nav />
-              </span>
             </Toolbar.LeftColumn>
             <Toolbar.CenterSlot />
             <Toolbar.RightColumn>
@@ -487,7 +498,9 @@ export default function SettingsLayout() {
             className="flex-1 bg-sidebar min-h-0"
             style={
               {
-                "--sidebar-width-icon": "3.5rem",
+                // Keep in sync with org-shell-layout: 3.125rem → 34px
+                // collapsed-rail buttons, matching the expanded toolbar's buttons.
+                "--sidebar-width-icon": "3.125rem",
               } as Record<string, string>
             }
           >

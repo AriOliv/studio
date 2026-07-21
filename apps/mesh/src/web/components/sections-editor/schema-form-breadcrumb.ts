@@ -26,11 +26,55 @@ function labelsMatchLoose(a: string, b: string): boolean {
   );
 }
 
-/** Breadcrumb trail when opening an array item (includes the array field label). */
+/**
+ * Whether the array's own label must stay in the breadcrumb trail so the item
+ * remains uniquely addressable.
+ *
+ * A trail of just `[itemLabel]` can't say WHICH array an item came from. That's
+ * fine for the common case — the array is an implementation detail whose list is
+ * already shown inline in the parent — but it breaks when the crumb is
+ * ambiguous, so the array label is kept as a disambiguator when EITHER:
+ *
+ * - a sibling array/drill-down field exists in the same scope
+ *   ({@link resolveActiveFieldKey} would otherwise pick the first sibling whose
+ *   item shares the crumb — e.g. two label-less arrays both fall back to
+ *   "Item N"); or
+ * - the item's own label collides with the array's display label or property
+ *   key — {@link breadcrumbPathForActiveField} strips a head crumb that matches
+ *   either, which would drop the sole crumb and lose the selection.
+ */
+function arrayCrumbNeededForDisambiguation(
+  arrayLabel: string,
+  itemLabel: string,
+  opts?: { arrayKey?: string; hasSiblingDrillDownFields?: boolean },
+): boolean {
+  return (
+    (opts?.hasSiblingDrillDownFields ?? false) ||
+    labelsMatch(itemLabel, arrayLabel) ||
+    (opts?.arrayKey != null && labelsMatch(itemLabel, opts.arrayKey))
+  );
+}
+
+/**
+ * Breadcrumb trail when opening an array item.
+ *
+ * The array field itself is an implementation detail: its list is already shown
+ * inline in the parent form, so drilling into an item jumps straight from the
+ * section to the item. We deliberately do NOT add the array's own label as a
+ * crumb — it would show a redundant "list only" step the user has to click back
+ * through (and, once nested, could even appear twice). Resolution
+ * ({@link resolveActiveFieldKey}, {@link resolveArrayItemSelection}) already
+ * matches an item by its label without the array crumb present.
+ *
+ * The exception is when the crumb would be ambiguous — see
+ * {@link arrayCrumbNeededForDisambiguation}: then the array label is kept so the
+ * right array (and item) still resolves.
+ */
 export function buildArrayDrillDownBreadcrumb(
   breadcrumbPath: string[],
   arrayLabel: string,
   itemLabel: string,
+  opts?: { arrayKey?: string; hasSiblingDrillDownFields?: boolean },
 ): string[] {
   const normalizedItem = normalizeBreadcrumbLabel(itemLabel);
   if (
@@ -42,13 +86,46 @@ export function buildArrayDrillDownBreadcrumb(
     return breadcrumbPath;
   }
   const trail = [...breadcrumbPath];
-  const hasArrayLabel = trail.some((crumb) => labelsMatch(crumb, arrayLabel));
-  if (!hasArrayLabel) trail.push(arrayLabel);
+  if (
+    arrayCrumbNeededForDisambiguation(arrayLabel, itemLabel, opts) &&
+    !trail.some((crumb) => labelsMatch(crumb, arrayLabel))
+  ) {
+    trail.push(arrayLabel);
+  }
   trail.push(itemLabel);
   return trail;
 }
 
-/** Drop crumbs consumed by the active field so children see a relative trail. */
+/**
+ * Crumbs the active field consumed — i.e. the prefix {@link breadcrumbPathForActiveField}
+ * dropped from the front of `breadcrumbPath` to produce `fieldBreadcrumbPath`.
+ *
+ * The active field receives a breadcrumb relative to itself but reports changes
+ * through an `onBreadcrumbChange` that writes the GLOBAL trail. Re-prepend this
+ * prefix to those reports so a child rebuilding the trail (e.g. ArrayField
+ * syncing an item's label while typing) doesn't silently drop the ancestor
+ * crumbs — which otherwise collapses the trail when a consumed crumb equals the
+ * child's own crumb (array labelled "Banner" + lone item labelled "Banner").
+ */
+export function consumedBreadcrumbPrefix(
+  breadcrumbPath: string[],
+  fieldBreadcrumbPath: string[],
+): string[] {
+  return breadcrumbPath.slice(
+    0,
+    breadcrumbPath.length - fieldBreadcrumbPath.length,
+  );
+}
+
+/**
+ * Drop crumbs consumed by the active field so children see a relative trail.
+ *
+ * NOTE: {@link consumedBreadcrumbPrefix} reconstructs the dropped prefix purely
+ * by length difference, which relies on the return value always being a
+ * front-suffix of `breadcrumbPath` (this only ever drops the leading crumb).
+ * Keep it that way — dropping from the middle or rewriting a crumb would make
+ * that reconstruction silently wrong.
+ */
 export function breadcrumbPathForActiveField(
   activeKey: string,
   schema: SchemaProperty,
@@ -254,18 +331,58 @@ export function isBreadcrumbInsideObject(
   );
 }
 
+/**
+ * Find the array item whose label matches `crumb`.
+ *
+ * Array items are addressed in the breadcrumb by their (mutable, non-unique)
+ * display label, so two items can resolve to the same crumb — e.g. after
+ * duplicating an item, or when the label field (name/title/alt/…) is edited to
+ * a value another item already uses. A plain `findIndex` always returns the
+ * FIRST such item, which yanks the editor away from a later item the moment its
+ * label collides with an earlier sibling (dropping focus mid-typing).
+ *
+ * `preferredIndex` is the item the caller currently has open. When it still
+ * matches the crumb we keep it, so editing a colliding label never snaps
+ * selection to a different row.
+ */
+function findItemIndexForCrumb(
+  items: unknown[],
+  itemSchema: SchemaProperty | undefined,
+  crumb: string,
+  preferredIndex?: number | null,
+): number {
+  if (
+    preferredIndex != null &&
+    preferredIndex >= 0 &&
+    preferredIndex < items.length &&
+    labelsMatch(
+      getArrayItemLabel(items[preferredIndex], preferredIndex, itemSchema),
+      crumb,
+    )
+  ) {
+    return preferredIndex;
+  }
+  return items.findIndex((item, i) =>
+    labelsMatch(getArrayItemLabel(item, i, itemSchema), crumb),
+  );
+}
+
 export function resolveArrayItemSelection(
   label: string,
   breadcrumbPath: string[],
   items: unknown[],
   itemSchema: SchemaProperty | undefined,
+  preferredIndex?: number | null,
 ): { index: number; innerPath: string[] } | null {
   if (breadcrumbPath.length === 0) return null;
 
   for (let pi = 0; pi < breadcrumbPath.length; pi++) {
     const crumb = breadcrumbPath[pi]!;
-    const index = items.findIndex((item, i) =>
-      labelsMatch(getArrayItemLabel(item, i, itemSchema), crumb),
+    const index = findItemIndexForCrumb(
+      items,
+      itemSchema,
+      crumb,
+      preferredIndex,
     );
     if (index >= 0) {
       return { index, innerPath: breadcrumbPath.slice(pi + 1) };
@@ -277,8 +394,11 @@ export function resolveArrayItemSelection(
   );
   if (labelIndex >= 0 && breadcrumbPath.length > labelIndex + 1) {
     const itemCrumb = breadcrumbPath[labelIndex + 1]!;
-    const index = items.findIndex((item, i) =>
-      labelsMatch(getArrayItemLabel(item, i, itemSchema), itemCrumb),
+    const index = findItemIndexForCrumb(
+      items,
+      itemSchema,
+      itemCrumb,
+      preferredIndex,
     );
     if (index >= 0) {
       return { index, innerPath: breadcrumbPath.slice(labelIndex + 2) };

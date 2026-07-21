@@ -39,6 +39,16 @@ export interface SandboxEvent {
   previewUrl?: string;
   /** Set on `failed`. */
   error?: string;
+  /**
+   * Registry metadata carried on create-path events so the TUI can render the
+   * correct PROJECT/BRANCH columns before the next `setPersistedSandboxes`
+   * hydration. Without these, a freshly created live row has no prior state to
+   * inherit from and falls back to the handle (which embeds the branch),
+   * showing the branch in the PROJECT column until the CLI restarts.
+   */
+  projectName?: string | null;
+  branch?: string | null;
+  sandboxPath?: string | null;
 }
 
 export interface SpawnResult {
@@ -407,7 +417,13 @@ export function createDesktopSandboxProvider(
       ...metadata,
       error: null,
     });
-    emit({ handle: input.handle, phase: "spawning" });
+    emit({
+      handle: input.handle,
+      phase: "spawning",
+      sandboxPath: workdir,
+      projectName: metadata.projectName,
+      branch: metadata.branch,
+    });
     evictIfNeeded();
     let port: number | undefined;
     let spawned: SpawnResult | null = null;
@@ -470,7 +486,13 @@ export function createDesktopSandboxProvider(
         );
       }
     } catch (err) {
-      console.error(
+      // A config-post timeout is expected under cold-start load, not a real
+      // failure — console.error is wired to error tracking (see
+      // observability/index.ts), so logging it at ERROR here was the #1
+      // chronic error in prod (20k+ hits, issue #3763). Log it at WARN
+      // instead; genuine bring-up failures still hit console.error.
+      const log = isTimeoutLike(err) ? console.warn : console.error;
+      log(
         `[user-desktop] sandbox bring-up failed handle=${input.handle} port=${port ?? "(none)"}${spawned ? " (killing daemon)" : ""}:`,
         err,
       );
@@ -485,6 +507,9 @@ export function createDesktopSandboxProvider(
         handle: input.handle,
         phase: "failed",
         error: bringUpCauseMessage(err),
+        sandboxPath: workdir,
+        projectName: metadata.projectName,
+        branch: metadata.branch,
       });
       persist({
         handle: input.handle,
@@ -531,6 +556,9 @@ export function createDesktopSandboxProvider(
       phase: "ready",
       port,
       previewUrl,
+      sandboxPath: workdir,
+      projectName: metadata.projectName,
+      branch: metadata.branch,
     });
 
     // Watchdog: clear the map entry if the daemon process exits unexpectedly.

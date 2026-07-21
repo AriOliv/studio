@@ -60,11 +60,20 @@ export interface EnsureOptions {
      * Clone URL. May embed an OAuth credential via userinfo (e.g.
      * `https://x-access-token:TOKEN@github.com/...`) — `git clone` stores
      * the credential on the remote so subsequent fetch/pull/push from
-     * inside the sandbox work without further plumbing. The token is
-     * frozen for the lifetime of the sandbox: to refresh, destroy and
-     * recreate.
+     * inside the sandbox work without further plumbing. The embedded token
+     * is short-lived (~1h GitHub App token); callers should pass a freshly
+     * minted URL on every ensure. Runners that reuse a running pod
+     * (resume/adopt) forward the new credential to the daemon so it rotates
+     * `origin` in place rather than leaving a stale token.
      */
     cloneUrl: string;
+    /**
+     * GitHub connection backing `cloneUrl`. Persisted so the runner can
+     * re-mint a fresh credential on autonomous recovery (pod recreation
+     * under a live claim) instead of replaying the stale token baked into
+     * `cloneUrl` at first provision. Absent for anonymous/public clones.
+     */
+    connectionId?: string;
     userName: string;
     userEmail: string;
     branch?: string;
@@ -182,13 +191,13 @@ export interface SandboxProvider {
 
   /**
    * Repopulate in-process routing state from a claim that already exists in
-   * the cluster (preview gateway traffic can outlive mesh's records cache).
+   * the cluster (preview gateway traffic can outlive studio's records cache).
    * Optional — only agent-sandbox implements this today.
    */
   adoptLiveClaim?(id: SandboxId, handle: string): Promise<boolean>;
 
   /**
-   * Stream of phase transitions for the pre-Ready lifecycle. Used by mesh's
+   * Stream of phase transitions for the pre-Ready lifecycle. Used by studio's
    * unified `/api/vm-events` SSE so the UI can show meaningful progress
    * between SANDBOX_START and the daemon SSE coming online.
    *

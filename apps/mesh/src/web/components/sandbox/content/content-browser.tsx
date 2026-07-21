@@ -1,29 +1,17 @@
-import { Suspense, forwardRef, lazy, useState } from "react";
+import { Suspense, lazy, useState } from "react";
 import { type Query } from "@tanstack/react-query";
 import {
   AlertCircle,
-  BookOpen01,
-  Calendar,
-  ChevronDown,
-  Code01,
-  Copy01,
-  DotsHorizontal,
-  Edit01,
+  CornerUpRight,
   File02,
-  Flag01,
   Globe02,
   Grid01,
   LayoutAlt01,
   Loading01,
   Plus,
   SearchLg,
-  Settings01,
-  SwitchVertical01,
   Tag01,
-  CreditCardSearch,
-  Trash01,
   Users01,
-  X,
 } from "@untitledui/icons";
 import { toast } from "sonner";
 import {
@@ -37,37 +25,6 @@ import {
   AlertDialogTitle,
 } from "@deco/ui/components/alert-dialog.tsx";
 import { Button } from "@deco/ui/components/button.tsx";
-import { Checkbox } from "@deco/ui/components/checkbox.tsx";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@deco/ui/components/dialog.tsx";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@deco/ui/components/dropdown-menu.tsx";
-import { Label } from "@deco/ui/components/label.tsx";
-import {
-  RadioGroup,
-  RadioGroupItem,
-} from "@deco/ui/components/radio-group.tsx";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@deco/ui/components/select.tsx";
 import { ScrollArea } from "@deco/ui/components/scroll-area.tsx";
 import {
   Tooltip,
@@ -99,6 +56,7 @@ import {
   type PageEntry,
 } from "@/web/components/sections-editor/page-list";
 import type { AppCatalogEntry } from "./app-catalog";
+import { ListEmpty } from "./list-empty";
 import { useDecoAppsCatalog } from "@/web/hooks/use-deco-apps-catalog";
 import { normalizePagePath } from "@/web/components/sections-editor/page-path-utils";
 import {
@@ -106,16 +64,18 @@ import {
   getPageVariantCount,
   getPageVariantSectionsAt,
 } from "@/web/components/sections-editor/page-variants";
-import type { SectionCatalogEntry } from "@/web/components/sections-editor/section-catalog";
+import { listAvailableSections } from "@/web/components/sections-editor/section-catalog";
+import { createReferencedBlockSaver } from "@/web/components/sections-editor/save-referenced-block";
+import { CollectionsSidebar } from "./collections-sidebar";
 import { useSandboxEvents } from "@/web/components/sandbox/hooks/use-sandbox-events";
 import {
   sandboxUserStop,
   useSandboxStart,
   type SandboxStartArgs,
 } from "@/web/components/sandbox/hooks/use-sandbox-start";
-import { SandboxStateCard } from "@/web/components/sandbox/preview/state-card";
-import { derivePhaseProgress } from "@/web/components/sandbox/preview/derive-phase-progress";
 import { computePreviewState } from "@/web/components/sandbox/preview/preview-state";
+import { decodeSandboxStartError } from "@/shared/sandbox-start-errors";
+import { SandboxStateRenderer } from "./sandbox-state-renderer";
 import {
   buildDuplicatePage,
   buildEmptyPage,
@@ -124,9 +84,15 @@ import {
   nextUniqueName,
   nextUniquePagePath,
 } from "./content-mutations";
-import { buildSectionBlockFromCatalogEntry } from "./section-create";
 import { PageFormDialog, type PageFormMode } from "./page-form-dialog";
 import { SectionRenameDialog } from "./section-rename-dialog";
+import {
+  buildRedirectBlock,
+  extractRedirects,
+  generateRedirectBlockKey,
+  type RedirectEntry,
+} from "./redirect-data";
+import { RedirectTypeBadge } from "./redirect-type-badge";
 import {
   type BlogEntry,
   type BlogKind,
@@ -141,14 +107,29 @@ import {
   isBlogKind,
   listBlogPayloads,
   listPostsWithMeta,
+  removeCategoryFromPost,
   replaceCategoryOnPost,
   scanBlogEntries,
+  stampPostModified,
 } from "./blog/blog-data";
 import {
   useDeleteBlogBlock,
   useSaveBlogBlock,
 } from "./blog/use-blog-mutations";
 import { PageJsonDialog } from "@/web/components/sections-editor/page-json-dialog";
+import { RunnableBlocksBrowser } from "./runnable-blocks-browser";
+import { countAvailableRunnables } from "./runnable-catalog";
+import { EmptyMessage } from "./empty-message";
+import { SectionsRightPane } from "./sections-right-pane";
+import { PostFilterBar, PostSelectionToolbar } from "./post-toolbar";
+import { ItemActions } from "./item-actions";
+import { ItemRow } from "./item-row";
+import {
+  GroupHeader,
+  groupSavedSectionsByResolveType,
+} from "./section-group-header";
+import { useBlocksPreviewWorkspace } from "@/web/components/sandbox/blocks/blocks-preview-workspace-context";
+import type { BlocksTarget } from "@/web/components/sandbox/blocks/blocks-preview-workspace-state";
 
 const AppEditor = lazy(() =>
   import("./app-editor").then((m) => ({ default: m.AppEditor })),
@@ -166,6 +147,12 @@ const CategoryEditor = lazy(() =>
   import("./blog/category-editor").then((m) => ({ default: m.CategoryEditor })),
 );
 
+const BulkCategoryPanel = lazy(() =>
+  import("./blog/bulk-category-panel").then((m) => ({
+    default: m.BulkCategoryPanel,
+  })),
+);
+
 const SectionsEditor = lazy(() =>
   import("@/web/components/sections-editor/sections-editor").then((m) => ({
     default: m.SectionsEditor,
@@ -178,35 +165,74 @@ const SeoEditor = lazy(() =>
   })),
 );
 
-const AddSectionModal = lazy(() =>
-  import("@/web/components/sections-editor/add-section-modal").then((m) => ({
-    default: m.AddSectionModal,
-  })),
-);
-
 const VariantCalendar = lazy(() =>
   import("./variant-calendar/variant-calendar").then((m) => ({
     default: m.VariantCalendar,
   })),
 );
 
-const VARIANT_GREEN = "oklch(0.65 0.15 160)";
+const RedirectEditor = lazy(() =>
+  import("./redirect-editor").then((m) => ({ default: m.RedirectEditor })),
+);
 
-type CollectionId =
+export type CollectionId =
   | "pages"
   | "sections"
   | "apps"
   | "site"
   | "seo"
   | "calendar"
+  | "loaders"
+  | "actions"
+  | "redirects"
   | BlogKind;
+
+export type CollectionCounts = Record<
+  | "pages"
+  | "sections"
+  | "apps"
+  | "loaders"
+  | "actions"
+  | "redirects"
+  | "posts"
+  | "authors"
+  | "categories",
+  number
+>;
 
 type Selection =
   | { collection: "pages"; key: string; path: string }
   | { collection: "sections"; key: string }
+  | {
+      collection: "available-section";
+      resolveType: string;
+      title: string;
+    }
   | { collection: "apps"; key: string }
+  | { collection: "redirects"; key: string }
   | { collection: BlogKind; key: string }
   | null;
+
+function selectionFromBlocksTarget(target: BlocksTarget | null): Selection {
+  if (!target) return null;
+  return target.kind === "page"
+    ? { collection: "pages", key: target.key, path: target.path }
+    : { collection: "sections", key: target.key };
+}
+
+function blocksTargetKey(target: BlocksTarget | null): string | null {
+  if (!target) return null;
+  return target.kind === "page"
+    ? `page:${target.key}:${target.path}`
+    : `section:${target.key}`;
+}
+
+/** A raw manifest section the user can customize and save as a global block. */
+export interface AvailableSectionEntry {
+  resolveType: string;
+  title: string;
+  description?: string;
+}
 
 type PageDialogState = {
   mode: PageFormMode;
@@ -218,13 +244,18 @@ type PageDialogState = {
 type DeleteTarget =
   | { kind: "page"; key: string; label: string }
   | { kind: "section"; key: string; label: string }
+  | { kind: "redirect"; key: string; label: string }
   | { kind: "blog"; blogKind: BlogKind; key: string; label: string }
   | { kind: "blog-bulk"; keys: string[]; count: number }
   | null;
 
-type PostSort = "date-desc" | "date-asc" | "az" | "za";
+export type PostSort = "date-desc" | "date-asc" | "az" | "za";
 
-export function ContentBrowser() {
+export interface ContentBrowserProps {
+  mode?: "content" | "blocks";
+}
+
+export function ContentBrowser({ mode = "content" }: ContentBrowserProps) {
   const inset = useInsetContext();
   const { data: session } = authClient.useSession();
   const { currentBranch: branch } = useChatTask();
@@ -270,6 +301,10 @@ export function ContentBrowser() {
     previewUrl,
     appPaused: vmEvents.status.state === "paused",
     userStopped,
+    startError:
+      startVm.isError && startVm.error
+        ? decodeSandboxStartError(startVm.error.message)
+        : null,
   });
 
   if (sandboxState.kind !== "iframe") {
@@ -279,6 +314,7 @@ export function ContentBrowser() {
         claimPhase={vmEvents.phase}
         lifecycle={vmEvents.lifecycle}
         onStart={triggerStart}
+        connectionsHref={`/${org.slug}/settings/connections`}
       />
     );
   }
@@ -293,6 +329,7 @@ export function ContentBrowser() {
       virtualMcpId={virtualMcpId}
       branch={branch}
       previewUrl={previewUrl}
+      mode={mode}
     />
   );
 }
@@ -320,21 +357,62 @@ function ContentBrowserReady({
   virtualMcpId,
   branch,
   previewUrl,
+  mode,
 }: {
   orgSlug: string;
   virtualMcpId: string;
   branch: string;
   previewUrl: string | null;
+  mode: "content" | "blocks";
 }) {
+  const workspace = useBlocksPreviewWorkspace();
   const fetchParams = { orgSlug, virtualMcpId, branch, previewUrl };
   const { data: decofile, isLoading: decofileLoading } =
     useDecofile(fetchParams);
 
   const [activeCollection, setActiveCollection] =
     useState<CollectionId>("pages");
-  const [selection, setSelection] = useState<Selection>(null);
+  const [selection, setSelection] = useState<Selection>(() =>
+    mode === "blocks"
+      ? selectionFromBlocksTarget(workspace.state.target)
+      : null,
+  );
   // Page that should open with the inline SEO form in SectionsEditor.
-  const [openPageSeoKey, setOpenPageSeoKey] = useState<string | null>(null);
+  const [openPageSeoKey, setOpenPageSeoKey] = useState<string | null>(() =>
+    mode === "blocks" ? workspace.state.editSeoPageKey : null,
+  );
+  const currentWorkspaceTargetKey = blocksTargetKey(workspace.state.target);
+  const [handledWorkspaceTargetKey, setHandledWorkspaceTargetKey] = useState(
+    currentWorkspaceTargetKey,
+  );
+  if (
+    mode === "blocks" &&
+    handledWorkspaceTargetKey !== currentWorkspaceTargetKey
+  ) {
+    setHandledWorkspaceTargetKey(currentWorkspaceTargetKey);
+    const next = selectionFromBlocksTarget(workspace.state.target);
+    setSelection(next);
+    if (next?.collection === "pages" || next?.collection === "sections") {
+      setActiveCollection(next.collection);
+    }
+  }
+  const [handledSeoPageKey, setHandledSeoPageKey] = useState(
+    workspace.state.editSeoPageKey,
+  );
+  if (
+    mode === "blocks" &&
+    handledSeoPageKey !== workspace.state.editSeoPageKey
+  ) {
+    setHandledSeoPageKey(workspace.state.editSeoPageKey);
+    if (workspace.state.editSeoPageKey) {
+      const target = workspace.state.target;
+      if (target?.kind === "page") {
+        setActiveCollection("pages");
+        setSelection(selectionFromBlocksTarget(target));
+        setOpenPageSeoKey(target.key);
+      }
+    }
+  }
   const [searchQuery, setSearchQuery] = useState("");
   // Posts-only filter/sort + bulk selection state.
   const [postCategoryFilter, setPostCategoryFilter] = useState<string | null>(
@@ -345,6 +423,31 @@ function ContentBrowserReady({
   const [selectedPostKeys, setSelectedPostKeys] = useState<Set<string>>(
     () => new Set(),
   );
+  // Category slug that pre-opens the bulk "Update category" panel (set when
+  // arriving from a category's "Add posts" / "Manage posts" action). While
+  // non-null the panel stays open even with zero posts selected.
+  const [bulkCategorySeed, setBulkCategorySeed] = useState<string | null>(null);
+  // Multi-select is implicit: selecting the first post (via the hover-revealed
+  // checkbox) enters "selection mode". Closing the panel (or applying) leaves
+  // it and drops the seed.
+  const clearSelection = () => {
+    setSelectedPostKeys(new Set());
+    setBulkCategorySeed(null);
+  };
+  const selectItem = (next: Selection) => {
+    setSelection(next);
+    setOpenPageSeoKey(null);
+    if (mode !== "blocks" || !next) return;
+    if (next.collection === "pages") {
+      workspace.selectTarget({
+        kind: "page",
+        key: next.key,
+        path: next.path,
+      });
+    } else if (next.collection === "sections") {
+      workspace.selectTarget({ kind: "section", key: next.key });
+    }
+  };
   // Reset search + post filters/selection when switching collections
   // (derived-state sync pattern).
   const [prevCollection, setPrevCollection] = useState(activeCollection);
@@ -355,6 +458,7 @@ function ContentBrowserReady({
     setPostAuthorFilter(null);
     setPostSort("date-desc");
     setSelectedPostKeys(new Set());
+    setBulkCategorySeed(null);
   }
 
   const {
@@ -421,14 +525,9 @@ function ContentBrowserReady({
   // Dialog state
   const [pageDialog, setPageDialog] = useState<PageDialogState>(null);
   const [pageDialogError, setPageDialogError] = useState<string | undefined>();
-  const [addSectionOpen, setAddSectionOpen] = useState(false);
   const [renameSectionKey, setRenameSectionKey] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>(null);
   const [jsonPageKey, setJsonPageKey] = useState<string | null>(null);
-  // "Update category" bulk dialog — holds the count of posts it will act on.
-  const [categoryDialog, setCategoryDialog] = useState<{
-    count: number;
-  } | null>(null);
 
   if (decofileLoading || metaLoading) {
     return (
@@ -445,7 +544,15 @@ function ContentBrowserReady({
   const pages = extractPages(decofile).sort((a, b) =>
     a.name.localeCompare(b.name),
   );
+  const redirects = extractRedirects(decofile).sort((a, b) =>
+    a.from.localeCompare(b.from),
+  );
   const globalSections = extractGlobalSections(decofile, meta);
+  // Only the Sections tab needs the raw catalog. Use the cheap lister (labels
+  // only, no per-section schema resolution) — resolving every section's schema
+  // here froze the tab on sites with many sections.
+  const availableSections: AvailableSectionEntry[] =
+    activeCollection === "sections" ? listAvailableSections(meta) : [];
   const siteApp = findSiteAppEntry(decofile, meta);
   const allBlogEntries = scanBlogEntries(decofile);
   const showBlog = BLOG_KINDS.some((k) => allBlogEntries[k].length > 0);
@@ -453,8 +560,8 @@ function ContentBrowserReady({
     ? allBlogEntries[activeCollection]
     : [];
 
-  // Category choices for the bulk "Update category" dialog (parent scope, since
-  // the dialog renders here rather than inside ItemList).
+  // Category choices for the bulk "Update category" panel (parent scope, since
+  // the panel renders in the right pane rather than inside ItemList).
   const bulkCategoryChoices: CategoryRef[] = (
     showBlog ? listBlogPayloads(decofile, "categories") : []
   )
@@ -466,23 +573,43 @@ function ContentBrowserReady({
     .filter((c) => c.slug)
     .sort((a, b) => a.name.localeCompare(b.name));
 
-  if (!hasEditableDecoContent(decofile, meta) && !showBlog) {
+  // The bulk "Update category" panel shows while posts are selected, or while
+  // a category seed forces it open (arriving from the category editor).
+  const bulkPanelOpen =
+    activeCollection === "posts" &&
+    (selectedPostKeys.size > 0 || bulkCategorySeed !== null);
+  // Posts the panel will act on (selection order is irrelevant — list order
+  // mirrors the decofile scan, same as the list pane).
+  const selectedPostsMeta = bulkPanelOpen
+    ? listPostsWithMeta(decofile).filter((p) => selectedPostKeys.has(p.key))
+    : [];
+
+  const loadersCount = countAvailableRunnables(meta, "loaders");
+  const actionsCount = countAvailableRunnables(meta, "actions");
+
+  // Loader/action-only sites are still editable — don't gate them out.
+  if (
+    !hasEditableDecoContent(decofile, meta) &&
+    !showBlog &&
+    loadersCount === 0 &&
+    actionsCount === 0
+  ) {
     return (
       <EmptyMessage
         icon={AlertCircle}
         title="No editable content"
-        description="This project doesn't expose any Deco pages, sections, or apps."
+        description="This project doesn't expose any Deco pages, sections, apps, loaders, or actions."
       />
     );
   }
 
-  const counts: Record<
-    "pages" | "sections" | "apps" | "posts" | "authors" | "categories",
-    number
-  > = {
+  const counts: CollectionCounts = {
     pages: pages.length,
     sections: globalSections.length,
     apps: appCatalog.length,
+    loaders: loadersCount,
+    actions: actionsCount,
+    redirects: redirects.length,
     posts: allBlogEntries.posts.length,
     authors: allBlogEntries.authors.length,
     categories: allBlogEntries.categories.length,
@@ -549,12 +676,26 @@ function ContentBrowserReady({
     });
   };
 
-  const submitPageDialog = async (values: { name: string; path: string }) => {
+  const submitPageDialog = async (values: {
+    name: string;
+    path: string;
+    templateKey: string | null;
+  }) => {
     if (!pageDialog) return;
     const { mode, sourceKey } = pageDialog;
     try {
       if (mode === "create") {
-        const data = buildEmptyPage(values.name, values.path);
+        // A template clones an existing page's content; only name/path change.
+        let data: Record<string, unknown>;
+        if (values.templateKey) {
+          const template = decofile[values.templateKey] as
+            | Record<string, unknown>
+            | undefined;
+          if (!template) throw new Error("Selected template no longer exists.");
+          data = { ...template, name: values.name, path: values.path };
+        } else {
+          data = buildEmptyPage(values.name, values.path);
+        }
         const key = generateUniquePageBlockKey(decofile, values.name);
         await saveBlock.mutateAsync({ blockKey: key, data });
         toast.success(`Created "${values.name}"`);
@@ -618,22 +759,26 @@ function ContentBrowserReady({
   };
 
   // ------------------ Section CRUD ------------------
-  const handleCreateSection = async (entry: SectionCatalogEntry) => {
-    const { blockKey: newKey, data } = buildSectionBlockFromCatalogEntry(
-      entry,
-      decofile,
-    );
-    try {
-      await saveBlock.mutateAsync({ blockKey: newKey, data });
-      toast.success(`Created section "${newKey}"`);
-      setAddSectionOpen(false);
-      setSelection({ collection: "sections", key: newKey });
-    } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Could not create section",
-      );
-    }
+  // Persist an edited available (raw manifest) section as a new global block.
+  // `blockId` becomes both the decofile key and the `name`; the form data is
+  // merged in. Throws on failure so the editor keeps its name dialog open.
+  const handleCreateAvailableSection = async (
+    resolveType: string,
+    blockId: string,
+    formValue: Record<string, unknown>,
+  ) => {
+    await saveBlock.mutateAsync({
+      blockKey: blockId,
+      data: { ...formValue, name: blockId, __resolveType: resolveType },
+    });
+    toast.success(`Created section "${blockId}"`);
+    setSelection({ collection: "sections", key: blockId });
   };
+
+  // Persist nested saved-block references created from within the section form.
+  const saveReferencedBlock = createReferencedBlockSaver((blockKey, data) =>
+    saveBlock.mutate({ blockKey, data }),
+  );
 
   const handleDuplicateSection = async (section: GlobalSectionEntry) => {
     const source = decofile[section.key] as Record<string, unknown> | undefined;
@@ -671,6 +816,31 @@ function ContentBrowserReady({
       setRenameSectionKey(null);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Rename failed");
+    }
+  };
+
+  // ------------------ Redirect CRUD ------------------
+  // Redirects are standalone `website/loaders/redirect.ts` blocks; the site's
+  // routes auto-discover them, so create/delete is a plain block write.
+  const handleCreateRedirect = async () => {
+    // Seed non-empty placeholder paths so the new block is a valid redirect
+    // (never an empty from/to that would emit a broken route once published).
+    const from = "/redirect-from";
+    const key = generateRedirectBlockKey(decofile, from);
+    const data = buildRedirectBlock({
+      from,
+      to: "/redirect-to",
+      type: "temporary",
+      discardQueryParameters: false,
+    });
+    try {
+      await saveBlock.mutateAsync({ blockKey: key, data });
+      toast.success("Created redirect");
+      setSelection({ collection: "redirects", key });
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Could not create redirect",
+      );
     }
   };
 
@@ -724,19 +894,22 @@ function ContentBrowserReady({
     });
   };
 
-  // Land on the posts list pre-filtered by a category (from the category
-  // editor). Sync `prevCollection` here so the collection-change reset
-  // above doesn't immediately clear the filter we're setting.
+  // Land on the unfiltered posts list with the bulk "Update category" panel
+  // already open and the clicked category pre-selected (from the category
+  // editor's "Add posts" / "Manage posts" actions). Sync `prevCollection` here
+  // so the collection-change reset above doesn't immediately clear what we're
+  // setting.
   const handleManagePosts = (slug: string) => {
     setActiveCollection("posts");
     setPrevCollection("posts");
     setSelection(null);
     setOpenPageSeoKey(null);
     setSearchQuery("");
-    setPostCategoryFilter(slug);
+    setPostCategoryFilter(null);
     setPostAuthorFilter(null);
     setPostSort("date-desc");
     setSelectedPostKeys(new Set());
+    setBulkCategorySeed(slug || null);
   };
 
   // Apply a pure category mutation to every selected post and persist
@@ -760,15 +933,15 @@ function ContentBrowserReady({
       if (next === payload) continue;
       await saveBlogBlock.mutateAsync({
         blockKey: key,
-        data: buildBlogBlock(key, "posts", next),
+        data: buildBlogBlock(key, "posts", stampPostModified(next)),
       });
       changed += 1;
     }
     return changed;
   };
 
-  // Driven by the "Update category" dialog: applies the chosen mode, reports
-  // the outcome, then closes the dialog and clears the selection.
+  // Driven by the "Update category" panel: applies the chosen mode, reports
+  // the outcome, then clears the selection (which closes the panel).
   const runBulkCategoryUpdate = async (
     mode: "add" | "replace",
     category: CategoryRef,
@@ -782,8 +955,7 @@ function ContentBrowserReady({
         `${verb} ${changed} ${changed === 1 ? "post" : "posts"}` +
           (unchanged > 0 ? ` (${unchanged} already set)` : ""),
       );
-      setSelectedPostKeys(new Set());
-      setCategoryDialog(null);
+      clearSelection();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Bulk update failed");
     }
@@ -802,21 +974,53 @@ function ContentBrowserReady({
             deleteTarget.count === 1 ? "post" : "posts"
           }`,
         );
-        if (selection && deleteTarget.keys.includes(selection.key)) {
+        if (
+          selection &&
+          selection.collection !== "available-section" &&
+          deleteTarget.keys.includes(selection.key)
+        ) {
           setSelection(null);
         }
-        setSelectedPostKeys(new Set());
+        clearSelection();
         setDeleteTarget(null);
         return;
       }
       const { kind, key, label } = deleteTarget;
       if (kind === "blog") {
+        // Deleting a category cascades to posts: they carry a denormalized
+        // copy of the category slug, so drop it everywhere first — otherwise
+        // posts keep a reference to a category that no longer exists. Posts
+        // first, then the category, so a failed cascade leaves it recoverable.
+        if (deleteTarget.blogKind === "categories") {
+          const slugValue = getBlogPayload(
+            decofile[key] as Record<string, unknown> | undefined,
+            "categories",
+          ).slug;
+          const slug = typeof slugValue === "string" ? slugValue : "";
+          if (slug) {
+            for (const { key: postKey, payload } of listBlogPayloads(
+              decofile,
+              "posts",
+            )) {
+              const next = removeCategoryFromPost(payload, slug);
+              if (next === payload) continue;
+              await saveBlogBlock.mutateAsync({
+                blockKey: postKey,
+                data: buildBlogBlock(postKey, "posts", stampPostModified(next)),
+              });
+            }
+          }
+        }
         await deleteBlogBlock.mutateAsync({ blockKey: key });
       } else {
         await deleteBlock.mutateAsync({ blockKey: key });
       }
       toast.success(`Deleted "${label}"`);
-      if (selection && selection.key === key) {
+      if (
+        selection &&
+        selection.collection !== "available-section" &&
+        selection.key === key
+      ) {
         setSelection(null);
       }
       setDeleteTarget(null);
@@ -826,7 +1030,14 @@ function ContentBrowserReady({
   };
 
   // ------------------ Render ------------------
-  const isDeleting = deleteBlock.isPending || deleteBlogBlock.isPending;
+  // `saveBlogBlock.isPending` covers the category-delete cascade (posts are
+  // rewritten via saveBlogBlock BEFORE the category block is unlinked), so the
+  // confirm dialog stays locked for the whole operation instead of only its
+  // final unlink — otherwise it could be re-clicked or dismissed mid-cascade.
+  const isDeleting =
+    deleteBlock.isPending ||
+    deleteBlogBlock.isPending ||
+    saveBlogBlock.isPending;
   const deleteNoun =
     deleteTarget?.kind === "blog"
       ? BLOG_SINGULAR[deleteTarget.blogKind]
@@ -835,23 +1046,30 @@ function ContentBrowserReady({
         : (deleteTarget?.kind ?? "item");
   return (
     <div className="flex h-full w-full">
-      <CollectionsSidebar
-        active={activeCollection}
-        counts={counts}
-        showBlog={showBlog}
-        onSelect={(id) => {
-          setActiveCollection(id);
-          setSelection(null);
-          setOpenPageSeoKey(null);
-        }}
-      />
+      {mode === "content" && (
+        <CollectionsSidebar
+          active={activeCollection}
+          counts={counts}
+          showBlog={showBlog}
+          onSelect={(id) => {
+            setActiveCollection(id);
+            setSelection(null);
+            setOpenPageSeoKey(null);
+          }}
+        />
+      )}
       {activeCollection !== "seo" &&
         activeCollection !== "site" &&
-        activeCollection !== "calendar" && (
+        activeCollection !== "calendar" &&
+        activeCollection !== "loaders" &&
+        activeCollection !== "actions" && (
           <ItemList
+            blocksMode={mode === "blocks"}
             activeCollection={activeCollection}
             pages={pages}
+            redirects={redirects}
             sections={globalSections}
+            availableSections={availableSections}
             appCatalog={appCatalog}
             appCatalogLoading={appCatalogLoading}
             blogEntries={blogEntries}
@@ -871,12 +1089,11 @@ function ContentBrowserReady({
             }}
             onPostSortChange={setPostSort}
             selectedPostKeys={selectedPostKeys}
+            postBulkPanelOpen={bulkPanelOpen}
             onTogglePostSelect={togglePostSelection}
             onSelectAllPosts={(keys) => setSelectedPostKeys(new Set(keys))}
             onClearPostSelection={() => setSelectedPostKeys(new Set())}
-            onBulkUpdateCategory={() =>
-              setCategoryDialog({ count: selectedPostKeys.size })
-            }
+            onExitPostSelection={clearSelection}
             onBulkDeletePosts={() =>
               setDeleteTarget({
                 kind: "blog-bulk",
@@ -885,20 +1102,19 @@ function ContentBrowserReady({
               })
             }
             selection={selection}
-            onSelect={(next) => {
-              setSelection(next);
+            onSelect={selectItem}
+            onCollectionSelect={(collection) => {
+              setActiveCollection(collection);
+              setSelection(null);
               setOpenPageSeoKey(null);
             }}
-            previewUrl={previewUrl}
             onCreate={() => {
               if (activeCollection === "pages") {
                 openCreatePage();
+              } else if (activeCollection === "redirects") {
+                void handleCreateRedirect();
               } else if (isBlogKind(activeCollection)) {
                 void handleCreateBlog(activeCollection);
-              } else if (!previewUrl) {
-                toast.error("Start the preview dev server to add sections.");
-              } else {
-                setAddSectionOpen(true);
               }
             }}
             onDuplicatePage={openDuplicatePage}
@@ -908,18 +1124,33 @@ function ContentBrowserReady({
               setDeleteTarget({ kind: "page", key: page.key, label: page.name })
             }
             onEditPageSeo={(page) => {
-              setSelection({
+              const target = {
                 collection: "pages",
                 key: page.key,
                 path: page.path,
-              });
+              } as const;
+              setSelection(target);
               setOpenPageSeoKey(page.key);
+              if (mode === "blocks") {
+                workspace.editSeo({
+                  kind: "page",
+                  key: page.key,
+                  path: page.path,
+                });
+              }
             }}
             onViewPageJson={(page) => setJsonPageKey(page.key)}
             onDuplicateSection={handleDuplicateSection}
             onRenameSection={(s) => setRenameSectionKey(s.key)}
             onDeleteSection={(s) =>
               setDeleteTarget({ kind: "section", key: s.key, label: s.name })
+            }
+            onDeleteRedirect={(entry) =>
+              setDeleteTarget({
+                kind: "redirect",
+                key: entry.key,
+                label: entry.from || entry.key,
+              })
             }
             onDuplicateBlog={handleDuplicateBlog}
             onDeleteBlog={(e) =>
@@ -933,153 +1164,225 @@ function ContentBrowserReady({
           />
         )}
       <div className="flex-1 min-w-0">
-        <Suspense
-          fallback={
-            <div className="h-full flex items-center justify-center">
-              <Loading01
-                size={20}
-                className="animate-spin text-muted-foreground"
-              />
-            </div>
-          }
-        >
-          {activeCollection === "calendar" ? (
-            <VariantCalendar decofile={decofile} />
-          ) : activeCollection === "site" ? (
-            siteApp ? (
-              <AppEditor
-                key={`site:${siteApp.key}`}
+        {activeCollection === "loaders" || activeCollection === "actions" ? (
+          <RunnableBlocksBrowser
+            orgSlug={orgSlug}
+            virtualMcpId={virtualMcpId}
+            branch={branch}
+            previewUrl={previewUrl}
+            meta={meta}
+            decofile={decofile}
+            kind={activeCollection}
+          />
+        ) : (
+          <Suspense
+            fallback={
+              <div className="h-full flex items-center justify-center">
+                <Loading01
+                  size={20}
+                  className="animate-spin text-muted-foreground"
+                />
+              </div>
+            }
+          >
+            {activeCollection === "calendar" ? (
+              <VariantCalendar decofile={decofile} />
+            ) : activeCollection === "site" ? (
+              siteApp ? (
+                <AppEditor
+                  key={`site:${siteApp.key}`}
+                  orgSlug={orgSlug}
+                  virtualMcpId={virtualMcpId}
+                  branch={branch}
+                  blockKey={siteApp.key}
+                  block={decofile[siteApp.key] as Record<string, unknown>}
+                  decofile={decofile}
+                  meta={meta}
+                  title="Site"
+                  excludeFields={["seo"]}
+                  schemaPending={isAppSchemaLoading(siteApp.resolveType, [
+                    "seo",
+                  ])}
+                  previewBaseUrl={previewUrl}
+                />
+              ) : (
+                <EmptyMessage
+                  title="Site settings not found"
+                  description="This project doesn't have a site app block (site/apps/site.ts)."
+                />
+              )
+            ) : activeCollection === "seo" ? (
+              <SeoEditor
                 orgSlug={orgSlug}
                 virtualMcpId={virtualMcpId}
                 branch={branch}
-                blockKey={siteApp.key}
-                block={decofile[siteApp.key] as Record<string, unknown>}
                 decofile={decofile}
                 meta={meta}
-                title="Site"
-                excludeFields={["seo"]}
-                schemaPending={isAppSchemaLoading(siteApp.resolveType, ["seo"])}
+                target={{ kind: "site" }}
                 previewBaseUrl={previewUrl}
               />
+            ) : activeCollection === "sections" ? (
+              <SectionsRightPane
+                selection={
+                  selection?.collection === "sections" ||
+                  selection?.collection === "available-section"
+                    ? selection
+                    : null
+                }
+                orgSlug={orgSlug}
+                virtualMcpId={virtualMcpId}
+                branch={branch}
+                previewUrl={previewUrl}
+                meta={meta}
+                decofile={decofile}
+                isCreating={saveBlock.isPending}
+                onCreateAvailable={handleCreateAvailableSection}
+                onSaveReferencedBlock={saveReferencedBlock}
+              />
+            ) : bulkPanelOpen ? (
+              // Posts selection mode: the bulk "Update category" panel takes
+              // over the right pane (rows toggle selection, not the editor).
+              // Keyed by seed so arriving from a category remounts the panel
+              // with that category pre-selected.
+              <BulkCategoryPanel
+                key={bulkCategorySeed ?? "selection"}
+                posts={selectedPostsMeta}
+                categories={bulkCategoryChoices}
+                initialSlug={bulkCategorySeed}
+                isPending={saveBlogBlock.isPending}
+                onApply={(mode, category) =>
+                  void runBulkCategoryUpdate(mode, category)
+                }
+                onClose={clearSelection}
+              />
+            ) : selection && selection.collection !== "available-section" ? (
+              selection.collection === "apps" ? (
+                <AppEditor
+                  key={`app:${selection.key}`}
+                  orgSlug={orgSlug}
+                  virtualMcpId={virtualMcpId}
+                  branch={branch}
+                  blockKey={selection.key}
+                  block={decofile[selection.key] as Record<string, unknown>}
+                  decofile={decofile}
+                  meta={meta}
+                  previewBaseUrl={previewUrl}
+                  schemaPending={isAppSchemaLoading(
+                    typeof (decofile[selection.key] as Record<string, unknown>)
+                      ?.__resolveType === "string"
+                      ? String(
+                          (decofile[selection.key] as Record<string, unknown>)
+                            .__resolveType,
+                        )
+                      : undefined,
+                  )}
+                />
+              ) : selection.collection === "posts" ? (
+                <PostEditor
+                  key={`post:${selection.key}`}
+                  orgSlug={orgSlug}
+                  virtualMcpId={virtualMcpId}
+                  branch={branch}
+                  blockKey={selection.key}
+                  block={decofile[selection.key] as Record<string, unknown>}
+                  decofile={decofile}
+                  meta={meta}
+                  previewBaseUrl={previewUrl}
+                />
+              ) : selection.collection === "categories" ? (
+                <CategoryEditor
+                  key={`category:${selection.key}`}
+                  orgSlug={orgSlug}
+                  virtualMcpId={virtualMcpId}
+                  branch={branch}
+                  blockKey={selection.key}
+                  block={decofile[selection.key] as Record<string, unknown>}
+                  decofile={decofile}
+                  meta={meta}
+                  onManagePosts={handleManagePosts}
+                  onOpenPost={(key) => {
+                    setActiveCollection("posts");
+                    setPrevCollection("posts");
+                    setSelection({ collection: "posts", key });
+                    setOpenPageSeoKey(null);
+                  }}
+                  previewBaseUrl={previewUrl}
+                />
+              ) : selection.collection === "authors" ? (
+                <RecordEditor
+                  key={`authors:${selection.key}`}
+                  orgSlug={orgSlug}
+                  virtualMcpId={virtualMcpId}
+                  branch={branch}
+                  kind="authors"
+                  blockKey={selection.key}
+                  block={decofile[selection.key] as Record<string, unknown>}
+                />
+              ) : selection.collection === "redirects" ? (
+                <RedirectEditor
+                  key={`redirect:${selection.key}`}
+                  orgSlug={orgSlug}
+                  virtualMcpId={virtualMcpId}
+                  branch={branch}
+                  blockKey={selection.key}
+                  block={decofile[selection.key] as Record<string, unknown>}
+                />
+              ) : (
+                <SectionsEditor
+                  key={
+                    selection.collection === "pages"
+                      ? `page:${selection.key}`
+                      : `section:${selection.key}`
+                  }
+                  orgSlug={orgSlug}
+                  virtualMcpId={virtualMcpId}
+                  branch={branch}
+                  previewReady
+                  previewUrl={previewUrl ?? undefined}
+                  currentPath={
+                    selection.collection === "pages" ? selection.path : "/"
+                  }
+                  activePageBlockKey={
+                    selection.collection === "pages" ? selection.key : null
+                  }
+                  activeGlobalBlockKey={
+                    selection.collection === "sections" ? selection.key : null
+                  }
+                  initialEditSeo={
+                    selection.collection === "pages" &&
+                    openPageSeoKey === selection.key
+                  }
+                  onExitSeo={() => {
+                    setOpenPageSeoKey(null);
+                    if (mode === "blocks") workspace.consumeEditSeo();
+                  }}
+                  onSaved={
+                    mode === "blocks" ? workspace.notifySaved : undefined
+                  }
+                />
+              )
             ) : (
               <EmptyMessage
-                title="Site settings not found"
-                description="This project doesn't have a site app block (site/apps/site.ts)."
-              />
-            )
-          ) : activeCollection === "seo" ? (
-            <SeoEditor
-              orgSlug={orgSlug}
-              virtualMcpId={virtualMcpId}
-              branch={branch}
-              decofile={decofile}
-              meta={meta}
-              target={{ kind: "site" }}
-              previewBaseUrl={previewUrl}
-            />
-          ) : selection ? (
-            selection.collection === "apps" ? (
-              <AppEditor
-                key={`app:${selection.key}`}
-                orgSlug={orgSlug}
-                virtualMcpId={virtualMcpId}
-                branch={branch}
-                blockKey={selection.key}
-                block={decofile[selection.key] as Record<string, unknown>}
-                decofile={decofile}
-                meta={meta}
-                previewBaseUrl={previewUrl}
-                schemaPending={isAppSchemaLoading(
-                  typeof (decofile[selection.key] as Record<string, unknown>)
-                    ?.__resolveType === "string"
-                    ? String(
-                        (decofile[selection.key] as Record<string, unknown>)
-                          .__resolveType,
-                      )
-                    : undefined,
-                )}
-              />
-            ) : selection.collection === "posts" ? (
-              <PostEditor
-                key={`post:${selection.key}`}
-                orgSlug={orgSlug}
-                virtualMcpId={virtualMcpId}
-                branch={branch}
-                blockKey={selection.key}
-                block={decofile[selection.key] as Record<string, unknown>}
-                decofile={decofile}
-                meta={meta}
-                previewBaseUrl={previewUrl}
-              />
-            ) : selection.collection === "categories" ? (
-              <CategoryEditor
-                key={`category:${selection.key}`}
-                orgSlug={orgSlug}
-                virtualMcpId={virtualMcpId}
-                branch={branch}
-                blockKey={selection.key}
-                block={decofile[selection.key] as Record<string, unknown>}
-                decofile={decofile}
-                meta={meta}
-                onManagePosts={handleManagePosts}
-              />
-            ) : selection.collection === "authors" ? (
-              <RecordEditor
-                key={`authors:${selection.key}`}
-                orgSlug={orgSlug}
-                virtualMcpId={virtualMcpId}
-                branch={branch}
-                kind="authors"
-                blockKey={selection.key}
-                block={decofile[selection.key] as Record<string, unknown>}
-              />
-            ) : (
-              <SectionsEditor
-                key={
-                  selection.collection === "pages"
-                    ? `page:${selection.key}`
-                    : `section:${selection.key}`
+                title={`Select ${
+                  isBlogKind(activeCollection)
+                    ? `a ${BLOG_SINGULAR[activeCollection]}`
+                    : activeCollection === "pages"
+                      ? "a page"
+                      : activeCollection === "apps"
+                        ? "an app"
+                        : activeCollection === "redirects"
+                          ? "a redirect"
+                          : "a section"
+                } to edit`}
+                description={
+                  activeCollection === "apps"
+                    ? "Browse all apps and select an installed one to edit its settings."
+                    : 'Pick an item from the list, or click "+" to create one.'
                 }
-                orgSlug={orgSlug}
-                virtualMcpId={virtualMcpId}
-                branch={branch}
-                previewReady
-                previewUrl={previewUrl ?? undefined}
-                currentPath={
-                  selection.collection === "pages" ? selection.path : "/"
-                }
-                activePageBlockKey={
-                  selection.collection === "pages" ? selection.key : null
-                }
-                activeGlobalBlockKey={
-                  selection.collection === "sections" ? selection.key : null
-                }
-                initialEditSeo={
-                  selection.collection === "pages" &&
-                  openPageSeoKey === selection.key
-                }
-                onExitSeo={() => setOpenPageSeoKey(null)}
               />
-            )
-          ) : (
-            <EmptyMessage
-              title={`Select ${
-                isBlogKind(activeCollection)
-                  ? `a ${BLOG_SINGULAR[activeCollection]}`
-                  : activeCollection === "pages"
-                    ? "a page"
-                    : activeCollection === "apps"
-                      ? "an app"
-                      : "a section"
-              } to edit`}
-              description={
-                activeCollection === "apps"
-                  ? "Browse all apps and select an installed one to edit its settings."
-                  : 'Pick an item from the list, or click "+" to create one.'
-              }
-            />
-          )}
-        </Suspense>
+            )}
+          </Suspense>
+        )}
       </div>
 
       {/* Page create/duplicate/rename dialog */}
@@ -1091,6 +1394,7 @@ function ContentBrowserReady({
           initialPath={pageDialog.initialPath}
           isPending={saveBlock.isPending}
           error={pageDialogError}
+          templates={pages}
           validate={validatePageValues}
           onSubmit={submitPageDialog}
           onOpenChange={(next) => {
@@ -1119,20 +1423,6 @@ function ContentBrowserReady({
         />
       )}
 
-      {/* Create global section — reuses the section gallery */}
-      {addSectionOpen && previewUrl && (
-        <Suspense fallback={null}>
-          <AddSectionModal
-            open={addSectionOpen}
-            onOpenChange={setAddSectionOpen}
-            meta={meta}
-            decofile={decofile}
-            previewBaseUrl={previewUrl}
-            onSelect={handleCreateSection}
-          />
-        </Suspense>
-      )}
-
       {/* Page JSON dialog */}
       {jsonPageKey && (
         <PageJsonDialog
@@ -1142,21 +1432,9 @@ function ContentBrowserReady({
           }}
           pageKey={jsonPageKey}
           decofile={decofile}
-        />
-      )}
-
-      {/* Bulk "Update category" dialog */}
-      {categoryDialog && (
-        <BulkCategoryDialog
-          count={categoryDialog.count}
-          categories={bulkCategoryChoices}
-          isPending={saveBlogBlock.isPending}
-          onApply={(mode, category) =>
-            void runBulkCategoryUpdate(mode, category)
+          onSave={(data) =>
+            saveBlock.mutateAsync({ blockKey: jsonPageKey, data })
           }
-          onOpenChange={(open) => {
-            if (!open && !saveBlogBlock.isPending) setCategoryDialog(null);
-          }}
         />
       )}
 
@@ -1208,159 +1486,17 @@ function ContentBrowserReady({
   );
 }
 
-function CollectionsSidebar({
-  active,
-  counts,
-  showBlog,
-  onSelect,
-}: {
-  active: CollectionId;
-  counts: Record<
-    "pages" | "sections" | "apps" | "posts" | "authors" | "categories",
-    number
-  >;
-  showBlog: boolean;
-  onSelect: (id: CollectionId) => void;
-}) {
-  return (
-    <div className="w-[208px] shrink-0 border-r flex flex-col">
-      <div className="px-3 h-12 flex items-center border-b shrink-0">
-        <span className="text-sm font-medium">Content</span>
-      </div>
-      <nav className="flex flex-col p-1.5 gap-0.5">
-        <CollectionRow
-          id="pages"
-          icon={LayoutAlt01}
-          label="Pages"
-          count={counts.pages}
-          active={active === "pages"}
-          onSelect={onSelect}
-        />
-        <CollectionRow
-          id="sections"
-          icon={Globe02}
-          label="Sections"
-          count={counts.sections}
-          active={active === "sections"}
-          onSelect={onSelect}
-        />
-        <CollectionRow
-          id="apps"
-          icon={Grid01}
-          label="Apps"
-          count={counts.apps}
-          active={active === "apps"}
-          onSelect={onSelect}
-        />
-        <CollectionRow
-          id="calendar"
-          icon={Calendar}
-          label="Calendar"
-          active={active === "calendar"}
-          onSelect={onSelect}
-        />
-        {showBlog && (
-          <>
-            <div className="mt-3 flex items-center gap-1.5 px-2.5 pb-1 pt-1 text-xs font-medium text-muted-foreground/70">
-              <BookOpen01 size={13} className="shrink-0" />
-              Blog
-            </div>
-            <CollectionRow
-              id="posts"
-              icon={File02}
-              label="Posts"
-              count={counts.posts}
-              active={active === "posts"}
-              onSelect={onSelect}
-            />
-            <CollectionRow
-              id="authors"
-              icon={Users01}
-              label="Authors"
-              count={counts.authors}
-              active={active === "authors"}
-              onSelect={onSelect}
-            />
-            <CollectionRow
-              id="categories"
-              icon={Tag01}
-              label="Categories"
-              count={counts.categories}
-              active={active === "categories"}
-              onSelect={onSelect}
-            />
-          </>
-        )}
-        <CollectionRow
-          id="site"
-          icon={Settings01}
-          label="Site"
-          active={active === "site"}
-          onSelect={onSelect}
-        />
-        <CollectionRow
-          id="seo"
-          icon={CreditCardSearch}
-          label="SEO"
-          active={active === "seo"}
-          onSelect={onSelect}
-        />
-      </nav>
-    </div>
-  );
-}
-
-function CollectionRow({
-  id,
-  icon: Icon,
-  label,
-  count,
-  active,
-  onSelect,
-}: {
-  id: CollectionId;
-  icon: React.ComponentType<{ size?: number; className?: string }>;
-  label: string;
-  count?: number;
-  active: boolean;
-  onSelect: (id: CollectionId) => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={() => onSelect(id)}
-      className={cn(
-        "flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm transition-colors cursor-pointer",
-        active
-          ? "bg-accent text-accent-foreground"
-          : "text-muted-foreground hover:bg-muted hover:text-foreground",
-      )}
-    >
-      <Icon size={16} className="shrink-0" />
-      <span className="flex-1 truncate">{label}</span>
-      {count !== undefined && (
-        <span
-          className={cn(
-            "shrink-0 text-xs tabular-nums",
-            active ? "text-accent-foreground/70" : "text-muted-foreground/70",
-          )}
-        >
-          {count}
-        </span>
-      )}
-    </button>
-  );
-}
-
 function ItemList({
+  blocksMode,
   activeCollection,
   pages,
+  redirects,
   sections,
+  availableSections,
   appCatalog,
   appCatalogLoading,
   blogEntries,
   decofile,
-  previewUrl,
   searchQuery,
   onSearchChange,
   postCategoryFilter,
@@ -1370,13 +1506,15 @@ function ItemList({
   onPostAuthorFilterChange,
   onPostSortChange,
   selectedPostKeys,
+  postBulkPanelOpen,
   onTogglePostSelect,
   onSelectAllPosts,
   onClearPostSelection,
-  onBulkUpdateCategory,
+  onExitPostSelection,
   onBulkDeletePosts,
   selection,
   onSelect,
+  onCollectionSelect,
   onCreate,
   onDuplicatePage,
   onRenamePage,
@@ -1387,17 +1525,20 @@ function ItemList({
   onDuplicateSection,
   onRenameSection,
   onDeleteSection,
+  onDeleteRedirect,
   onDuplicateBlog,
   onDeleteBlog,
 }: {
+  blocksMode: boolean;
   activeCollection: CollectionId;
   pages: PageEntry[];
+  redirects: RedirectEntry[];
   sections: GlobalSectionEntry[];
+  availableSections: AvailableSectionEntry[];
   appCatalog: AppCatalogEntry[];
   appCatalogLoading: boolean;
   blogEntries: BlogEntry[];
   decofile: Record<string, unknown>;
-  previewUrl: string | null;
   searchQuery: string;
   onSearchChange: (q: string) => void;
   postCategoryFilter: string | null;
@@ -1407,13 +1548,18 @@ function ItemList({
   onPostAuthorFilterChange: (email: string | null) => void;
   onPostSortChange: (sort: PostSort) => void;
   selectedPostKeys: Set<string>;
+  /** The right-pane bulk panel is open (forces selection mode in the list). */
+  postBulkPanelOpen: boolean;
   onTogglePostSelect: (key: string) => void;
   onSelectAllPosts: (keys: string[]) => void;
+  /** Deselect all posts, staying in selection mode if the panel is open. */
   onClearPostSelection: () => void;
-  onBulkUpdateCategory: () => void;
+  /** Leave selection mode entirely (also closes the bulk panel). */
+  onExitPostSelection: () => void;
   onBulkDeletePosts: () => void;
   selection: Selection;
   onSelect: (next: Selection) => void;
+  onCollectionSelect: (collection: "pages" | "sections") => void;
   onCreate: () => void;
   onDuplicatePage: (page: PageEntry) => void;
   onRenamePage: (page: PageEntry) => void;
@@ -1424,6 +1570,7 @@ function ItemList({
   onDuplicateSection: (section: GlobalSectionEntry) => void;
   onRenameSection: (section: GlobalSectionEntry) => void;
   onDeleteSection: (section: GlobalSectionEntry) => void;
+  onDeleteRedirect: (entry: RedirectEntry) => void;
   onDuplicateBlog: (entry: BlogEntry) => void;
   onDeleteBlog: (entry: BlogEntry) => void;
 }) {
@@ -1434,6 +1581,10 @@ function ItemList({
       p.name.toLowerCase().includes(q) ||
       p.path.toLowerCase().includes(q),
   );
+  const filteredRedirects = redirects.filter(
+    (r) =>
+      !q || r.from.toLowerCase().includes(q) || r.to.toLowerCase().includes(q),
+  );
   const filteredSections = sections.filter(
     (s) =>
       !q ||
@@ -1441,6 +1592,16 @@ function ItemList({
       s.key.toLowerCase().includes(q) ||
       s.resolveType.toLowerCase().includes(q),
   );
+  const filteredAvailableSections = availableSections.filter(
+    (s) =>
+      !q ||
+      s.title.toLowerCase().includes(q) ||
+      s.resolveType.toLowerCase().includes(q) ||
+      (s.description?.toLowerCase().includes(q) ?? false),
+  );
+  // Group saved sections by their underlying resolveType (the section's
+  // component), so the list reads as families of the same kind.
+  const savedSectionGroups = groupSavedSectionsByResolveType(filteredSections);
   const filteredApps = appCatalog.filter(
     (entry) =>
       !q ||
@@ -1524,7 +1685,10 @@ function ItemList({
   const allVisibleSelected =
     visiblePostKeys.length > 0 &&
     visiblePostKeys.every((k) => selectedPostKeys.has(k));
-  const selectionActive = selectionCount > 0;
+  // Selecting the first post enters "selection mode": the toolbar replaces the
+  // filter bar and every row's checkbox becomes visible. The open bulk panel
+  // forces it too, so posts can be picked right after landing from a category.
+  const selectionActive = selectionCount > 0 || postBulkPanelOpen;
   const toggleSelectAll = () => {
     if (allVisibleSelected) {
       onClearPostSelection();
@@ -1536,18 +1700,42 @@ function ItemList({
   const placeholder = `Search ${activeCollection}…`;
   const createTooltip = isBlogKind(activeCollection)
     ? `Create new ${BLOG_SINGULAR[activeCollection]}`
-    : activeCollection === "pages"
-      ? "Create new page"
-      : "Create new section";
-  const sectionCreateBlocked = activeCollection === "sections" && !previewUrl;
-  const showCreateButton = activeCollection !== "apps";
-  const createDisabled = sectionCreateBlocked;
-  const createDisabledReason = sectionCreateBlocked
-    ? "Start the preview dev server to add sections"
-    : undefined;
+    : activeCollection === "redirects"
+      ? "Create new redirect"
+      : "Create new page";
+  // Sections are created by saving an available section, not via the "+".
+  const showCreateButton =
+    activeCollection !== "apps" && activeCollection !== "sections";
 
   return (
-    <div className="w-[300px] shrink-0 border-r flex flex-col min-h-0">
+    <div
+      className={cn(
+        "shrink-0 border-r flex flex-col min-h-0",
+        blocksMode ? "w-[240px]" : "w-[300px]",
+      )}
+    >
+      {blocksMode && (
+        <div className="flex h-10 shrink-0 items-center gap-1 border-b px-2">
+          <Button
+            variant={activeCollection === "pages" ? "secondary" : "ghost"}
+            size="sm"
+            className="h-7 flex-1"
+            onClick={() => onCollectionSelect("pages")}
+          >
+            <LayoutAlt01 size={14} />
+            Pages
+          </Button>
+          <Button
+            variant={activeCollection === "sections" ? "secondary" : "ghost"}
+            size="sm"
+            className="h-7 flex-1"
+            onClick={() => onCollectionSelect("sections")}
+          >
+            <Globe02 size={14} />
+            Sections
+          </Button>
+        </div>
+      )}
       <div className="px-2 h-12 flex items-center gap-1 border-b shrink-0">
         <div className="flex flex-1 items-center gap-2 pl-1">
           <SearchLg
@@ -1571,16 +1759,12 @@ function ItemList({
                 variant="ghost"
                 size="icon"
                 onClick={onCreate}
-                disabled={createDisabled}
                 aria-label={createTooltip}
-                aria-disabled={createDisabled}
               >
                 <Plus size={14} />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="bottom">
-              {createDisabledReason ?? createTooltip}
-            </TooltipContent>
+            <TooltipContent side="bottom">{createTooltip}</TooltipContent>
           </Tooltip>
         )}
       </div>
@@ -1590,9 +1774,8 @@ function ItemList({
             count={selectionCount}
             allSelected={allVisibleSelected}
             onToggleSelectAll={toggleSelectAll}
-            onUpdateCategory={onBulkUpdateCategory}
             onDelete={onBulkDeletePosts}
-            onClear={onClearPostSelection}
+            onExit={onExitPostSelection}
           />
         ) : (
           <PostFilterBar
@@ -1601,9 +1784,6 @@ function ItemList({
             categoryFilter={postCategoryFilter}
             authorFilter={postAuthorFilter}
             sort={postSort}
-            hasPosts={postsWithMeta.length > 0}
-            allSelected={allVisibleSelected}
-            onToggleSelectAll={toggleSelectAll}
             onCategoryFilterChange={onPostCategoryFilterChange}
             onAuthorFilterChange={onPostAuthorFilterChange}
             onSortChange={onPostSortChange}
@@ -1656,41 +1836,92 @@ function ItemList({
               })
             )
           ) : activeCollection === "sections" ? (
-            filteredSections.length === 0 ? (
+            filteredSections.length === 0 &&
+            filteredAvailableSections.length === 0 ? (
               <ListEmpty
-                hasItems={sections.length > 0}
-                emptyLabel="No saved sections yet."
-                emptyHint='Click "+" to create one, or save a section from a page.'
+                hasItems={sections.length > 0 || availableSections.length > 0}
+                emptyLabel="No sections yet."
+                emptyHint="Save a section from a page, or start the preview dev server."
               />
             ) : (
-              filteredSections.map((section) => {
-                const isActive =
-                  selection?.collection === "sections" &&
-                  selection.key === section.key;
-                const typeLabel = section.resolveType
-                  .split("/")
-                  .pop()
-                  ?.replace(/\.tsx?$/, "");
-                return (
-                  <ItemRow
-                    key={section.key}
-                    icon={Globe02}
-                    title={section.name}
-                    subtitle={typeLabel ?? section.resolveType}
-                    active={isActive}
-                    onClick={() =>
-                      onSelect({ collection: "sections", key: section.key })
-                    }
-                    menu={
-                      <ItemActions
-                        onDuplicate={() => onDuplicateSection(section)}
-                        onRename={() => onRenameSection(section)}
-                        onDelete={() => onDeleteSection(section)}
-                      />
-                    }
-                  />
-                );
-              })
+              <>
+                {savedSectionGroups.length > 0 && (
+                  <>
+                    <GroupHeader icon={Globe02} label="Saved sections" />
+                    {savedSectionGroups.map((group) => (
+                      <div key={group.label} className="flex flex-col gap-1">
+                        <div className="px-2.5 pt-1 pb-0.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground/60">
+                          {group.label}
+                        </div>
+                        {group.sections.map((section) => {
+                          const isActive =
+                            selection?.collection === "sections" &&
+                            selection.key === section.key;
+                          return (
+                            <ItemRow
+                              key={section.key}
+                              icon={Globe02}
+                              accent="global"
+                              title={section.name}
+                              subtitle={group.label}
+                              active={isActive}
+                              onClick={() =>
+                                onSelect({
+                                  collection: "sections",
+                                  key: section.key,
+                                })
+                              }
+                              menu={
+                                <ItemActions
+                                  onDuplicate={() =>
+                                    onDuplicateSection(section)
+                                  }
+                                  onRename={() => onRenameSection(section)}
+                                  onDelete={() => onDeleteSection(section)}
+                                />
+                              }
+                            />
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </>
+                )}
+                {filteredAvailableSections.length > 0 && (
+                  <>
+                    <GroupHeader
+                      icon={LayoutAlt01}
+                      label="Available sections"
+                      className={cn(savedSectionGroups.length > 0 && "mt-3")}
+                    />
+                    {filteredAvailableSections.map((section) => {
+                      const isActive =
+                        selection?.collection === "available-section" &&
+                        selection.resolveType === section.resolveType;
+                      const typeLabel = section.resolveType
+                        .split("/")
+                        .pop()
+                        ?.replace(/\.tsx?$/, "");
+                      return (
+                        <ItemRow
+                          key={section.resolveType}
+                          icon={LayoutAlt01}
+                          title={section.title}
+                          subtitle={typeLabel ?? section.resolveType}
+                          active={isActive}
+                          onClick={() =>
+                            onSelect({
+                              collection: "available-section",
+                              resolveType: section.resolveType,
+                              title: section.title,
+                            })
+                          }
+                        />
+                      );
+                    })}
+                  </>
+                )}
+              </>
             )
           ) : activeCollection === "apps" ? (
             appCatalogLoading ? (
@@ -1722,7 +1953,7 @@ function ItemList({
                     active={isActive}
                     trailing={
                       entry.installed ? (
-                        <span className="shrink-0 rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+                        <span className="shrink-0 rounded-full bg-success/15 px-1.5 py-0.5 text-[10px] font-medium text-success">
                           Installed
                         </span>
                       ) : undefined
@@ -1739,6 +1970,34 @@ function ItemList({
                   />
                 );
               })
+            )
+          ) : activeCollection === "redirects" ? (
+            filteredRedirects.length === 0 ? (
+              <ListEmpty
+                hasItems={redirects.length > 0}
+                emptyLabel="No redirects yet."
+                emptyHint='Click "+" to create your first redirect.'
+              />
+            ) : (
+              filteredRedirects.map((entry) => (
+                <ItemRow
+                  key={entry.key}
+                  icon={CornerUpRight}
+                  title={entry.from || "(no source)"}
+                  subtitle={`→ ${entry.to || "(no target)"}`}
+                  active={
+                    selection?.collection === "redirects" &&
+                    selection.key === entry.key
+                  }
+                  trailing={<RedirectTypeBadge type={entry.type} />}
+                  onClick={() =>
+                    onSelect({ collection: "redirects", key: entry.key })
+                  }
+                  menu={
+                    <ItemActions onDelete={() => onDeleteRedirect(entry)} />
+                  }
+                />
+              ))
             )
           ) : isPostsCollection ? (
             sortedPosts.length === 0 ? (
@@ -1760,7 +2019,9 @@ function ItemList({
                     key={post.key}
                     icon={File02}
                     title={post.title}
-                    subtitle={post.slug}
+                    subtitle={post.slug || "no slug"}
+                    invalid={post.missing.length > 0}
+                    invalidReason={`Missing: ${post.missing.join(", ")}`}
                     active={
                       selection?.collection === "posts" &&
                       selection.key === post.key
@@ -1770,7 +2031,9 @@ function ItemList({
                     selected={selectedPostKeys.has(post.key)}
                     onToggleSelect={() => onTogglePostSelect(post.key)}
                     onClick={() =>
-                      onSelect({ collection: "posts", key: post.key })
+                      selectionActive
+                        ? onTogglePostSelect(post.key)
+                        : onSelect({ collection: "posts", key: post.key })
                     }
                     menu={
                       <ItemActions
@@ -1825,712 +2088,6 @@ function ItemList({
           )}
         </div>
       </ScrollArea>
-    </div>
-  );
-}
-
-// Sentinel for the "no filter" radio option (Radix forbids empty values).
-const ALL_FILTER = "__all__";
-
-const POST_SORT_LABELS: Record<PostSort, string> = {
-  "date-desc": "Newest first",
-  "date-asc": "Oldest first",
-  az: "Title A–Z",
-  za: "Title Z–A",
-};
-
-const POST_SORT_SHORT: Record<PostSort, string> = {
-  "date-desc": "Newest",
-  "date-asc": "Oldest",
-  az: "A–Z",
-  za: "Z–A",
-};
-
-type CategoryOption = { slug: string; name: string; count: number };
-type AuthorOption = { email: string; name: string; count: number };
-
-/**
- * Compact, icon-led filter trigger: just the icon when no filter is applied,
- * icon + highlighted value once one is. Forwards props/ref so it can be used
- * directly as a `DropdownMenuTrigger asChild` child.
- */
-const FilterChipTrigger = forwardRef<
-  HTMLButtonElement,
-  {
-    icon: React.ComponentType<{ size?: number; className?: string }>;
-    active: boolean;
-    value?: string;
-  } & React.ComponentProps<typeof Button>
->(function FilterChipTrigger(
-  { icon: Icon, active, value, className, ...props },
-  ref,
-) {
-  return (
-    <Button
-      ref={ref}
-      type="button"
-      variant="ghost"
-      size="sm"
-      className={cn(
-        "h-7 gap-1 px-1.5 text-xs",
-        active ? "text-foreground" : "text-muted-foreground",
-        className,
-      )}
-      {...props}
-    >
-      <Icon size={14} className="shrink-0" />
-      {value && <span className="min-w-0 flex-1 truncate">{value}</span>}
-      <ChevronDown size={12} className="shrink-0 opacity-60" />
-    </Button>
-  );
-});
-
-function OptionCount({ count }: { count: number }) {
-  return (
-    <span className="ml-auto pl-3 text-xs text-muted-foreground tabular-nums">
-      {count}
-    </span>
-  );
-}
-
-function PostFilterBar({
-  categories,
-  authors,
-  categoryFilter,
-  authorFilter,
-  sort,
-  hasPosts,
-  allSelected,
-  onToggleSelectAll,
-  onCategoryFilterChange,
-  onAuthorFilterChange,
-  onSortChange,
-}: {
-  categories: CategoryOption[];
-  authors: AuthorOption[];
-  categoryFilter: string | null;
-  authorFilter: string | null;
-  sort: PostSort;
-  hasPosts: boolean;
-  allSelected: boolean;
-  onToggleSelectAll: () => void;
-  onCategoryFilterChange: (slug: string | null) => void;
-  onAuthorFilterChange: (email: string | null) => void;
-  onSortChange: (sort: PostSort) => void;
-}) {
-  const activeCategory = categories.find((c) => c.slug === categoryFilter);
-  const activeAuthor = authors.find((a) => a.email === authorFilter);
-
-  return (
-    <div className="flex min-w-0 items-center gap-0.5 overflow-hidden border-b px-2 py-1.5">
-      <SelectAllControl
-        checked={allSelected}
-        disabled={!hasPosts}
-        onToggle={onToggleSelectAll}
-      />
-
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <FilterChipTrigger
-            icon={Tag01}
-            active={!!categoryFilter}
-            value={activeCategory?.name}
-            className="min-w-0 shrink"
-          />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent
-          align="start"
-          className="max-h-80 w-56 overflow-y-auto"
-        >
-          <DropdownMenuLabel>Filter by category</DropdownMenuLabel>
-          <DropdownMenuRadioGroup
-            value={categoryFilter ?? ALL_FILTER}
-            onValueChange={(v) =>
-              onCategoryFilterChange(v === ALL_FILTER ? null : v)
-            }
-          >
-            <DropdownMenuRadioItem value={ALL_FILTER}>
-              All categories
-            </DropdownMenuRadioItem>
-            {categories.map((c) => (
-              <DropdownMenuRadioItem key={c.slug} value={c.slug}>
-                <span className="min-w-0 flex-1 truncate">{c.name}</span>
-                <OptionCount count={c.count} />
-              </DropdownMenuRadioItem>
-            ))}
-          </DropdownMenuRadioGroup>
-        </DropdownMenuContent>
-      </DropdownMenu>
-
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <FilterChipTrigger
-            icon={Users01}
-            active={!!authorFilter}
-            value={activeAuthor?.name}
-            className="min-w-0 shrink"
-          />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent
-          align="start"
-          className="max-h-80 w-56 overflow-y-auto"
-        >
-          <DropdownMenuLabel>Filter by author</DropdownMenuLabel>
-          <DropdownMenuRadioGroup
-            value={authorFilter ?? ALL_FILTER}
-            onValueChange={(v) =>
-              onAuthorFilterChange(v === ALL_FILTER ? null : v)
-            }
-          >
-            <DropdownMenuRadioItem value={ALL_FILTER}>
-              All authors
-            </DropdownMenuRadioItem>
-            {authors.map((a) => (
-              <DropdownMenuRadioItem key={a.email} value={a.email}>
-                <span className="min-w-0 flex-1 truncate">{a.name}</span>
-                <OptionCount count={a.count} />
-              </DropdownMenuRadioItem>
-            ))}
-          </DropdownMenuRadioGroup>
-        </DropdownMenuContent>
-      </DropdownMenu>
-
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <FilterChipTrigger
-            icon={SwitchVertical01}
-            active
-            value={POST_SORT_SHORT[sort]}
-          />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-44">
-          <DropdownMenuLabel>Sort by</DropdownMenuLabel>
-          <DropdownMenuRadioGroup
-            value={sort}
-            onValueChange={(v) => onSortChange(v as PostSort)}
-          >
-            {(Object.keys(POST_SORT_LABELS) as PostSort[]).map((value) => (
-              <DropdownMenuRadioItem key={value} value={value}>
-                {POST_SORT_LABELS[value]}
-              </DropdownMenuRadioItem>
-            ))}
-          </DropdownMenuRadioGroup>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    </div>
-  );
-}
-
-/** Tooltip-wrapped "select all" checkbox shared by the filter bar + toolbar. */
-function SelectAllControl({
-  checked,
-  disabled,
-  onToggle,
-}: {
-  checked: boolean;
-  disabled?: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span
-          className="flex shrink-0 items-center px-1.5"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <Checkbox
-            checked={checked}
-            disabled={disabled}
-            onCheckedChange={() => onToggle()}
-            aria-label={checked ? "Deselect all posts" : "Select all posts"}
-          />
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="bottom">
-        {checked ? "Deselect all" : "Select all"}
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
-function PostSelectionToolbar({
-  count,
-  allSelected,
-  onToggleSelectAll,
-  onUpdateCategory,
-  onDelete,
-  onClear,
-}: {
-  count: number;
-  allSelected: boolean;
-  onToggleSelectAll: () => void;
-  onUpdateCategory: () => void;
-  onDelete: () => void;
-  onClear: () => void;
-}) {
-  return (
-    <div className="flex items-center gap-0.5 border-b bg-accent/40 px-2 py-1.5">
-      <SelectAllControl checked={allSelected} onToggle={onToggleSelectAll} />
-      <span className="text-xs font-medium tabular-nums">{count} selected</span>
-      <div className="ml-auto flex items-center gap-0.5">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-7 gap-1 px-2 text-xs"
-              onClick={onUpdateCategory}
-              aria-label="Update category for selected posts"
-            >
-              <Tag01 size={14} />
-              Category
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Update category</TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7 text-destructive hover:text-destructive"
-              onClick={onDelete}
-              aria-label="Delete selected posts"
-            >
-              <Trash01 size={14} />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Delete selected</TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7"
-              onClick={onClear}
-              aria-label="Clear selection"
-            >
-              <X size={14} />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Clear selection</TooltipContent>
-        </Tooltip>
-      </div>
-    </div>
-  );
-}
-
-/**
- * Dialog for the bulk "Update category" action: pick a category, then choose
- * whether to add it (keeping existing categories) or replace all categories
- * with it (a one-step migration). Holds its own selection/mode state so the
- * parent only deals with the final apply.
- */
-function BulkCategoryDialog({
-  count,
-  categories,
-  isPending,
-  onApply,
-  onOpenChange,
-}: {
-  count: number;
-  categories: CategoryRef[];
-  isPending: boolean;
-  onApply: (mode: "add" | "replace", category: CategoryRef) => void;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const [slug, setSlug] = useState<string>(categories[0]?.slug ?? "");
-  const [mode, setMode] = useState<"add" | "replace">("add");
-  const selected = categories.find((c) => c.slug === slug);
-
-  return (
-    <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Update category</DialogTitle>
-          <DialogDescription>
-            Choose a category to apply to {count}{" "}
-            {count === 1 ? "post" : "posts"}.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-4 py-2">
-          <div className="space-y-2">
-            <Label>Category</Label>
-            {categories.length === 0 ? (
-              <p className="text-sm text-muted-foreground">
-                No categories yet — create one in the Categories collection.
-              </p>
-            ) : (
-              <Select value={slug} onValueChange={setSlug}>
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="Select a category" />
-                </SelectTrigger>
-                <SelectContent>
-                  {categories.map((c) => (
-                    <SelectItem key={c.slug} value={c.slug}>
-                      <span className="truncate">{c.name}</span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-          </div>
-
-          <RadioGroup
-            value={mode}
-            onValueChange={(v) => setMode(v as "add" | "replace")}
-            className="gap-2"
-          >
-            <Label
-              htmlFor="cat-mode-add"
-              className="flex cursor-pointer items-start gap-2.5 rounded-lg border p-3"
-            >
-              <RadioGroupItem
-                value="add"
-                id="cat-mode-add"
-                className="mt-0.5"
-              />
-              <span className="space-y-0.5">
-                <span className="block text-sm font-medium">Add category</span>
-                <span className="block text-xs text-muted-foreground">
-                  Keep existing categories and add this one.
-                </span>
-              </span>
-            </Label>
-            <Label
-              htmlFor="cat-mode-replace"
-              className="flex cursor-pointer items-start gap-2.5 rounded-lg border p-3"
-            >
-              <RadioGroupItem
-                value="replace"
-                id="cat-mode-replace"
-                className="mt-0.5"
-              />
-              <span className="space-y-0.5">
-                <span className="block text-sm font-medium">
-                  Replace category
-                </span>
-                <span className="block text-xs text-muted-foreground">
-                  Remove all current categories and set only this one.
-                </span>
-              </span>
-            </Label>
-          </RadioGroup>
-        </div>
-
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={isPending}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            disabled={!selected || isPending}
-            onClick={() =>
-              selected &&
-              onApply(mode, { name: selected.name, slug: selected.slug })
-            }
-          >
-            {isPending ? (
-              <>
-                <Loading01 size={14} className="animate-spin" />
-                Updating…
-              </>
-            ) : (
-              "Apply"
-            )}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function ItemRow({
-  icon: Icon,
-  logoUrl,
-  title,
-  subtitle,
-  active,
-  variantCount,
-  trailing,
-  selectable,
-  selectionActive,
-  selected,
-  onToggleSelect,
-  onClick,
-  menu,
-}: {
-  icon: React.ComponentType<{
-    size?: number;
-    className?: string;
-    style?: React.CSSProperties;
-  }>;
-  logoUrl?: string;
-  title: string;
-  subtitle: string;
-  active: boolean;
-  variantCount?: number;
-  trailing?: React.ReactNode;
-  selectable?: boolean;
-  selectionActive?: boolean;
-  selected?: boolean;
-  onToggleSelect?: () => void;
-  onClick: () => void;
-  menu?: React.ReactNode;
-}) {
-  const rowIcon =
-    variantCount && variantCount > 1 ? (
-      <span className="flex size-8 shrink-0 items-center justify-center">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Icon
-              size={16}
-              className="shrink-0"
-              style={{ color: VARIANT_GREEN }}
-            />
-          </TooltipTrigger>
-          <TooltipContent side="right">{variantCount} variants</TooltipContent>
-        </Tooltip>
-      </span>
-    ) : logoUrl ? (
-      <img
-        src={logoUrl}
-        alt=""
-        className="size-8 shrink-0 rounded-lg object-cover bg-muted"
-      />
-    ) : (
-      <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
-        <Icon
-          size={16}
-          className={cn(
-            "shrink-0",
-            active ? "text-accent-foreground" : "text-muted-foreground",
-          )}
-        />
-      </span>
-    );
-
-  return (
-    <div
-      className={cn(
-        "group relative flex min-w-0 items-center rounded-md transition-colors",
-        active ? "bg-accent text-accent-foreground" : "hover:bg-muted",
-      )}
-    >
-      {selectable && (
-        <span
-          className={cn(
-            "flex shrink-0 items-center pl-2.5 transition-opacity",
-            selected || selectionActive
-              ? "opacity-100"
-              : "opacity-0 group-hover:opacity-100 focus-within:opacity-100",
-          )}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <Checkbox
-            checked={selected}
-            onCheckedChange={() => onToggleSelect?.()}
-            aria-label={`Select ${title}`}
-          />
-        </span>
-      )}
-      <button
-        type="button"
-        onClick={onClick}
-        className="flex min-w-0 flex-1 items-center gap-2.5 rounded-md px-2.5 py-2 text-left cursor-pointer"
-      >
-        {rowIcon}
-        <span className="min-w-0 flex-1">
-          <span className="block truncate text-sm font-medium">{title}</span>
-          <span
-            className={cn(
-              "block truncate text-xs",
-              active ? "text-accent-foreground/70" : "text-muted-foreground",
-            )}
-          >
-            {subtitle}
-          </span>
-        </span>
-        {trailing}
-      </button>
-      {menu && (
-        <div
-          className={cn(
-            "pr-1 opacity-0 transition-opacity group-hover:opacity-100",
-            active && "opacity-100",
-          )}
-        >
-          {menu}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ItemActions({
-  onDuplicate,
-  onRename,
-  onAddVariant,
-  onEditSeo,
-  onViewJson,
-  onDelete,
-}: {
-  onDuplicate: () => void;
-  onRename?: () => void;
-  onAddVariant?: () => void;
-  onEditSeo?: () => void;
-  onViewJson?: () => void;
-  onDelete: () => void;
-}) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          aria-label="More actions"
-          className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-background hover:text-foreground cursor-pointer"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <DotsHorizontal size={14} />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-44">
-        {onRename && (
-          <DropdownMenuItem onClick={onRename}>
-            <Edit01 size={14} />
-            Rename
-          </DropdownMenuItem>
-        )}
-        <DropdownMenuItem onClick={onDuplicate}>
-          <Copy01 size={14} />
-          Duplicate
-        </DropdownMenuItem>
-        {onAddVariant && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              onClick={onAddVariant}
-              className="cursor-pointer"
-              style={{ color: VARIANT_GREEN }}
-            >
-              <Flag01 size={14} style={{ color: VARIANT_GREEN }} />
-              Add variant
-            </DropdownMenuItem>
-          </>
-        )}
-        {(onEditSeo || onViewJson) && (
-          <>
-            <DropdownMenuSeparator />
-            {onEditSeo && (
-              <DropdownMenuItem onClick={onEditSeo}>
-                <CreditCardSearch size={14} />
-                Edit SEO
-              </DropdownMenuItem>
-            )}
-            {onViewJson && (
-              <DropdownMenuItem onClick={onViewJson}>
-                <Code01 size={14} />
-                View JSON
-              </DropdownMenuItem>
-            )}
-          </>
-        )}
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          onClick={onDelete}
-          className="text-destructive focus:text-destructive"
-        >
-          <Trash01 size={14} />
-          Delete
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
-function ListEmpty({
-  hasItems,
-  emptyLabel,
-  emptyHint,
-}: {
-  hasItems: boolean;
-  emptyLabel: string;
-  emptyHint: string;
-}) {
-  return (
-    <div className="px-3 py-6 text-center text-xs text-muted-foreground">
-      {hasItems ? (
-        "No results match your search."
-      ) : (
-        <>
-          <div>{emptyLabel}</div>
-          <div className="mt-1 text-muted-foreground/80">{emptyHint}</div>
-        </>
-      )}
-    </div>
-  );
-}
-
-/**
- * Renders the SandboxStateCard variant that matches the current
- * sandbox state. Mirrors Preview's switch so Content shows the same
- * "Starting your sandbox" / "Sandbox is paused" cards. The daemon's
- * HTTP proxy serves every other "not live" case as auto-reloading
- * HTML through the iframe, so Content only needs these two overlays.
- */
-function SandboxStateRenderer({
-  state,
-  claimPhase,
-  lifecycle,
-  onStart,
-}: {
-  state: { kind: "starting" } | { kind: "suspended" };
-  claimPhase: ReturnType<typeof useSandboxEvents>["phase"];
-  lifecycle: ReturnType<typeof useSandboxEvents>["lifecycle"];
-  onStart: () => void;
-}) {
-  switch (state.kind) {
-    case "starting":
-      return (
-        <SandboxStateCard
-          kind="starting"
-          progress={derivePhaseProgress({ claimPhase, lifecycle })}
-          claimPhase={claimPhase}
-        />
-      );
-    case "suspended":
-      return <SandboxStateCard kind="suspended" onResume={onStart} />;
-  }
-}
-
-function EmptyMessage({
-  icon: Icon,
-  title,
-  description,
-}: {
-  icon?: React.ComponentType<{ size?: number; className?: string }>;
-  title: string;
-  description?: string;
-}) {
-  return (
-    <div className="flex h-full w-full flex-col items-center justify-center gap-2 p-6 text-center text-sm text-muted-foreground">
-      {Icon && <Icon size={24} className="text-muted-foreground/60" />}
-      <div>{title}</div>
-      {description && (
-        <div className="text-xs text-muted-foreground/80 max-w-sm">
-          {description}
-        </div>
-      )}
     </div>
   );
 }

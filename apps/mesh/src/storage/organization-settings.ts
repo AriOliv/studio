@@ -45,6 +45,7 @@ export class OrganizationSettingsStorage
           ? JSON.parse(record.default_home_agents)
           : record.default_home_agents
         : null,
+      reports_only: record.reports_only ?? null,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
     };
@@ -60,6 +61,7 @@ export class OrganizationSettingsStorage
         | "registry_config"
         | "simple_mode"
         | "default_home_agents"
+        | "reports_only"
       >
     >,
   ): Promise<OrganizationSettings> {
@@ -79,7 +81,6 @@ export class OrganizationSettingsStorage
     const defaultHomeAgentsJson = data?.default_home_agents
       ? JSON.stringify(data.default_home_agents)
       : null;
-
     await this.db
       .insertInto("organization_settings")
       .values({
@@ -89,6 +90,7 @@ export class OrganizationSettingsStorage
         registry_config: registryConfigJson,
         simple_mode: simpleModeJson,
         default_home_agents: defaultHomeAgentsJson,
+        reports_only: data?.reports_only ?? null,
         createdAt: now,
         updatedAt: now,
       })
@@ -101,6 +103,9 @@ export class OrganizationSettingsStorage
           default_home_agents: defaultHomeAgentsJson
             ? defaultHomeAgentsJson
             : undefined,
+          // Boolean flag: explicit `false` must persist; `undefined` (field
+          // absent) skips the column in doUpdateSet.
+          reports_only: data?.reports_only,
           updatedAt: now,
         }),
       )
@@ -116,6 +121,7 @@ export class OrganizationSettingsStorage
         registry_config: data?.registry_config ?? null,
         simple_mode: data?.simple_mode ?? null,
         default_home_agents: data?.default_home_agents ?? null,
+        reports_only: data?.reports_only ?? null,
         createdAt: now,
         updatedAt: now,
       };

@@ -3,11 +3,36 @@ import {
   applySandboxEvent,
   getLinkState,
   pushSandboxEvent,
+  removeSandboxRow,
   resetLinkStateForTests,
   type SandboxRow,
+  setActionError,
+  setPendingConfirm,
   setPersistedSandboxes,
   setLogPath,
+  setSelectedHandle,
 } from "./link-store";
+
+type LinkRecord = Parameters<typeof setPersistedSandboxes>[0][number];
+
+function record(handle: string, over: Partial<LinkRecord> = {}): LinkRecord {
+  return {
+    handle,
+    status: "stopped",
+    sandboxPath: `/${handle}`,
+    port: null,
+    previewUrl: null,
+    repoCloneUrl: null,
+    branch: null,
+    projectName: null,
+    error: null,
+    createdAt: 0,
+    updatedAt: 0,
+    lastSeenAt: null,
+    missingSince: null,
+    ...over,
+  };
+}
 
 function empty(): Map<string, SandboxRow> {
   return new Map();
@@ -29,6 +54,42 @@ describe("applySandboxEvent", () => {
     expect(m.get("a")?.status).toBe("ready");
     expect(m.get("a")?.port).toBe(51234);
     expect(m.get("a")?.previewUrl).toBe("http://a.localhost:5174");
+  });
+
+  it("carries projectName/branch/sandboxPath from a spawning event", () => {
+    const m = applySandboxEvent(empty(), {
+      handle: "agent-1-feat/x",
+      phase: "spawning",
+      projectName: "studio",
+      branch: "feat/x",
+      sandboxPath: "/tmp/deco/sandboxes/agent-1-feat/x",
+    });
+    expect(m.get("agent-1-feat/x")).toEqual(
+      expect.objectContaining({
+        status: "spawning",
+        projectName: "studio",
+        branch: "feat/x",
+        sandboxPath: "/tmp/deco/sandboxes/agent-1-feat/x",
+      }),
+    );
+  });
+
+  it("retains metadata across a follow-up event that omits it", () => {
+    let m = applySandboxEvent(empty(), {
+      handle: "a",
+      phase: "spawning",
+      projectName: "studio",
+      branch: "feat/x",
+    });
+    m = applySandboxEvent(m, { handle: "a", phase: "ready", port: 7 });
+    expect(m.get("a")).toEqual(
+      expect.objectContaining({
+        status: "ready",
+        port: 7,
+        projectName: "studio",
+        branch: "feat/x",
+      }),
+    );
   });
 
   it("records the error on failure and retains the row", () => {
@@ -252,5 +313,36 @@ describe("setPersistedSandboxes", () => {
         port: 9999,
       }),
     );
+  });
+});
+
+describe("selection setters", () => {
+  it("stores the selected handle, confirm, and error", () => {
+    setSelectedHandle("h1");
+    expect(getLinkState().selectedHandle).toBe("h1");
+
+    setPendingConfirm({
+      handle: "h1",
+      branch: "b",
+      dirtyCount: 0,
+      merged: true,
+    });
+    expect(getLinkState().pendingConfirm?.handle).toBe("h1");
+
+    setActionError("boom");
+    expect(getLinkState().actionError).toBe("boom");
+  });
+});
+
+describe("removeSandboxRow", () => {
+  it("drops the row and follows selection to the neighbor", () => {
+    setPersistedSandboxes([record("a"), record("b")]);
+    setSelectedHandle("a");
+
+    removeSandboxRow("a");
+
+    expect([...getLinkState().sandboxes.keys()]).toEqual(["b"]);
+    expect(getLinkState().selectedHandle).toBe("b");
+    expect(getLinkState().pendingConfirm).toBeNull();
   });
 });

@@ -2,12 +2,12 @@ import type { GithubRepo } from "@decocms/mesh-sdk";
 export { DEFAULT_THREAD_TITLE } from "../thread-title";
 
 export const DEFAULT_WINDOW_SIZE = 50;
-export const PARENT_STEP_LIMIT = 30;
+export const PARENT_STEP_LIMIT = 60;
 
 /** Step budget for a delegated `subtask`/subagent run. Lives here (a `@/*`-free
  *  harnesses leaf) so the portable core + the daemon (Task 18 desktop subtask)
  *  can bundle it; re-exported from the route constants for the cluster. */
-export const SUBAGENT_STEP_LIMIT = 15;
+export const SUBAGENT_STEP_LIMIT = 30;
 
 export function buildBasePlatformPrompt(): string {
   return `<platform>
@@ -90,7 +90,7 @@ for code, commands, and identifiers. Cite sources. No emojis.
 
 export function buildDecopilotAgentPrompt(): string {
   return `<identity>
-You are Decopilot, the AI assistant for this Deco CMS workspace. You are the
+You are Super Agent, the AI assistant for this Deco CMS workspace. You are the
 user's hands on their workspace — you wire up connections, configure and run
 their agents, build automations, and operate the tools they've installed. You
 know this platform well, so be proactive: when there's a better path to the

@@ -10,6 +10,18 @@ describe("SYSTEM_TAB_ICONS", () => {
     expect(SYSTEM_TAB_ICONS.automations).toBe(Lightning01);
     expect(SYSTEM_TAB_ICONS.preview).toBeDefined();
     expect(SYSTEM_TAB_ICONS.git).toBeDefined();
+    expect(SYSTEM_TAB_ICONS.code).toBeDefined();
+  });
+});
+
+describe("code system icon", () => {
+  test("resolve to component icons", () => {
+    const code = resolveTabIcon({
+      kind: "system",
+      tabId: "code",
+      connections: [],
+    });
+    expect(code.kind).toBe("component");
   });
 });
 

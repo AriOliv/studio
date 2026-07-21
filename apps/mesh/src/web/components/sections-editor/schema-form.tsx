@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+import { resolveSchema } from "./resolve-schema";
 import type { LiveMeta, SchemaProperty } from "./resolve-schema";
 import type { FieldProps } from "./fields/field-props";
 import { StringField } from "./fields/string-field";
@@ -10,20 +12,29 @@ import { AnyOfField } from "./fields/any-of-field";
 import { DynamicOptionsField } from "./fields/dynamic-options-field";
 import { FileField } from "./fields/file-field";
 import { ImageField } from "./fields/image-field";
+import { InlineUnionField } from "./fields/inline-union-field";
+import { LocationField } from "./fields/location-field";
+import { MapField } from "./fields/map-field";
 import { MultivariateFieldWrapper } from "./fields/multivariate-field-wrapper";
 import { isSecretBlock, SecretField } from "./fields/secret-field";
 import {
   isMultivariateArrayWrapper,
   isPageMultivariateSectionArrayField,
+  isSectionMultivariateWrapperValue,
   unwrapMultivariateArrayValue,
   wrapMultivariateArrayValue,
 } from "./page-variants";
 import {
   breadcrumbPathForActiveField,
+  consumedBreadcrumbPrefix,
   fieldDisplayLabel,
+  isArrayDrillDownField,
   resolveActiveFieldKey,
 } from "./schema-form-breadcrumb";
-import { inferBlockRefArrayItemSchema } from "./block-ref-array-inference";
+import {
+  blockRefArrayItemSchemaFromRefs,
+  inferBlockRefArrayItemSchema,
+} from "./block-ref-array-inference";
 
 /** Skip internal deco properties that shouldn't be user-editable. */
 const HIDDEN_PROPS = new Set(["__resolveType", "@type"]);
@@ -147,7 +158,11 @@ export function renderField(props: FieldProps) {
     !isMultivariateArrayWrapper(value) &&
     schema.type === "block-ref"
   ) {
-    const items = inferBlockRefArrayItemSchema(value);
+    // Prefer the real item schema from the block-ref's loader/section branches
+    // (carries `titleBy`/`format`/`@image`); fall back to inferring from data.
+    const items =
+      blockRefArrayItemSchemaFromRefs(schema, value) ??
+      inferBlockRefArrayItemSchema(value);
     if (items) {
       const arraySchema: SchemaProperty = { ...schema, type: "array", items };
       return (
@@ -210,6 +225,11 @@ export function renderField(props: FieldProps) {
     return null;
   }
 
+  // inline-union → branch selector for plain "A or B" data unions (Location | Map)
+  if (schema.type === "inline-union") {
+    return <InlineUnionField key={props.path} {...props} />;
+  }
+
   // image-uri → ImageField (preview + image-only picker)
   if (schema.format === "image-uri") {
     return <ImageField key={props.path} {...props} />;
@@ -219,9 +239,19 @@ export function renderField(props: FieldProps) {
     return <FileField key={props.path} {...props} />;
   }
 
+  // map → MapField (Google Maps area selector encoded as "lat,lng,radius")
+  if (schema.format === "map") {
+    return <MapField key={props.path} {...props} />;
+  }
+
   // dynamic-options → DynamicOptionsField (select with options from a loader)
   if (schema.format === "dynamic-options" && schema.options) {
     return <DynamicOptionsField key={props.path} {...props} />;
+  }
+
+  // location → LocationField (country → region → city cascade; Brazil gets a map)
+  if (schema.format === "location") {
+    return <LocationField key={props.path} {...props} />;
   }
 
   // Enum (including extracted const enums)
@@ -283,7 +313,7 @@ export function renderField(props: FieldProps) {
     case "string": {
       // Format-based widgets
       const fmt = schema.format;
-      if (fmt === "color-input") {
+      if (fmt === "color-input" || fmt === "color") {
         return <StringField key={props.path} {...effectiveProps} />;
       }
       if (fmt === "textarea" || fmt === "rich-text" || fmt === "html") {
@@ -303,6 +333,62 @@ export function renderField(props: FieldProps) {
     default:
       return <StringField key={props.path} {...effectiveProps} />;
   }
+}
+
+/**
+ * Render the value of a single multivariate variant (its `value` field).
+ *
+ * Section variants hold a full section; render it through the normal
+ * block-ref/section editor (breadcrumbs + drill-down keep working). When the
+ * flag's `value` type couldn't be resolved (schema depth limits), fall back to
+ * resolving the concrete value's own `__resolveType`.
+ */
+function renderMultivariateInnerField(
+  props: FieldProps,
+  variantValueSchema: SchemaProperty | undefined,
+): ReactNode {
+  if (
+    variantValueSchema &&
+    (variantValueSchema.type === "block-ref" ||
+      variantValueSchema.anyOfRefs ||
+      variantValueSchema.properties)
+  ) {
+    return renderField({ ...props, schema: variantValueSchema });
+  }
+
+  const value = props.value;
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    typeof (value as Record<string, unknown>).__resolveType === "string" &&
+    props.meta
+  ) {
+    const innerSchema = resolveSchema(
+      (value as Record<string, unknown>).__resolveType as string,
+      props.meta,
+    );
+    if (innerSchema) {
+      return (
+        <SchemaForm
+          schema={innerSchema}
+          value={value}
+          onChange={props.onChange}
+          basePath={props.path}
+          breadcrumbPath={props.breadcrumbPath}
+          onBreadcrumbChange={props.onBreadcrumbChange}
+          meta={props.meta}
+          decofile={props.decofile}
+          onSaveReferencedBlock={props.onSaveReferencedBlock}
+          sandbox={props.sandbox}
+        />
+      );
+    }
+  }
+
+  return renderField(
+    variantValueSchema ? { ...props, schema: variantValueSchema } : props,
+  );
 }
 
 export function SchemaForm({
@@ -340,6 +426,38 @@ export function SchemaForm({
   const properties = schema.properties;
   if (!properties) return null;
 
+  // A section-level multivariate flag (`website/flags/multivariate/section.ts`)
+  // opened directly — e.g. a saved/global block that wraps a section in
+  // variants. Its schema is `{ variants: Variant<Section>[] }`, so the generic
+  // object form would render `variants` as a plain "Item 1 / Item 2" array.
+  // Render the variant editor (rule matcher + per-variant section form) instead.
+  if (isSectionMultivariateWrapperValue(value) && properties.variants) {
+    const variantValueSchema = properties.variants.items?.properties?.value;
+    return (
+      <MultivariateFieldWrapper
+        key={basePath}
+        schema={schema}
+        value={value}
+        onChange={onChange}
+        path={basePath}
+        label={schema.title ?? ""}
+        breadcrumbPath={breadcrumbPath}
+        onBreadcrumbChange={onBreadcrumbChange}
+        meta={meta}
+        decofile={decofile}
+        onSaveReferencedBlock={onSaveReferencedBlock}
+        previewBaseUrl={previewBaseUrl}
+        onAddSectionItem={onAddSectionItem}
+        onRequestAddSection={onRequestAddSection}
+        sandbox={sandbox}
+        multivariateResolveType={value.__resolveType}
+        renderInnerField={(fieldProps) =>
+          renderMultivariateInnerField(fieldProps, variantValueSchema)
+        }
+      />
+    );
+  }
+
   const objValue =
     value != null && typeof value === "object" && !Array.isArray(value)
       ? (value as Record<string, unknown>)
@@ -366,6 +484,15 @@ export function SchemaForm({
       ? objValue.__resolveType
       : undefined;
 
+  // When more than one array/drill-down field lives in this scope, an item's
+  // bare `[itemLabel]` breadcrumb is ambiguous (two label-less arrays both fall
+  // back to "Item N"), so array fields keep their own label as a disambiguator.
+  const hasSiblingDrillDownFields =
+    keys.filter((key) => {
+      const s = properties[key];
+      return s != null && isArrayDrillDownField(s, objValue[key]);
+    }).length > 1;
+
   const activeKey =
     breadcrumbPath.length > 0
       ? resolveActiveFieldKey(keys, properties, objValue, breadcrumbPath)
@@ -376,6 +503,24 @@ export function SchemaForm({
     activeKey && activeSchema
       ? breadcrumbPathForActiveField(activeKey, activeSchema, breadcrumbPath)
       : breadcrumbPath;
+  // `breadcrumbPathForActiveField` hands the active field a breadcrumb RELATIVE
+  // to itself (the crumbs it consumed are dropped from the front). The child
+  // reports changes through `onBreadcrumbChange`, which writes the GLOBAL trail,
+  // so we must re-prepend the crumbs we consumed — otherwise a child that
+  // rebuilds the trail (e.g. ArrayField.updateItem syncing an item's label as
+  // you type) drops the ancestor crumbs. That silent prefix loss is usually
+  // masked by label re-matching, but breaks when a consumed crumb equals the
+  // child's own crumb (e.g. an array labelled "Banner" whose only item is also
+  // labelled "Banner" because its label comes from `alt`): editing the label
+  // then collapses the trail and kicks you back to the list.
+  const consumedPrefix = consumedBreadcrumbPrefix(
+    breadcrumbPath,
+    fieldBreadcrumbPath,
+  );
+  const fieldOnBreadcrumbChange =
+    consumedPrefix.length > 0 && onBreadcrumbChange
+      ? (next: string[]) => onBreadcrumbChange([...consumedPrefix, ...next])
+      : onBreadcrumbChange;
   return (
     <div className="min-w-0 space-y-6">
       {visibleKeys.map((key) => {
@@ -391,7 +536,8 @@ export function SchemaForm({
           path: fieldPath,
           label,
           breadcrumbPath: fieldBreadcrumbPath,
-          onBreadcrumbChange,
+          onBreadcrumbChange: fieldOnBreadcrumbChange,
+          hasSiblingDrillDownFields,
           meta,
           decofile,
           onSaveReferencedBlock,

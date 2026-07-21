@@ -1,7 +1,7 @@
 /**
  * Tool Registry
  *
- * Central export for all MCP Mesh management tools.
+ * Central export for all Studio management tools.
  * Types are inferred from CORE_TOOLS — this is the source of truth.
  */
 
@@ -13,12 +13,13 @@ import { sharedJsonSchemaValidator } from "@decocms/mcp-utils";
 import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as ApiKeyTools from "./apiKeys";
-import * as CommerceDiscoveryTools from "./commerce-discovery";
+import * as CommerceDiscoveryTools from "./reports";
 import * as ConnectionTools from "./connection";
 import * as DatabaseTools from "./database";
 import * as VirtualMCPTools from "./virtual";
 import * as MonitoringTools from "./monitoring";
 import * as OrganizationTools from "./organization";
+import * as TaskBoardTools from "./task-board";
 import * as TagTools from "./tags";
 import * as ThreadTools from "./thread";
 import * as AutomationTools from "./automations";
@@ -49,6 +50,11 @@ export const CORE_TOOLS = [
   OrganizationTools.ORGANIZATION_DELETE,
   OrganizationTools.ORGANIZATION_SETTINGS_GET,
   OrganizationTools.ORGANIZATION_SETTINGS_UPDATE,
+  TaskBoardTools.TASK_BOARD_ITEM_CREATE,
+  TaskBoardTools.TASK_BOARD_ITEM_LIST,
+  TaskBoardTools.TASK_BOARD_ITEM_UPDATE,
+  TaskBoardTools.TASK_BOARD_ITEM_DELETE,
+  TaskBoardTools.TASK_BOARD_ITEM_PRS_GET,
   OrganizationTools.BRAND_CONTEXT_LIST,
   OrganizationTools.BRAND_CONTEXT_GET,
   OrganizationTools.BRAND_CONTEXT_CREATE,
@@ -78,6 +84,9 @@ export const CORE_TOOLS = [
   ConnectionTools.COLLECTION_CONNECTIONS_DELETE,
   ConnectionTools.CONNECTION_TEST,
   CommerceDiscoveryTools.COMMERCE_DISCOVERY_SETUP,
+  CommerceDiscoveryTools.COMMERCE_DISCOVERY_RUN,
+  CommerceDiscoveryTools.COMMERCE_DISCOVERY_BIND,
+  CommerceDiscoveryTools.COMMERCE_DISCOVERY_CONNECTION_STATUS,
 
   // Virtual MCP collection tools
   VirtualMCPTools.COLLECTION_VIRTUAL_MCP_CREATE,

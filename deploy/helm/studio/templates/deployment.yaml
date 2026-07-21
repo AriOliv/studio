@@ -91,6 +91,9 @@ spec:
             periodSeconds: 5
           lifecycle:
             preStop:
+              # Keep the listener open while external load balancers remove the
+              # terminating pod from their targets. After the hook completes,
+              # the nginx image's STOPSIGNAL (SIGQUIT) drains open connections.
               exec:
                 command: ["sleep", "{{ .Values.nginx.preStopSleepSeconds | default 15 }}"]
           {{- with .Values.nginx.resources }}

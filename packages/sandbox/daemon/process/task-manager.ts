@@ -1,10 +1,13 @@
 import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
 import { readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { appLogPath } from "../paths";
 import { LogTee } from "./log-tee";
 import { spawnPty } from "./pty-spawn";
+import { resolveShell } from "./resolve-shell";
 import { RingBuffer } from "./ring-buffer";
+import { SIGNAL_NUMBERS } from "./signal-numbers";
 import type { PhaseManager } from "./phase-manager";
 
 const RING_BUFFER_BYTES = 256 * 1024;
@@ -162,10 +165,7 @@ export class TaskManager {
       for (const t of this.tasks.values()) {
         if (t.status !== "running" || t.spec.logName !== spec.logName) continue;
         t.intentional = true;
-        t.kill("SIGTERM");
-        setTimeout(() => {
-          if (t.status === "running") t.kill("SIGKILL");
-        }, 3000);
+        this.killWithEscalation(t, "SIGTERM");
         waiters.push(t.finishedPromise);
       }
       if (waiters.length > 0) await Promise.all(waiters);
@@ -262,12 +262,12 @@ export class TaskManager {
     const t = this.tasks.get(id);
     if (!t) return false;
     if (t.status !== "running") return false;
-    t.kill(signal);
-    setTimeout(() => {
-      if (t.status === "running") {
-        t.kill("SIGKILL");
-      }
-    }, 3000);
+    // The only caller is the single-task Stop route — always a deliberate
+    // user stop, never an internal/automatic kill. Flag it so a WELL_KNOWN_STARTERS
+    // (dev script) task stopped this way isn't misread by the orchestrator's
+    // onTaskExit as a crash (see task-manager's `intentional` field docs).
+    t.intentional = true;
+    this.killWithEscalation(t, signal);
     return true;
   }
 
@@ -280,10 +280,7 @@ export class TaskManager {
     for (const t of this.tasks.values()) {
       if (t.status !== "running" || t.spec.logName !== logName) continue;
       if (opts?.intentional) t.intentional = true;
-      t.kill(signal);
-      setTimeout(() => {
-        if (t.status === "running") t.kill("SIGKILL");
-      }, 3000);
+      this.killWithEscalation(t, signal);
       count++;
     }
     return count;
@@ -293,11 +290,22 @@ export class TaskManager {
     let count = 0;
     for (const t of this.tasks.values()) {
       if (t.status === "running") {
-        t.kill("SIGTERM");
+        t.intentional = true;
+        this.killWithEscalation(t, "SIGTERM");
         count++;
       }
     }
     return count;
+  }
+
+  /** Signal a task, then escalate to SIGKILL after 3s if it's still running
+   *  (a stuck subprocess or a shell with a trap can ignore the first signal). */
+  private killWithEscalation(t: TaskInternal, signal: NodeJS.Signals): void {
+    t.kill(signal);
+    const escalate = setTimeout(() => {
+      if (t.status === "running") t.kill("SIGKILL");
+    }, 3000);
+    escalate.unref?.();
   }
 
   delete(id: string): boolean {
@@ -456,22 +464,67 @@ export class TaskManager {
   }
 
   private startPipe(task: TaskInternal): void {
+    const isWin32 = process.platform === "win32";
+    let shell: string;
+    try {
+      shell = isWin32 ? resolveShell("bash") : "bash";
+    } catch (e) {
+      // resolveShell throws synchronously (ShellNotFoundError) when no
+      // usable shell can be found — mirror startPty's catch shape so the
+      // failure finalizes this task instead of propagating into the route
+      // handler (which would otherwise see an uncaught exception).
+      const msg = `spawn error: ${(e as Error).message}\n`;
+      task.stderr.append(msg);
+      task.tee.write(msg);
+      this.fanOut(task, { stream: "stderr", data: msg });
+      queueMicrotask(() =>
+        this.finalize(task, { exitCode: -1, timedOut: false }),
+      );
+      return;
+    }
     const opts: Parameters<typeof nodeSpawn>[2] = {
       cwd: task.spec.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: task.spec.env,
-      detached: true,
+      // POSIX: detached so `-pgid` below can signal the whole process
+      // group. win32 has no process groups — `detached: true` there
+      // instead allocates the child a new console, which we don't want.
+      detached: !isWin32,
     };
     const child: ChildProcess = nodeSpawn(
-      "bash",
+      shell,
       ["-c", task.spec.command],
       opts,
     );
     task.pid = child.pid;
     task.pgid = child.pid;
+    // A multi-byte UTF-8 character can straddle two separate stdout/stderr
+    // 'data' events — decoding each Buffer chunk independently below would
+    // mangle it into replacement characters. StringDecoder carries the
+    // dangling bytes over to the next chunk instead.
+    const stdoutDecoder = new StringDecoder("utf-8");
+    const stderrDecoder = new StringDecoder("utf-8");
 
     const killGroup = (signal: NodeJS.Signals) => {
       if (task.pgid === undefined) return;
+      if (isWin32) {
+        // No POSIX process groups and no distinct signal semantics on
+        // win32 — any signal here means "terminate". `taskkill /T` walks
+        // the whole child tree (bash -c's descendants included). Fire and
+        // forget: the process may already be gone, and there's no group
+        // fallback to retry with.
+        try {
+          nodeSpawn("taskkill", ["/pid", String(task.pgid), "/T", "/F"]).on(
+            "error",
+            () => {
+              /* taskkill itself failed to spawn — nothing more we can do */
+            },
+          );
+        } catch {
+          /* taskkill not spawnable */
+        }
+        return;
+      }
       try {
         process.kill(-task.pgid, signal);
       } catch {
@@ -481,13 +534,13 @@ export class TaskManager {
     task.kill = (signal) => killGroup(signal ?? "SIGTERM");
 
     child.stdout?.on("data", (chunk: Buffer) => {
-      const data = chunk.toString("utf-8");
+      const data = stdoutDecoder.write(chunk);
       task.stdout.append(data);
       task.tee.write(data);
       this.fanOut(task, { stream: "stdout", data });
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      const data = chunk.toString("utf-8");
+      const data = stderrDecoder.write(chunk);
       task.stderr.append(data);
       task.tee.write(data);
       this.fanOut(task, { stream: "stderr", data });
@@ -501,12 +554,36 @@ export class TaskManager {
       }, task.spec.timeoutMs);
     }
 
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       if (task.timer) clearTimeout(task.timer);
       // Reap survivors of any backgrounded children.
       killGroup("SIGKILL");
+      // A trailing multi-byte UTF-8 sequence can still be buffered inside
+      // the decoder when the stream ends (no more bytes ever arrive to
+      // complete it) — flush it now so it isn't silently dropped.
+      const stdoutTail = stdoutDecoder.end();
+      if (stdoutTail) {
+        task.stdout.append(stdoutTail);
+        task.tee.write(stdoutTail);
+        this.fanOut(task, { stream: "stdout", data: stdoutTail });
+      }
+      const stderrTail = stderrDecoder.end();
+      if (stderrTail) {
+        task.stderr.append(stderrTail);
+        task.tee.write(stderrTail);
+        this.fanOut(task, { stream: "stderr", data: stderrTail });
+      }
+      // A signal-terminated child (e.g. our own SIGTERM/SIGKILL via
+      // kill()/killByLogName()) reports `code: null` here — mapping that
+      // to `1` collapsed every explicit kill into status "exited" instead
+      // of "killed". Map to the shell convention (128 + signal number),
+      // matching pty mode's shellExitCode, so finalize()'s `> 128` check
+      // classifies it correctly.
+      const exitCode = signal
+        ? 128 + (SIGNAL_NUMBERS[signal] ?? 1)
+        : (code ?? 1);
       this.finalize(task, {
-        exitCode: code ?? 1,
+        exitCode,
         timedOut: task.timedOut,
       });
     });
@@ -591,7 +668,8 @@ function summarize(t: TaskInternal): TaskSummary {
     startedAt: t.startedAt,
     finishedAt: t.finishedAt,
     timedOut: t.timedOut,
-    truncated: t.tee.isTruncated(),
+    truncated:
+      t.stdout.isTruncated() || t.stderr.isTruncated() || t.tee.isTruncated(),
     logName: t.spec.logName,
     intentional: t.intentional,
   };

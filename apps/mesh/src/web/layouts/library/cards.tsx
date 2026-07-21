@@ -85,6 +85,13 @@ function extOf(filename: string): string {
   return filename.split(".").pop()?.toLowerCase() ?? "";
 }
 
+/** Shared fetch-as-text helper for the card thumbnail/preview queries below. */
+async function fetchText(url: string, init?: RequestInit): Promise<string> {
+  const res = await fetch(url, { credentials: "include", ...init });
+  if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
+  return res.text();
+}
+
 /** Shared "Share" menu item — opens the share dialog for a file/folder. */
 function ShareMenuItem({ onShare }: { onShare: () => void }) {
   return (
@@ -164,6 +171,52 @@ function FileActions({
   );
 }
 
+/** Shared "Actions" dropdown for a card: browse/share/delete, whichever
+ *  the caller passes. Renders nothing if none are given. */
+function EntryActionsMenu({
+  label,
+  onBrowse,
+  onShare,
+  onDelete,
+}: {
+  label: string;
+  onBrowse?: () => void;
+  onShare?: () => void;
+  onDelete?: () => void;
+}) {
+  if (!onBrowse && !onShare && !onDelete) return undefined;
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6 shrink-0 opacity-0 transition-opacity group-hover/card:opacity-100 data-[state=open]:opacity-100"
+          onClick={(e) => e.stopPropagation()}
+          aria-label={`Actions for ${label}`}
+        >
+          <DotsVertical size={14} />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+        {onBrowse && (
+          <DropdownMenuItem onClick={onBrowse}>
+            <Folder size={14} />
+            Browse files
+          </DropdownMenuItem>
+        )}
+        {onShare && <ShareMenuItem onShare={onShare} />}
+        {onDelete && (
+          <DropdownMenuItem variant="destructive" onClick={onDelete}>
+            <Trash01 size={14} />
+            Delete
+          </DropdownMenuItem>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 function CardShell({
   onOpen,
   children,
@@ -231,7 +284,12 @@ function CardHeader({
           )}
         </div>
         {subtitle && (
-          <span className="text-xs text-muted-foreground">{subtitle}</span>
+          <span
+            className="truncate text-xs text-muted-foreground"
+            title={subtitle}
+          >
+            {subtitle}
+          </span>
         )}
       </div>
       {actions}
@@ -278,33 +336,11 @@ export function FolderCard({
         subtitle={subtitle}
         publicState={publicState}
         actions={
-          onShare || onDelete ? (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-6 shrink-0 opacity-0 transition-opacity group-hover/card:opacity-100 data-[state=open]:opacity-100"
-                  onClick={(e) => e.stopPropagation()}
-                  aria-label={`Actions for ${name}`}
-                >
-                  <DotsVertical size={14} />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                align="end"
-                onClick={(e) => e.stopPropagation()}
-              >
-                {onShare && <ShareMenuItem onShare={onShare} />}
-                {onDelete && (
-                  <DropdownMenuItem variant="destructive" onClick={onDelete}>
-                    <Trash01 size={14} />
-                    Delete
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          ) : undefined
+          <EntryActionsMenu
+            label={name}
+            onShare={onShare}
+            onDelete={onDelete}
+          />
         }
       />
     </CardShell>
@@ -315,6 +351,7 @@ export function FileCard({
   filename,
   updatedAt,
   downloadUrl,
+  subtitle,
   publicState,
   onOpen,
   onShare,
@@ -323,6 +360,8 @@ export function FileCard({
   filename: string;
   updatedAt: string;
   downloadUrl: string;
+  /** Overrides the file-type description (e.g. the containing folder). */
+  subtitle?: string;
   publicState?: PublicState;
   onOpen: () => void;
   onShare?: () => void;
@@ -336,7 +375,7 @@ export function FileCard({
         }
         name={filename}
         meta={timeAgo(updatedAt)}
-        subtitle={describeFileType(filename)}
+        subtitle={subtitle ?? describeFileType(filename)}
         publicState={publicState}
         actions={
           <FileActions
@@ -381,11 +420,7 @@ export function SkillCard({
 }) {
   const { data } = useQuery({
     queryKey: KEYS.fileText(skillMdUrl),
-    queryFn: async () => {
-      const res = await fetch(skillMdUrl, { credentials: "include" });
-      if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
-      return res.text();
-    },
+    queryFn: () => fetchText(skillMdUrl),
     staleTime: 60_000,
     retry: false,
   });
@@ -404,35 +439,12 @@ export function SkillCard({
         subtitle="Skill"
         publicState={publicState}
         actions={
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-6 shrink-0 opacity-0 transition-opacity group-hover/card:opacity-100 data-[state=open]:opacity-100"
-                onClick={(e) => e.stopPropagation()}
-                aria-label={`Actions for ${dirName}`}
-              >
-                <DotsVertical size={14} />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="end"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <DropdownMenuItem onClick={onBrowse}>
-                <Folder size={14} />
-                Browse files
-              </DropdownMenuItem>
-              {onShare && <ShareMenuItem onShare={onShare} />}
-              {onDelete && (
-                <DropdownMenuItem variant="destructive" onClick={onDelete}>
-                  <Trash01 size={14} />
-                  Delete
-                </DropdownMenuItem>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <EntryActionsMenu
+            label={dirName}
+            onBrowse={onBrowse}
+            onShare={onShare}
+            onDelete={onDelete}
+          />
         }
       />
       <p className="line-clamp-2 min-h-8 text-xs leading-4 text-muted-foreground">
@@ -467,11 +479,7 @@ export function BrandCard({
 }) {
   const { data } = useQuery({
     queryKey: KEYS.fileText(tokensUrl),
-    queryFn: async () => {
-      const res = await fetch(tokensUrl, { credentials: "include" });
-      if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
-      return res.text();
-    },
+    queryFn: () => fetchText(tokensUrl),
     staleTime: 60_000,
     retry: false,
   });
@@ -493,34 +501,11 @@ export function BrandCard({
         meta={timeAgo(updatedAt)}
         subtitle="Brand"
         actions={
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-6 shrink-0 opacity-0 transition-opacity group-hover/card:opacity-100 data-[state=open]:opacity-100"
-                onClick={(e) => e.stopPropagation()}
-                aria-label={`Actions for ${dirName}`}
-              >
-                <DotsVertical size={14} />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="end"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <DropdownMenuItem onClick={onBrowse}>
-                <Folder size={14} />
-                Browse files
-              </DropdownMenuItem>
-              {onDelete && (
-                <DropdownMenuItem variant="destructive" onClick={onDelete}>
-                  <Trash01 size={14} />
-                  Delete
-                </DropdownMenuItem>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <EntryActionsMenu
+            label={dirName}
+            onBrowse={onBrowse}
+            onDelete={onDelete}
+          />
         }
       />
       <div className="flex min-h-5 items-center gap-1.5">
@@ -565,11 +550,7 @@ function LazyThumb({ children }: { children: ReactNode }) {
 function TextThumb({ url }: { url: string }) {
   const { data } = useQuery({
     queryKey: KEYS.fileText(url),
-    queryFn: async () => {
-      const res = await fetch(url, { credentials: "include" });
-      if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
-      return res.text();
-    },
+    queryFn: () => fetchText(url),
     staleTime: 60_000,
     retry: false,
   });
@@ -584,14 +565,7 @@ function TextThumb({ url }: { url: string }) {
 function CsvThumb({ url, ext }: { url: string; ext: string }) {
   const { data } = useQuery({
     queryKey: KEYS.csvThumb(url),
-    queryFn: async () => {
-      const res = await fetch(url, {
-        credentials: "include",
-        headers: { Range: "bytes=0-8191" },
-      });
-      if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
-      return res.text();
-    },
+    queryFn: () => fetchText(url, { headers: { Range: "bytes=0-8191" } }),
     staleTime: 60_000,
     retry: false,
   });
@@ -705,6 +679,8 @@ export function RecentFileCard(props: {
   updatedAt: string;
   size: number;
   downloadUrl: string;
+  /** Overrides the file-type description (e.g. the containing folder). */
+  subtitle?: string;
   publicState?: PublicState;
   onOpen: () => void;
   onShare?: () => void;
@@ -721,7 +697,7 @@ export function RecentFileCard(props: {
         }
         name={props.filename}
         meta={timeAgo(props.updatedAt)}
-        subtitle={describeFileType(props.filename)}
+        subtitle={props.subtitle ?? describeFileType(props.filename)}
         publicState={props.publicState}
         actions={
           <FileActions

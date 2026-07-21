@@ -51,14 +51,14 @@ export interface PackageManagerConfig {
 export interface Application {
   readonly packageManager?: PackageManagerConfig;
   readonly runtime?: RuntimeName;
-  /** Port the dev script binds to (set as PORT env). Mesh always supplies this. */
+  /** Port the dev script binds to (set as PORT env). Studio always supplies this. */
   readonly port?: number;
 }
 
 /**
  * User-intent state for a sandboxed application. The daemon never writes this
  * file — `<repoDir>/.decocms/daemon.json` is read at boot as a fallback for
- * fields the mesh didn't supply, and any further refinements (lockfile-based
+ * fields the studio didn't supply, and any further refinements (lockfile-based
  * package manager / runtime detection) happen in memory only. The file lives
  * in the repo iff a tenant chose to commit it themselves.
  */
@@ -71,8 +71,8 @@ export interface TenantConfig {
 
 /** In-memory enriched view: TenantConfig + derivations. */
 export interface EnrichedTenantConfig extends TenantConfig {
-  /** Computed from `application.runtime`. */
-  readonly runtimePathPrefix: string;
+  /** Computed from `application.runtime` — PATH dirs to prepend for structured commands. */
+  readonly runtimePathDirs: readonly string[];
 }
 
 /** What the rest of the daemon (orchestrator, routes) sees. */

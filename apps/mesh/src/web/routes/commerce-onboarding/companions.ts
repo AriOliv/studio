@@ -1,29 +1,39 @@
 export interface CompanionCopy {
   /** Registry item id pointer, e.g. "deco/vtex" — reliable resolution path. */
   registryAppId: string;
-  /** Static "+ N checks" number (editorial). */
-  checks: number;
-  /** Primary value line under the card. */
+  /** Business area this source opens up (e.g. "Funil", "Catálogo") — a scannable
+   *  tag oriented to the merchant's business, not our internal check count. */
+  area: string;
+  /** Primary value line under the card — the revenue outcome connecting reveals.
+   *  Kept short so it renders in ~2 lines without truncation. */
   headline: string;
   /** Extra unlock bullet lines. */
   bullets?: string[];
 }
 
-// NOTE: copy is placeholder pending final strings from design (Figma node 8669-25470).
+// Business-oriented copy: each card names the area of the merchant's operation
+// it opens up (area tag) and the revenue outcome it reveals (headline), instead
+// of an internal "+N verificações" count that means nothing to a store owner.
+// NOTE: wording still open for design review (Figma node 8669-25470).
 export const COMMERCE_COMPANION_MCPS: Record<string, CompanionCopy> = {
   vtex: {
     registryAppId: "deco/vtex",
-    checks: 49,
-    headline: "Out-of-stock, thin PDPs & attribute gaps across every SKU",
+    area: "Catálogo",
+    headline: "Rupturas e PDPs que travam suas vendas.",
   },
   "google-analytics": {
     registryAppId: "deco/google-analytics",
-    checks: 49,
-    headline: "Where revenue leaks between product view and checkout",
+    area: "Funil",
+    headline: "Onde a receita vaza no seu funil.",
   },
   "google-search-console": {
     registryAppId: "deco/google-search-console",
-    checks: 49,
-    headline: "Search visibility & indexing gaps across your catalog",
+    area: "Busca",
+    headline: "O tráfego de busca que você deixa na mesa.",
+  },
+  github: {
+    registryAppId: "deco/mcp-github",
+    area: "Engenharia",
+    headline: "A saúde da entrega de código por trás da sua loja.",
   },
 };

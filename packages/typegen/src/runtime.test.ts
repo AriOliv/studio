@@ -67,6 +67,25 @@ describe("createMeshClient", () => {
     );
   });
 
+  test("throws a message naming the tool even with no text content", async () => {
+    mockCallTool.mockResolvedValueOnce({
+      isError: true,
+      content: [],
+    });
+
+    type Tools = {
+      FAIL_TOOL: { input: Record<string, never>; output: unknown };
+    };
+    const client = createMeshClient<Tools>(
+      { mcpId: "vmc_test", apiKey: "sk" },
+      deps,
+    );
+
+    await expect(client.FAIL_TOOL({})).rejects.toThrow(
+      'Tool "FAIL_TOOL" failed',
+    );
+  });
+
   test("close() closes the underlying client and allows reconnect", async () => {
     type Tools = { TOOL: { input: Record<string, never>; output: unknown } };
     const client = createMeshClient<Tools>(
@@ -82,6 +101,36 @@ describe("createMeshClient", () => {
 
     await client.TOOL({});
     expect(mockConnect).toHaveBeenCalledTimes(2);
+  });
+
+  test("retries connecting after a failed connect instead of caching the rejection forever", async () => {
+    mockConnect.mockRejectedValueOnce(new Error("network blip"));
+
+    type Tools = { TOOL: { input: Record<string, never>; output: unknown } };
+    const client = createMeshClient<Tools>(
+      { mcpId: "vmc_test", apiKey: "sk" },
+      deps,
+    );
+
+    await expect(client.TOOL({})).rejects.toThrow("network blip");
+
+    // Transient failure resolved — a later call should retry, not replay the
+    // same cached rejection forever.
+    await expect(client.TOOL({})).resolves.toEqual({
+      tool: "TOOL",
+      args: {},
+    });
+    expect(mockConnect).toHaveBeenCalledTimes(2);
+  });
+
+  test("is not treated as a thenable (await would otherwise hang forever)", () => {
+    type Tools = { TOOL: { input: Record<string, never>; output: unknown } };
+    const client = createMeshClient<Tools>(
+      { mcpId: "vmc_test", apiKey: "sk" },
+      deps,
+    );
+
+    expect(client.then).toBeUndefined();
   });
 
   test("builds URL with correct mcpId and baseUrl", async () => {

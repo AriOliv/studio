@@ -12,10 +12,10 @@ import { setCookie, getCookie } from "hono/cookie";
 import * as jose from "jose";
 import { getSettings } from "../../settings";
 import type { StudioContext } from "../../core/studio-context";
-import { ADMIN_ROLES } from "../../auth/roles";
+import { hasAdminRole } from "../../auth/roles";
 
 type Variables = {
-  meshContext: StudioContext;
+  studioContext: StudioContext;
 };
 
 export const createSsoRoutes = () => {
@@ -37,7 +37,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: GET /api/org-sso/status?orgId=<id>
    */
   app.get("/status", async (c) => {
-    const ctx = c.get("meshContext") as StudioContext;
+    const ctx = c.get("studioContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -81,7 +81,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: GET /api/org-sso/authorize?orgId=<id>
    */
   app.get("/authorize", async (c) => {
-    const ctx = c.get("meshContext") as StudioContext;
+    const ctx = c.get("studioContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -152,7 +152,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: GET /api/org-sso/callback
    */
   app.get("/callback", async (c) => {
-    const ctx = c.get("meshContext") as StudioContext;
+    const ctx = c.get("studioContext") as StudioContext;
 
     const code = c.req.query("code");
     const state = c.req.query("state");
@@ -297,7 +297,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: GET /api/org-sso/config
    */
   app.get("/config", async (c) => {
-    const ctx = c.get("meshContext") as StudioContext;
+    const ctx = c.get("studioContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -329,7 +329,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: POST /api/org-sso/config
    */
   app.post("/config", async (c) => {
-    const ctx = c.get("meshContext") as StudioContext;
+    const ctx = c.get("studioContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -408,7 +408,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: POST /api/org-sso/config/enforce
    */
   app.post("/config/enforce", async (c) => {
-    const ctx = c.get("meshContext") as StudioContext;
+    const ctx = c.get("studioContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -441,7 +441,7 @@ function registerSsoRoutes(app: SsoApp) {
    * Route: DELETE /api/org-sso/config
    */
   app.delete("/config", async (c) => {
-    const ctx = c.get("meshContext") as StudioContext;
+    const ctx = c.get("studioContext") as StudioContext;
     if (!ctx.auth.user) {
       return c.json({ error: "Authentication required" }, 401);
     }
@@ -606,12 +606,19 @@ async function getOrgMembership(
   return row ?? null;
 }
 
-function isOrgAdmin(ctx: StudioContext): boolean {
-  const role = ctx.auth.user?.role;
-  if (!role) return false;
-  return (ADMIN_ROLES as readonly string[]).includes(role);
+/**
+ * `ctx.auth.user?.role` reflects the session's ACTIVE org, which can differ
+ * from `ctx.organization` here (an org-scoped call can target an org the
+ * caller merely holds a lower-privileged membership in) — using it would let
+ * an owner/admin of a DIFFERENT org manage this org's SSO config. Use the
+ * path-resolved role on `ctx.organization` instead, which `resolveOrgFromPath`
+ * sets to the caller's real membership row in the TARGET org.
+ */
+export function isOrgAdmin(ctx: StudioContext): boolean {
+  return hasAdminRole(ctx.organization?.role);
 }
 
-function isOrgOwner(ctx: StudioContext): boolean {
-  return ctx.auth.user?.role === "owner";
+export function isOrgOwner(ctx: StudioContext): boolean {
+  const role = ctx.organization?.role;
+  return !!role && role.split(",").includes("owner");
 }

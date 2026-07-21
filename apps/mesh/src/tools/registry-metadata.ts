@@ -37,7 +37,8 @@ export type ToolCategory =
   | "GitHub"
   | "VM"
   | "Links"
-  | "Search";
+  | "Search"
+  | "Task Board";
 
 /**
  * All tool names - keep in sync with CORE_TOOLS in index.ts
@@ -79,6 +80,9 @@ const ALL_TOOL_NAMES = [
   "COLLECTION_CONNECTIONS_DELETE",
   "CONNECTION_TEST",
   "COMMERCE_DISCOVERY_SETUP",
+  "COMMERCE_DISCOVERY_RUN",
+  "COMMERCE_DISCOVERY_BIND",
+  "COMMERCE_DISCOVERY_CONNECTION_STATUS",
   // Virtual MCP tools
   "COLLECTION_VIRTUAL_MCP_CREATE",
   "COLLECTION_VIRTUAL_MCP_LIST",
@@ -213,6 +217,13 @@ const ALL_TOOL_NAMES = [
 
   // Search tools
   "GLOBAL_SEARCH",
+
+  // Task board tools
+  "TASK_BOARD_ITEM_CREATE",
+  "TASK_BOARD_ITEM_LIST",
+  "TASK_BOARD_ITEM_UPDATE",
+  "TASK_BOARD_ITEM_DELETE",
+  "TASK_BOARD_ITEM_PRS_GET",
 ] as const;
 
 /**
@@ -430,6 +441,21 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
   {
     name: "COMMERCE_DISCOVERY_SETUP",
     description: "Set up Commerce Discovery",
+    category: "Connections",
+  },
+  {
+    name: "COMMERCE_DISCOVERY_RUN",
+    description: "Run Commerce Discovery",
+    category: "Connections",
+  },
+  {
+    name: "COMMERCE_DISCOVERY_BIND",
+    description: "Bind Commerce Discovery data source",
+    category: "Connections",
+  },
+  {
+    name: "COMMERCE_DISCOVERY_CONNECTION_STATUS",
+    description: "Read Commerce Discovery connection status",
     category: "Connections",
   },
   {
@@ -989,6 +1015,33 @@ export const MANAGEMENT_TOOLS: ToolMetadata[] = [
       "Search across organization resources (currently threads). Returns a typed union of matches.",
     category: "Search",
   },
+  // Task board tools
+  {
+    name: "TASK_BOARD_ITEM_CREATE",
+    description: "Create task board item",
+    category: "Task Board",
+  },
+  {
+    name: "TASK_BOARD_ITEM_LIST",
+    description: "List task board items",
+    category: "Task Board",
+  },
+  {
+    name: "TASK_BOARD_ITEM_UPDATE",
+    description: "Update task board item",
+    category: "Task Board",
+  },
+  {
+    name: "TASK_BOARD_ITEM_DELETE",
+    description: "Delete task board item",
+    category: "Task Board",
+    dangerous: true,
+  },
+  {
+    name: "TASK_BOARD_ITEM_PRS_GET",
+    description: "Get a task board item's linked pull requests with live state",
+    category: "Task Board",
+  },
 ];
 
 // ============================================================================
@@ -1085,6 +1138,13 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       // the run fence token, same trust boundary as the chat turn itself.
       "THREAD_BACKGROUND_TOOL_START",
       "THREAD_SUBTASK_DELIVER",
+      // Task board — org-scoped, usable by every member, same basic-usage
+      // tier as chat threads.
+      "TASK_BOARD_ITEM_CREATE",
+      "TASK_BOARD_ITEM_LIST",
+      "TASK_BOARD_ITEM_UPDATE",
+      "TASK_BOARD_ITEM_DELETE",
+      "TASK_BOARD_ITEM_PRS_GET",
     ],
   },
   // Organization
@@ -1144,6 +1204,9 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       "COLLECTION_CONNECTIONS_UPDATE",
       "COLLECTION_CONNECTIONS_DELETE",
       "COMMERCE_DISCOVERY_SETUP",
+      "COMMERCE_DISCOVERY_RUN",
+      "COMMERCE_DISCOVERY_BIND",
+      "COMMERCE_DISCOVERY_CONNECTION_STATUS",
     ],
     dangerous: true,
   },

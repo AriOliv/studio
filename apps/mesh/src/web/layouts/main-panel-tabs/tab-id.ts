@@ -144,15 +144,48 @@ export function parseLibraryFileTabId(
   }
 }
 
+export interface CodeTabParsed {
+  /** File to open in the code tab, or null for the bare file-tree view. */
+  path: string | null;
+}
+
+/** Paths carry `/`, so the tab id encodes them to keep the
+ *  `<kind>:<rest>` grammar unambiguous in the `?main=` URL param. */
+export function formatCodeTabId(path: string): string {
+  return `code:${encodeURIComponent(path)}`;
+}
+
+export function parseCodeTabId(
+  tabId: string | undefined,
+): CodeTabParsed | null {
+  if (!tabId) return null;
+  if (tabId === "code") return { path: null };
+  if (!tabId.startsWith("code:")) return null;
+  const encoded = tabId.slice("code:".length);
+  if (!encoded) return null;
+  try {
+    return { path: decodeURIComponent(encoded) };
+  } catch {
+    return null;
+  }
+}
+
 export const FIXED_SYSTEM_TABS = [
+  "overview",
   "settings",
   "automations",
   "preview",
+  "code",
   "content",
   "git",
 ] as const;
 
 const FIXED_SYSTEM_TAB_SET = new Set<string>(FIXED_SYSTEM_TABS);
+
+// Agent-independent overlays (Tasks `board`, Library `files`) take over the
+// whole panel and aren't sandbox-backed views. Shared by the drawer-visibility
+// check and the in-panel-app navigate allowlist so the two stay in sync.
+export const OVERLAY_TABS = new Set(["board", "files"]);
 
 /**
  * Returns true for tab ids that are scoped to a specific thread and must not
@@ -162,6 +195,9 @@ const FIXED_SYSTEM_TAB_SET = new Set<string>(FIXED_SYSTEM_TABS);
  *   - "file:<encoded key>"            (ephemeral thread-output file preview)
  *   - "deck:<encoded path>"           (ephemeral HTML-artifact preview/editor)
  *   - "library-file:<encoded path>"   (ephemeral org Library file preview)
+ *   - "code:<encoded path>"           (open file in the Code tab's file explorer,
+ *     scoped to the task's branch/sandbox — the bare "code" tab id is NOT
+ *     per-thread, only a specific open path is)
  */
 export function isPerThreadTab(tabId: string): boolean {
   return (
@@ -169,7 +205,8 @@ export function isPerThreadTab(tabId: string): boolean {
     tabId.startsWith("automation:") ||
     tabId.startsWith("file:") ||
     tabId.startsWith("deck:") ||
-    tabId.startsWith("library-file:")
+    tabId.startsWith("library-file:") ||
+    tabId.startsWith("code:")
   );
 }
 
@@ -217,15 +254,16 @@ export function resolveDefaultTabId(
 }
 
 export function resolveActiveTabAndOpen(ctx: {
-  mainParam: string | undefined;
+  mainParam: string | 0 | undefined;
   metadata: EntityLayoutMetadata | null;
 }): { mainOpen: boolean; activeTab: string } {
+  const mainParam = ctx.mainParam === 0 ? "0" : ctx.mainParam;
   const def = resolveDefaultTabId(ctx.metadata);
 
-  if (ctx.mainParam === "0") {
+  if (mainParam === "0") {
     return { mainOpen: false, activeTab: def };
   }
-  if (ctx.mainParam === undefined) {
+  if (mainParam === undefined) {
     // Mirror resolveDefaultPanelState: a chat-default (or absent default)
     // keeps the main panel closed so the header tab bar doesn't highlight
     // a tab while the panel is 0px wide.
@@ -234,10 +272,10 @@ export function resolveActiveTabAndOpen(ctx: {
     return { mainOpen: !defaultIsChat, activeTab: def };
   }
   // Legacy ids coming from URL state migrate to the unified settings tab.
-  if (LEGACY_SETTINGS_TABS.has(ctx.mainParam)) {
+  if (LEGACY_SETTINGS_TABS.has(mainParam)) {
     return { mainOpen: true, activeTab: "settings" };
   }
-  return { mainOpen: true, activeTab: ctx.mainParam };
+  return { mainOpen: true, activeTab: mainParam };
 }
 
 /**
@@ -250,8 +288,8 @@ export function resolveTabClickTarget(ctx: {
   clickedId: string;
   activeTab: string;
   mainOpen: boolean;
-}): string {
-  if (ctx.mainOpen && ctx.clickedId === ctx.activeTab) return "0";
+}): string | 0 {
+  if (ctx.mainOpen && ctx.clickedId === ctx.activeTab) return 0;
   return ctx.clickedId;
 }
 
@@ -272,14 +310,14 @@ export function isAutomationsPillActive(ctx: {
 /**
  * Click target for the Automations pill.
  *
- * - On the list with the panel open → close (`"0"`).
+ * - On the list with the panel open → close (`0`).
  * - On a detail view → navigate up to the list (`"automations"`).
  * - Otherwise (panel closed or on a different tab) → open the list.
  */
 export function resolveAutomationsPillClickTarget(ctx: {
   activeTab: string;
   mainOpen: boolean;
-}): string {
-  if (ctx.mainOpen && ctx.activeTab === "automations") return "0";
+}): string | 0 {
+  if (ctx.mainOpen && ctx.activeTab === "automations") return 0;
   return "automations";
 }

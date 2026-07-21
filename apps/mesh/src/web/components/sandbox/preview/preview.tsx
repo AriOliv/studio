@@ -1,13 +1,16 @@
+import { sleep } from "@decocms/std";
 import { useState, useRef, useEffect, Suspense, lazy } from "react";
-import { useInsetContext } from "@/web/layouts/agent-shell-layout";
+import { useNavigate } from "@tanstack/react-router";
+import { formatCodeTabId } from "@/web/layouts/main-panel-tabs/tab-id";
 import { useChatTask } from "@/web/components/chat/context";
 import { useProjectContext } from "@decocms/mesh-sdk";
 import { useSandboxLifecycle } from "@/web/components/sandbox/hooks/sandbox-lifecycle-context";
+import { useIsMobile } from "@deco/ui/hooks/use-mobile.ts";
 
 import {
   ChevronDown,
   Code01,
-  Code02,
+  CornerDownLeft,
   CursorClick01,
   DotsHorizontal,
   Globe02,
@@ -17,7 +20,6 @@ import {
   SearchLg,
   CreditCardSearch,
   TextInput,
-  Loading01,
   Monitor04,
   Phone02,
   RefreshCw01,
@@ -26,14 +28,11 @@ import {
 import { cn } from "@deco/ui/lib/utils.js";
 import { Button } from "@deco/ui/components/button.tsx";
 import {
-  ViewModeToggle,
-  type ViewModeOption,
-} from "@deco/ui/components/view-mode-toggle.tsx";
-import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@deco/ui/components/tooltip.tsx";
+import { ToolbarIconButton } from "@/web/components/toolbar-icon-button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -43,19 +42,18 @@ import {
 } from "@deco/ui/components/dropdown-menu.tsx";
 import { useDecofile } from "@/web/components/sections-editor/use-decofile";
 import { withVariantMatcherOverride } from "@/web/components/sections-editor/variant-matcher-override";
-import { parseSections } from "@/web/components/sections-editor/parse-sections";
-import { getPageVariantSectionsAt } from "@/web/components/sections-editor/page-variants";
 import { useLiveMeta } from "@/web/components/sections-editor/use-live-meta";
 import {
   extractGlobalSections,
   extractPages,
   findPageForPath,
-  hasEditableDecoContent,
   type GlobalSectionEntry,
   type PageEntry,
 } from "@/web/components/sections-editor/page-list";
 import {
+  fillPathTemplate,
   normalizePagePath,
+  splitPathTemplate,
   validatePagePath,
 } from "@/web/components/sections-editor/page-path-utils";
 import { decoBlockFileViewPath } from "@/web/components/sections-editor/deco-block-key";
@@ -70,26 +68,55 @@ import {
   type VisualEditorPayload,
 } from "./visual-editor-script";
 import { CMS_EDITOR_SCRIPT, CmsEditorPayloadSchema } from "./cms-editor-script";
+import { parseSections } from "@/web/components/sections-editor/parse-sections";
+import { resolveSectionCandidates } from "./section-candidates";
+import { getPageVariantSectionsAt } from "@/web/components/sections-editor/page-variants";
 import { VisualEditorPrompt } from "./visual-editor-prompt";
 import {
   useSandboxEvents,
   useSandboxReloadHandler,
 } from "../hooks/use-sandbox-events";
 import { SandboxStateCard } from "./state-card";
+import {
+  lastPreviewPageKey,
+  readLastPreviewPage,
+  writeLastPreviewPage,
+  type LastPreviewPage,
+} from "./last-preview-page";
 import { derivePhaseProgress } from "./derive-phase-progress";
+import { ideDeepLink } from "../ide-deep-link";
+import {
+  classifyParamKinds,
+  collectPageLoaderResolveTypes,
+  commercePlatformsFromLoaders,
+  resolveOptionSources,
+  type OptionSource,
+} from "./path-param-picker";
+import {
+  PathParamAutoFill,
+  PathParamPickerChip,
+} from "./path-param-picker-chip";
+import { manifestLoaderResolveTypes } from "@/web/components/sandbox/content/runnable-catalog";
 import { track } from "@/web/lib/posthog-client";
 import { useSandboxRepoDir } from "../hooks/use-sandbox-repo-dir";
+import { useBlocksPreviewWorkspace } from "@/web/components/sandbox/blocks/blocks-preview-workspace-context";
+import { BlocksPanel } from "@/web/components/sandbox/blocks/blocks-panel";
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+  type ImperativePanelHandle,
+} from "@/web/components/resizable";
+import {
+  togglePreviewEditorMode,
+  type PreviewEditingMode,
+  type PreviewEditorMode,
+} from "./editing-mode";
 
 const VSCODE_ICON_URL =
   "https://decoims.com/decocms/01b321bd-4613-4b2c-9348-35058444d210/Visual_Studio_Code_1.35_icon.svg.png";
 const CURSOR_ICON_URL =
   "https://decoims.com/decocms/7583d3b5-81d0-4afb-becf-6a59bbb3a68e/cursor-logo-icon-freelogovectors.net_.png";
-
-const SectionsEditor = lazy(() =>
-  import("@/web/components/sections-editor/sections-editor").then((m) => ({
-    default: m.SectionsEditor,
-  })),
-);
 
 const SeoSheet = lazy(() =>
   import("@/web/components/sections-editor/page-seo-sheet").then((m) => ({
@@ -97,16 +124,9 @@ const SeoSheet = lazy(() =>
   })),
 );
 
-const FileExplorer = lazy(() =>
-  import("./file-explorer/file-explorer").then((m) => ({
-    default: m.FileExplorer,
-  })),
-);
-
 /** Delay before reloading the preview iframe after a save, giving the dev server time to pick up file changes. */
 const DEV_SERVER_SETTLE_MS = 500;
 
-type PreviewViewMode = "preview" | "visual" | "cms" | "code";
 type PreviewDeviceSize = "mobile" | "tablet" | "desktop";
 
 const PREVIEW_DEVICE_WIDTHS: Record<PreviewDeviceSize, number | null> = {
@@ -123,67 +143,76 @@ const DEVICE_LABELS: Record<PreviewDeviceSize, string> = {
   desktop: "Desktop",
 };
 
-const LAZY_RESOLVE_TYPE = "website/sections/Rendering/Lazy.tsx";
-
 /**
- * Candidate top-level `data-manifest-key`s a page section can render as, used
- * iframe-side to align the editable run within the DOM. Saved-block refs
- * (globals) resolve to their underlying component. A Lazy returns BOTH its
- * loader key and the inner section's key — the classic runtime keeps the Lazy
- * wrapper at top level, TanStack renders the inner section directly. Multivariate
- * flags render an unpredictable active variant, so they return [] (a wildcard
- * the iframe treats as "matches anything").
+ * Inline editor for one `:param` or `*` (catch-all) token, rendered in place
+ * inside the URL label. Grows with its content and commits on Enter/blur.
  */
-function resolveSectionCandidates(
-  section: { __resolveType?: unknown; section?: unknown; variants?: unknown },
-  decofile: Record<string, unknown>,
-): string[] {
-  let obj: { __resolveType?: unknown; section?: unknown; variants?: unknown } =
-    section;
-  let rt = typeof obj?.__resolveType === "string" ? obj.__resolveType : "";
-  for (let i = 0; rt && i < 5; i++) {
-    const block = decofile[rt];
-    if (block && typeof block === "object" && "__resolveType" in block) {
-      const next = (block as { __resolveType?: unknown }).__resolveType;
-      if (typeof next === "string" && next && next !== rt) {
-        obj = block as typeof obj;
-        rt = next;
-        continue;
-      }
-    }
-    break;
-  }
-  if (!rt) return [];
-  // Multivariate (A/B) renders one of its variants — collect every variant's
-  // possible key so it matches whichever rendered (NOT a blind wildcard, which
-  // could otherwise grab an adjacent framework section).
-  if (rt.includes("flags/multivariate")) {
-    const variants = Array.isArray(obj.variants) ? obj.variants : [];
-    const keys: string[] = [];
-    for (const v of variants) {
-      const value = (v as { value?: unknown })?.value;
-      if (value && typeof value === "object") {
-        for (const k of resolveSectionCandidates(
-          value as { __resolveType?: unknown },
-          decofile,
-        )) {
-          if (!keys.includes(k)) keys.push(k);
-        }
-      }
-    }
-    return keys;
-  }
-  if (rt === LAZY_RESOLVE_TYPE) {
-    const inner =
-      obj.section && typeof obj.section === "object"
-        ? resolveSectionCandidates(
-            obj.section as { __resolveType?: unknown },
-            decofile,
-          )
-        : [];
-    return inner.length ? [rt, ...inner] : [rt];
-  }
-  return [rt];
+function PathParamInput({
+  name,
+  value,
+  onCommit,
+}: {
+  name: string;
+  value: string;
+  onCommit: (value: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [focused, setFocused] = useState(false);
+  const cancelledRef = useRef(false);
+  const label = name === "*" ? "path" : `:${name}`;
+  const sizer = draft || label;
+  return (
+    <>
+      <span className="relative inline-flex max-w-64 shrink-0 items-center overflow-hidden">
+        {/* Invisible sizer: the box hugs the rendered text exactly. Must
+          mirror the input's font size and horizontal padding. */}
+        <span
+          aria-hidden
+          className="invisible whitespace-pre px-1 py-0.5 text-[12px]"
+        >
+          {sizer}
+        </span>
+        <input
+          type="text"
+          value={draft}
+          placeholder={label}
+          title={`Value for ${label}`}
+          spellCheck={false}
+          className="absolute inset-0 rounded-sm bg-violet-500/15 px-1 text-[12px] text-violet-600 outline-none placeholder:text-violet-500/60 focus:bg-violet-500/25 dark:text-violet-400"
+          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => setDraft(e.target.value)}
+          onFocus={() => setFocused(true)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+            if (e.key === "Escape") {
+              cancelledRef.current = true;
+              setDraft(value);
+              e.currentTarget.blur();
+            }
+          }}
+          onBlur={() => {
+            setFocused(false);
+            if (cancelledRef.current) {
+              cancelledRef.current = false;
+              return;
+            }
+            // Blank values are not accepted: clearing the input reverts to the
+            // bare `:param` token (placeholder) and the template URL.
+            const next = draft.trim();
+            setDraft(next);
+            if (next !== value) onCommit(next);
+          }}
+        />
+      </span>
+      {/* Editing hint, outside the value box */}
+      {focused && (
+        <span className="pointer-events-none ml-1.5 flex shrink-0 items-center gap-1 whitespace-nowrap rounded-sm border border-border bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+          <CornerDownLeft size={10} />
+          Enter to go
+        </span>
+      )}
+    </>
+  );
 }
 
 /** Deco reads `deviceHint` to force SSR device matchers (see deco `deviceOf`). */
@@ -193,35 +222,33 @@ function withDeviceHint(url: string, device: PreviewDeviceSize): string {
   return parsed.href;
 }
 
-export function PreviewContent() {
-  const inset = useInsetContext();
+export function PreviewContent({ virtualMcpId }: { virtualMcpId: string }) {
+  const isMobile = useIsMobile();
+  const navigate = useNavigate();
   const { currentBranch: branch } = useChatTask();
+  const workspace = useBlocksPreviewWorkspace();
 
-  // Visual editor state
-  const [viewMode, setViewMode] = useState<PreviewViewMode>("preview");
+  const goToTab = (main: string) => {
+    navigate({
+      to: ".",
+      search: (prev: Record<string, unknown>) => ({ ...prev, main }),
+      replace: true,
+    });
+  };
+
+  // Editing mode is singular: Visual editor and Blocks cannot be active
+  // together. Device size is independent and survives mode switches.
+  const [editingMode, setEditingMode] = useState<PreviewEditingMode>("preview");
   const [previewDeviceSize, setPreviewDeviceSize] =
     useState<PreviewDeviceSize>("desktop");
   const [visualElement, setVisualElement] =
     useState<VisualEditorPayload | null>(null);
-  const previewIframeRef = useRef<HTMLIFrameElement>(null);
-
-  // Sections editor panel
-  const sectionsOpen = viewMode === "cms";
+  /** Section index selected via click-through from the preview iframe. */
   const [cmsSelectedSectionIndex, setCmsSelectedSectionIndex] = useState<
     number | null
   >(null);
-  // `x-deco-matchers-override` params forcing the preview to render the section
-  // variant currently selected in the sections editor (CMS mode only).
-  const [variantOverrideParams, setVariantOverrideParams] = useState<
-    string[] | null
-  >(null);
-  const [panelWidth, setPanelWidth] = useState(384);
-  const isResizingRef = useRef(false);
-  const resizeStartXRef = useRef(0);
-  const resizeStartWidthRef = useRef(0);
-  // Tracks the last focused element outside the iframe so we can restore it
-  // when the iframe reload steals focus.
-  const focusBeforeIframeRef = useRef<HTMLElement | null>(null);
+  const previewIframeRef = useRef<HTMLIFrameElement>(null);
+  const blocksPanelRef = useRef<ImperativePanelHandle>(null);
 
   // Pages dropdown in URL bar
   const [pagesOpen, setPagesOpen] = useState(false);
@@ -238,14 +265,34 @@ export function PreviewContent() {
   const [currentPath, setCurrentPath] = useState("/");
   /** Explicit page block key from the page picker; disambiguates duplicate paths. */
   const [pinnedPageKey, setPinnedPageKey] = useState<string | null>(null);
+  /** User-provided values for `:param` tokens in path templates, keyed by page block key. */
+  const [pathParamsByPage, setPathParamsByPage] = useState<
+    Record<string, Record<string, string>>
+  >({});
+
+  // Instant click feedback: set the moment a page/section is picked, cleared
+  // when the iframe's onLoad fires. Without this the click has no visible
+  // effect until the new page finishes fetching, so it feels unresponsive.
+  const [navigating, setNavigating] = useState(false);
+  const navTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const beginNavigation = () => {
+    setNavigating(true);
+    if (navTimerRef.current) clearTimeout(navTimerRef.current);
+    // Safety net: clear the indicator even if onLoad never fires (network
+    // failure, cross-origin redirect) so it can't get stuck on forever.
+    navTimerRef.current = setTimeout(() => setNavigating(false), 15000);
+  };
+  const endNavigation = () => {
+    if (navTimerRef.current) {
+      clearTimeout(navTimerRef.current);
+      navTimerRef.current = null;
+    }
+    setNavigating(false);
+  };
 
   // SEO panel state
-  const [cmsInitialEditSeo, setCmsInitialEditSeo] = useState(false);
   const [siteSeoOpen, setSiteSeoOpen] = useState(false);
-  // File deep-link for "View JSON" — opens the page's block file in code mode.
-  const [codeFilePath, setCodeFilePath] = useState<string | null>(null);
 
-  const virtualMcpId = inset?.entity?.id ?? null;
   const { org } = useProjectContext();
 
   const vmEvents = useSandboxEvents();
@@ -310,6 +357,40 @@ export function PreviewContent() {
     ? activeGlobalSection.name
     : currentPage?.name;
   const currentPageKey = currentPage?.key ?? null;
+  const currentPagePath = currentPage?.path ?? null;
+
+  // Path templates: pages like `/blog/:slug` expose inline inputs in the URL
+  // bar. `currentPath` keeps the template (so the page stays matched); the
+  // iframe navigates to the template with the user's values filled in.
+  const pathParamValues =
+    (currentPageKey ? pathParamsByPage[currentPageKey] : undefined) ?? {};
+  const resolvedPath = fillPathTemplate(currentPath, pathParamValues);
+
+  // Special selectors for path params: each `:param`/`*` is classified from the
+  // loaders the current page uses (product/category, app-agnostic) and bound to
+  // whatever product-search / category loader the running site actually ships.
+  // A param with no resolvable source keeps the plain inline input.
+  const pathParamSources: Record<string, OptionSource[]> = {};
+  if (devServerReady && previewUrl && meta && decofile) {
+    const manifestLoaders = manifestLoaderResolveTypes(meta, "loaders");
+    const pageBlock = currentPageKey ? decofile[currentPageKey] : undefined;
+    const pageLoaders = collectPageLoaderResolveTypes(
+      pageBlock,
+      decofile,
+      (rt) => manifestLoaders.has(rt),
+    );
+    // The page's commerce platform (e.g. magento) — so option sources don't
+    // invoke a competing vendor's loader that merely exists in the manifest.
+    const platforms = commercePlatformsFromLoaders(pageLoaders);
+    for (const token of splitPathTemplate(currentPath)) {
+      if (token.type !== "param") continue;
+      const kinds = classifyParamKinds(currentPath, token.name, pageLoaders);
+      const sources = resolveOptionSources(kinds, manifestLoaders, platforms);
+      if (sources.length > 0) pathParamSources[token.name] = sources;
+    }
+  }
+  const pickerSandboxRef =
+    virtualMcpId && branch ? { orgSlug: org.slug, virtualMcpId, branch } : null;
 
   // Per-section metadata for the CMS hover overlay, aligned by index with the
   // iframe's top-level section list. `label`: ONLY global (saved block)
@@ -362,19 +443,100 @@ export function PreviewContent() {
   const previewState = lifecycle.previewState;
   const userStopped = lifecycle.userStopped;
 
+  // The recorded previewUrl flips previewState to "iframe" as soon as the
+  // sandbox handle exists — well before the public preview proxy is routable
+  // and actually serving, so the iframe renders blank during the initial boot.
+  // Keep the booting visual overlaid (absolute, z-30, above the warming iframe)
+  // until the dev server has come up. `progress.status === "doing"` is true for
+  // exactly the forward boot phases (provision → clone → install → starting);
+  // it flips to "done" at `running` and "failed" on a terminal error, so both
+  // the live app and the daemon's auto-reloading status/crash page still fall
+  // through to the iframe unobscured.
+  const showBootingOverlay =
+    previewState.kind === "starting" ||
+    (previewState.kind === "iframe" && progress.status === "doing");
+
   const iframeSrc =
     previewState.kind === "iframe"
       ? withVariantMatcherOverride(
           withDeviceHint(
             directPreviewUrl ??
-              new URL(currentPath, previewState.previewUrl).href,
+              new URL(resolvedPath, previewState.previewUrl).href,
             previewDeviceSize,
           ),
-          sectionsOpen && variantOverrideParams ? variantOverrideParams : [],
+          workspace.state.variantOverride ?? [],
         )
       : null;
 
-  // Reset navigation when the VM preview base URL changes (branch switch, etc.)
+  // Last visited page (incl. `:param` values), persisted per project+branch.
+  const previewStorageKey =
+    virtualMcpId && branch
+      ? lastPreviewPageKey(org.slug, virtualMcpId, branch)
+      : null;
+  const persistLastPage = (page: LastPreviewPage) => {
+    if (previewStorageKey) writeLastPreviewPage(previewStorageKey, page);
+  };
+
+  const sharedTarget = workspace.state.target;
+  // oxlint-disable-next-line ban-use-effect/ban-use-effect -- synchronizes the independent Blocks selection with the mounted Preview iframe
+  useEffect(() => {
+    if (!sharedTarget || !previewUrl || !meta) return;
+    if (sharedTarget.kind === "page") {
+      const params = pathParamsByPage[sharedTarget.key] ?? {};
+      intendedPathRef.current = fillPathTemplate(sharedTarget.path, params);
+      setActiveGlobalSection(null);
+      setDirectPreviewUrl(null);
+      setPinnedPageKey(sharedTarget.key);
+      setCurrentPath(sharedTarget.path);
+      persistLastPage({
+        path: sharedTarget.path,
+        pageKey: sharedTarget.key,
+        params,
+      });
+    } else {
+      const section = globalSections.find(
+        (candidate) => candidate.key === sharedTarget.key,
+      );
+      if (section) {
+        intendedPathRef.current = null;
+        const livePageRt = findLivePageResolveType(meta);
+        setActiveGlobalSection(section);
+        setDirectPreviewUrl(
+          buildGlobalSectionPreviewUrl(previewUrl, livePageRt, section.key),
+        );
+      }
+    }
+    // oxlint-disable-next-line eslint-plugin-react-hooks/exhaustive-deps -- derived helpers must not retrigger selection synchronization every render
+  }, [sharedTarget, previewUrl, meta, pathParamsByPage]);
+
+  // Publish the page Preview is showing to the shared workspace so the Blocks
+  // panel follows it — Blocks has no page navigator, it edits whatever page
+  // Preview is on. navigatePreviewToPage already publishes on explicit page
+  // switches; this covers the initial restore (last visited page), where
+  // pinnedPageKey is set but the target was never published. Guarded against
+  // the target→Preview sync above: dispatches only when the current page
+  // actually differs from the target, so the two effects converge, never loop.
+  // oxlint-disable-next-line ban-use-effect/ban-use-effect -- publishes Preview's current page to the shared Blocks selection
+  useEffect(() => {
+    if (!currentPageKey || currentPagePath === null) return;
+    if (
+      sharedTarget?.kind === "page" &&
+      sharedTarget.key === currentPageKey &&
+      sharedTarget.path === currentPagePath
+    ) {
+      return;
+    }
+    workspace.selectTarget({
+      kind: "page",
+      key: currentPageKey,
+      path: currentPagePath,
+    });
+    // oxlint-disable-next-line eslint-plugin-react-hooks/exhaustive-deps -- workspace handle is recreated each render; publish keyed on page + target only
+  }, [currentPageKey, currentPagePath, sharedTarget]);
+
+  // When the VM preview base URL appears or changes (first boot, branch
+  // switch, etc.), restore the last visited page for this project+branch;
+  // reset navigation to "/" when there's nothing saved.
   const [prevIframeBase, setPrevIframeBase] = useState<string | null>(null);
   if (
     previewState.kind === "iframe" &&
@@ -382,7 +544,21 @@ export function PreviewContent() {
   ) {
     const hadPreviousBase = prevIframeBase !== null;
     setPrevIframeBase(previewState.previewUrl);
-    if (hadPreviousBase) {
+    const saved = previewStorageKey
+      ? readLastPreviewPage(previewStorageKey)
+      : null;
+    if (saved) {
+      // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- expect the restored page's resolved path on the next iframe load
+      intendedPathRef.current = fillPathTemplate(saved.path, saved.params);
+      setCurrentPath(saved.path);
+      setPinnedPageKey(saved.pageKey);
+      setDirectPreviewUrl(null);
+      setActiveGlobalSection(null);
+      if (saved.pageKey && Object.keys(saved.params).length > 0) {
+        const pageKey = saved.pageKey;
+        setPathParamsByPage((prev) => ({ ...prev, [pageKey]: saved.params }));
+      }
+    } else if (hadPreviousBase) {
       // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- clear stale navigation intent on branch switch
       intendedPathRef.current = null;
       setCurrentPath("/");
@@ -406,15 +582,12 @@ export function PreviewContent() {
     !appPaused &&
     (claimPhase?.kind === "ready" || lifecyclePhase !== "idle");
 
-  // `visual` and `cms` drop out of the toggle options when the iframe is
-  // gone (they require a live dev server to inject overlays into). Fall
-  // back to `preview` for the toggle binding + overlay renders so the
-  // toggle never carries a value not in its option list.
-  const effectiveViewMode: PreviewViewMode =
-    previewState.kind !== "iframe" &&
-    (viewMode === "visual" || viewMode === "cms")
+  // Visual mode requires a live iframe. Blocks can stay open while the
+  // sandbox restarts so its loading/error state remains actionable.
+  const effectiveEditingMode: PreviewEditingMode =
+    previewState.kind !== "iframe" && editingMode === "visual"
       ? "preview"
-      : viewMode;
+      : editingMode;
 
   // oxlint-disable-next-line ban-use-effect/ban-use-effect — DOM event subscription
   useEffect(() => {
@@ -453,45 +626,6 @@ export function PreviewContent() {
     document.addEventListener("pointerdown", handler);
     return () => document.removeEventListener("pointerdown", handler);
   }, [pagesOpen]);
-
-  // Prevent the iframe from stealing focus away from sections-editor inputs.
-  // When focus leaves an element and lands on the iframe (or body, which
-  // happens for cross-origin iframe focus), restore the previously focused
-  // element. We track the last non-iframe focused element via `focusin`, and
-  // detect the steal via a rAF after `blur` (by that time activeElement has
-  // settled to body/iframe when focus entered the iframe content window).
-  // oxlint-disable-next-line ban-use-effect/ban-use-effect — DOM event subscription for focus tracking
-  useEffect(() => {
-    if (!sectionsOpen) return;
-
-    const onFocusIn = (e: FocusEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (target && target !== previewIframeRef.current) {
-        focusBeforeIframeRef.current = target;
-      }
-    };
-
-    const onBlur = () => {
-      requestAnimationFrame(() => {
-        const active = document.activeElement;
-        // When focus enters a cross-origin iframe, activeElement becomes
-        // <body> or the <iframe> element itself.
-        if (
-          (active === document.body || active === previewIframeRef.current) &&
-          focusBeforeIframeRef.current
-        ) {
-          focusBeforeIframeRef.current.focus();
-        }
-      });
-    };
-
-    document.addEventListener("focusin", onFocusIn);
-    document.addEventListener("blur", onBlur, true);
-    return () => {
-      document.removeEventListener("focusin", onFocusIn);
-      document.removeEventListener("blur", onBlur, true);
-    };
-  }, [sectionsOpen]);
 
   const injectVisualEditor = () => {
     const win = previewIframeRef.current?.contentWindow;
@@ -535,21 +669,23 @@ export function PreviewContent() {
     win.postMessage({ type: "cms-editor::deactivate" }, "*");
   };
 
-  const handleViewModeChange = (mode: PreviewViewMode) => {
-    const prev = viewMode;
-    setViewMode(mode);
-    setVisualElement(null);
-    // Leaving code mode clears the "View JSON" deep-link so re-entering code
-    // mode later opens the file tree, not the previously-viewed page JSON.
-    if (mode !== "code") setCodeFilePath(null);
-    if (mode !== "cms") {
-      setCmsSelectedSectionIndex(null);
-      setVariantOverrideParams(null);
+  const activateEditingMode = (mode: PreviewEditingMode) => {
+    const previousMode = editingMode;
+    if (!isMobile && mode !== previousMode) {
+      if (mode === "blocks") blocksPanelRef.current?.resize(40);
+      else blocksPanelRef.current?.collapse();
     }
-    if (prev === "visual") deactivateVisualEditor();
-    if (prev === "cms") deactivateCmsEditor();
+    setEditingMode(mode);
+    setVisualElement(null);
+    setCmsSelectedSectionIndex(null);
+    if (previousMode === "visual") deactivateVisualEditor();
     if (mode === "visual") injectVisualEditor();
-    if (mode === "cms") injectCmsEditor();
+    if (previousMode === "blocks" && mode !== "blocks") deactivateCmsEditor();
+    if (mode === "blocks") injectCmsEditor();
+  };
+
+  const toggleEditingMode = (mode: PreviewEditorMode) => {
+    activateEditingMode(togglePreviewEditorMode(editingMode, mode));
   };
 
   const handleRefresh = () => {
@@ -560,16 +696,7 @@ export function PreviewContent() {
     iframe.src = iframeSrc;
   };
 
-  // Selecting/reordering a variant changes `iframeSrc` (override params), which
-  // re-navigates the iframe. Scroll position is preserved entirely inside the
-  // injected CMS script (it persists scroll to sessionStorage and restores it
-  // after the reload, surviving re-hydration), so nothing to capture here.
-  const handleVariantPreviewOverride = (params: string[] | null) => {
-    setVariantOverrideParams(params);
-  };
-
-  // Reload the preview after a save while preventing the iframe from stealing
-  // focus. Scroll is restored by the injected CMS script (see above).
+  // Reload the preview after a Blocks save without moving keyboard focus.
   const reloadPreviewPreservingScroll = () => {
     const iframe = previewIframeRef.current;
     if (!iframe) return;
@@ -584,15 +711,29 @@ export function PreviewContent() {
       const src = iframeSrcRef.current;
       if (src) iframe.src = src;
     }
+    let fallbackTimer: ReturnType<typeof setTimeout>;
     const restore = () => {
+      clearTimeout(fallbackTimer);
       iframe.tabIndex = prevTabIndex;
       iframe.style.pointerEvents = "";
       focused?.focus();
       iframe.removeEventListener("load", restore);
     };
     iframe.addEventListener("load", restore);
-    setTimeout(restore, 3000);
+    // Safety net only — cleared above once `load` fires first, so `restore`
+    // (and its focus() steal) can't fire a second time 3s after a normal load.
+    fallbackTimer = setTimeout(restore, 3000);
   };
+
+  const [handledPreviewRevision, setHandledPreviewRevision] = useState(
+    workspace.state.previewRevision,
+  );
+  // oxlint-disable-next-line ban-use-effect/ban-use-effect -- synchronizes persisted Blocks saves with the mounted preview iframe
+  useEffect(() => {
+    if (handledPreviewRevision === workspace.state.previewRevision) return;
+    setHandledPreviewRevision(workspace.state.previewRevision);
+    reloadPreviewPreservingScroll();
+  }, [handledPreviewRevision, workspace.state.previewRevision]);
 
   const handleHardReload = () => {
     if (!previewIframeRef.current || !iframeSrc) return;
@@ -605,12 +746,24 @@ export function PreviewContent() {
     setPreviewDeviceSize(DEVICE_CYCLE[(idx + 1) % DEVICE_CYCLE.length]!);
   };
 
-  const handleCopyUrl = () => {
-    const url =
-      previewIframeRef.current?.contentWindow?.location?.href ??
-      iframeSrc ??
-      previewUrl;
-    if (url) navigator.clipboard.writeText(url);
+  const handleCopyUrl = async () => {
+    // The iframe's live location is cross-origin (sandbox preview domain), so
+    // reading `.location.href` throws — same reason the onLoad handler below
+    // guards the analogous `.pathname` read.
+    let liveUrl: string | null = null;
+    try {
+      liveUrl = previewIframeRef.current?.contentWindow?.location?.href ?? null;
+    } catch {
+      // Cross-origin — fall back below.
+    }
+    const url = liveUrl ?? iframeSrc ?? previewUrl;
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast.success("URL copied to clipboard");
+    } catch {
+      toast.error("Failed to copy URL");
+    }
   };
 
   const previewLabel = (() => {
@@ -618,7 +771,7 @@ export function PreviewContent() {
     if (activeGlobalSection) return activeGlobalSection.name;
     try {
       const url = new URL(previewUrl);
-      const path = currentPath === "/" ? "" : currentPath;
+      const path = resolvedPath === "/" ? "" : resolvedPath;
       return `${url.host}${path}`;
     } catch {
       return previewUrl;
@@ -626,13 +779,38 @@ export function PreviewContent() {
   })();
 
   const navigatePreviewToPage = (page: PageEntry) => {
-    intendedPathRef.current = page.path;
+    // The iframe loads the template with any stored param values filled in.
+    const params = pathParamsByPage[page.key] ?? {};
+    const target = fillPathTemplate(page.path, params);
+    // Show the loading indicator only when the iframe will actually reload —
+    // re-selecting the current page leaves `iframeSrc` unchanged (no onLoad).
+    if (activeGlobalSection || normPath(target) !== normPath(resolvedPath)) {
+      beginNavigation();
+    }
+    intendedPathRef.current = target;
     setActiveGlobalSection(null);
     setDirectPreviewUrl(null);
+    // A click-through index from the previous page must not auto-select on the
+    // next page's remounted editor.
+    setCmsSelectedSectionIndex(null);
     setPinnedPageKey(page.key);
     setCurrentPath(page.path);
-    setCmsSelectedSectionIndex(null);
-    setCmsInitialEditSeo(false);
+    persistLastPage({ path: page.path, pageKey: page.key, params });
+    workspace.selectTarget({
+      kind: "page",
+      key: page.key,
+      path: page.path,
+    });
+  };
+
+  const setPathParamValue = (name: string, value: string) => {
+    if (!currentPageKey) return;
+    const pageKey = currentPageKey;
+    const nextValues = { ...pathParamValues, [name]: value };
+    // Guard against a stale onLoad from the previous URL resetting currentPath.
+    intendedPathRef.current = fillPathTemplate(currentPath, nextValues);
+    setPathParamsByPage((prev) => ({ ...prev, [pageKey]: nextValues }));
+    persistLastPage({ path: currentPath, pageKey, params: nextValues });
   };
 
   const navigatePreviewToGlobalSection = (section: GlobalSectionEntry) => {
@@ -640,6 +818,7 @@ export function PreviewContent() {
       toast.error("Preview metadata not ready yet");
       return;
     }
+    beginNavigation();
     intendedPathRef.current = null;
     const livePageRt = findLivePageResolveType(meta);
     const url = buildGlobalSectionPreviewUrl(
@@ -650,14 +829,17 @@ export function PreviewContent() {
     setActiveGlobalSection(section);
     setDirectPreviewUrl(url);
     setCmsSelectedSectionIndex(null);
+    workspace.selectTarget({ kind: "section", key: section.key });
   };
 
   const handleCreatePage = async ({
     name,
     path,
+    templateKey,
   }: {
     name: string;
     path: string;
+    templateKey: string | null;
   }) => {
     if (!virtualMcpId || !branch) return;
     const pathError = validatePagePath(path);
@@ -672,21 +854,30 @@ export function PreviewContent() {
       setCreatePageError(`A page with path "${trimmedPath}" already exists.`);
       return;
     }
+    let template: Record<string, unknown> | undefined;
+    if (templateKey) {
+      template = decofile?.[templateKey] as Record<string, unknown> | undefined;
+      if (!template) {
+        setCreatePageError("Selected template no longer exists.");
+        return;
+      }
+    }
     setCreatePageError(undefined);
     try {
       const result = await createPage.mutateAsync({
         name,
         path: trimmedPath,
+        template,
       });
       setCreatePageDialogOpen(false);
       toast.success(`Page "${name}" created`);
-      await new Promise((resolve) => setTimeout(resolve, DEV_SERVER_SETTLE_MS));
+      await sleep(DEV_SERVER_SETTLE_MS);
       navigatePreviewToPage({
         key: result.key,
         name: result.name,
         path: result.path,
       });
-      handleViewModeChange("cms");
+      activateEditingMode("blocks");
     } catch (error) {
       setCreatePageError(
         error instanceof Error ? error.message : "Failed to create page",
@@ -694,59 +885,85 @@ export function PreviewContent() {
     }
   };
 
-  // visual + cms require a live iframe (they inject overlays into the dev
-  // server); when the iframe isn't up we still offer preview + code so the
-  // user can browse files after a dev-script crash.
-  const viewModeOptions: ViewModeOption<PreviewViewMode>[] = [
-    { value: "preview", icon: <Monitor04 size={14} />, tooltip: "Interactive" },
-    ...(previewState.kind === "iframe"
-      ? [
-          {
-            value: "visual" as PreviewViewMode,
-            icon: <CursorClick01 size={14} />,
-            tooltip: "Visual editor",
-          },
-        ]
-      : []),
-    ...(previewState.kind === "iframe" && hasEditableDecoContent(decofile, meta)
-      ? [
-          {
-            value: "cms" as PreviewViewMode,
-            icon: <TextInput size={14} />,
-            tooltip: "Sections editor",
-          },
-        ]
-      : []),
-    { value: "code", icon: <Code02 size={14} />, tooltip: "Code editor" },
-  ];
+  const canVisualEdit = previewState.kind === "iframe";
+  const floatingPreviewControls = canVisualEdit ? (
+    <div className="absolute bottom-4 left-1/2 z-20 -translate-x-1/2">
+      <div className="flex items-center gap-0.5 rounded-full border bg-background/90 p-1 shadow-lg backdrop-blur-sm">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <ToolbarIconButton
+              onClick={() => toggleEditingMode("visual")}
+              aria-pressed={editingMode === "visual"}
+              aria-label="Visual editor"
+              active={editingMode === "visual"}
+              disabled={!canVisualEdit}
+            >
+              <CursorClick01 size={16} />
+            </ToolbarIconButton>
+          </TooltipTrigger>
+          <TooltipContent side="top">Visual editor</TooltipContent>
+        </Tooltip>
+        <div className="mx-0.5 h-5 w-px bg-border" />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <ToolbarIconButton
+              onClick={handleDeviceToggle}
+              aria-label={DEVICE_LABELS[previewDeviceSize]}
+              disabled={!canVisualEdit}
+            >
+              <span
+                key={previewDeviceSize}
+                className="flex items-center justify-center animate-device-icon-pop"
+              >
+                {previewDeviceSize === "mobile" && <Phone02 size={16} />}
+                {previewDeviceSize === "tablet" && <Tablet01 size={16} />}
+                {previewDeviceSize === "desktop" && <Monitor04 size={16} />}
+              </span>
+            </ToolbarIconButton>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            {DEVICE_LABELS[previewDeviceSize]}
+          </TooltipContent>
+        </Tooltip>
+      </div>
+    </div>
+  ) : null;
 
   return (
     <div className="flex flex-col w-full h-full">
-      {daemonReady && (
-        <div className="flex h-12 shrink-0 items-center gap-4 border-b border-border/60 px-3 md:px-4">
-          {/* Group 1: view mode toggle. Always visible when the daemon is up
-              so the user can drop into code mode after a dev-script crash. */}
-          <div className="flex shrink-0 items-center gap-1">
-            <ViewModeToggle
-              value={effectiveViewMode}
-              onValueChange={handleViewModeChange}
-              options={viewModeOptions}
-              size="sm"
-              className="shrink-0 bg-foreground/4.5"
+      {/* Auto-select the first entity for a picker param with no value yet, so
+          navigating to a bare dynamic-route template lands on a real page.
+          Each helper renders nothing and unmounts once its param is filled. */}
+      {pickerSandboxRef &&
+        Object.entries(pathParamSources).map(([name, sources]) =>
+          (pathParamValues[name] ?? "") === "" ? (
+            <PathParamAutoFill
+              key={`${currentPageKey}:${name}`}
+              source={sources[0]!}
+              template={currentPath}
+              paramName={name}
+              sandboxRef={pickerSandboxRef}
+              onFill={(value) => setPathParamValue(name, value)}
             />
-          </div>
-
-          {/* Groups 2+3 only render when the iframe is live — they read
-              `previewState.previewUrl` and steer the iframe directly. */}
+          ) : null,
+        )}
+      {daemonReady && previewState.kind === "iframe" && (
+        <div className="relative flex h-12 shrink-0 items-center gap-4 border-b border-border/60 px-3 md:px-4">
           {previewState.kind === "iframe" && (
-            <>
-              {/* Group 2: nav + url (hidden in code mode) */}
-              <div
-                className={cn(
-                  "flex min-w-0 flex-1 items-center gap-0.5 ml-2",
-                  viewMode === "code" && "hidden",
-                )}
+            <div className="flex h-full w-full items-center justify-between gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                data-testid="preview-blocks-toggle"
+                onClick={() => toggleEditingMode("blocks")}
+                aria-pressed={editingMode === "blocks"}
+                aria-label="Blocks editor"
               >
+                <TextInput size={14} />
+                Blocks
+              </Button>
+
+              <div className="flex w-full min-w-0 max-w-[500px] items-center gap-0.5">
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button variant="ghost" size="icon" onClick={handleRefresh}>
@@ -756,65 +973,105 @@ export function PreviewContent() {
                   <TooltipContent side="bottom">Refresh</TooltipContent>
                 </Tooltip>
 
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={handleDeviceToggle}
-                    >
-                      <span
-                        key={previewDeviceSize}
-                        className="flex items-center justify-center animate-device-icon-pop"
-                      >
-                        {previewDeviceSize === "mobile" && (
-                          <Phone02 size={14} />
-                        )}
-                        {previewDeviceSize === "tablet" && (
-                          <Tablet01 size={14} />
-                        )}
-                        {previewDeviceSize === "desktop" && (
-                          <Monitor04 size={14} />
-                        )}
-                      </span>
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">
-                    {DEVICE_LABELS[previewDeviceSize]}
-                  </TooltipContent>
-                </Tooltip>
-
                 <div
                   ref={pagesContainerRef}
                   className="relative min-w-0 flex-1"
                 >
-                  <button
-                    type="button"
-                    className="flex h-8 w-full min-w-0 items-center gap-1 rounded-md bg-background px-2 transition-colors duration-200 hover:bg-accent"
-                    onClick={() => setPagesOpen((prev) => !prev)}
-                  >
-                    {activeGlobalSection && (
-                      <span className="shrink-0 inline-flex items-center gap-1 rounded bg-global-section/14 px-1.5 py-0.5 text-[11px] font-medium text-global-section-fg dark:text-global-section-fg-dark">
-                        <Globe02 size={11} />
-                        Global
-                      </span>
-                    )}
-                    <span className="min-w-0 flex-1 truncate text-left text-[12px] text-foreground/88">
-                      {previewLabel}
-                    </span>
-                    {currentPageName && !activeGlobalSection && (
-                      <span className="shrink-0 text-[12px] text-muted-foreground">
-                        {currentPageName}
-                      </span>
-                    )}
-                    <ChevronDown
-                      size={12}
-                      className={cn(
-                        "shrink-0 text-muted-foreground transition-transform",
-                        pagesOpen && "rotate-180",
+                  <div className="flex h-8 w-full min-w-0 items-center rounded-md border border-border bg-background transition-colors duration-200 hover:bg-accent">
+                    {/* Not a <button>: path-template pages render `:param`
+                        inputs inline, and inputs can't nest inside a button.
+                        Keyboard toggling stays on the chevron button. */}
+                    <div
+                      className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1 pl-2 pr-1"
+                      onClick={() => setPagesOpen((prev) => !prev)}
+                    >
+                      {activeGlobalSection && (
+                        <span className="shrink-0 inline-flex items-center gap-1 rounded bg-global-section/14 px-1.5 py-0.5 text-[11px] font-medium text-global-section-fg dark:text-global-section-fg-dark">
+                          <Globe02 size={11} />
+                          Global
+                        </span>
                       )}
-                    />
-                  </button>
+                      {/* Page name in focus, followed by the route path.
+                            Path-template segments (`:param`/`*`) stay editable
+                            inputs; plain paths render as muted text. */}
+                      <span
+                        className={cn(
+                          "text-[13px] font-medium text-foreground",
+                          // A real page name stays fully visible (the route
+                          // path truncates instead); the host fallback has no
+                          // path segment to shed, so it must truncate itself.
+                          currentPageName == null
+                            ? "min-w-0 flex-1 truncate"
+                            : "shrink-0",
+                        )}
+                      >
+                        {currentPageName ?? previewLabel}
+                      </span>
+                      {!activeGlobalSection &&
+                        currentPageName != null &&
+                        currentPath && (
+                          <span className="flex min-w-0 flex-1 items-center overflow-hidden whitespace-nowrap text-[12px] text-muted-foreground">
+                            {splitPathTemplate(currentPath).map((token, i) => {
+                              if (token.type === "text") {
+                                return (
+                                  <span
+                                    key={`text-${i}`}
+                                    className={cn(
+                                      i === 0 ? "min-w-0 truncate" : "shrink-0",
+                                    )}
+                                  >
+                                    {token.text}
+                                  </span>
+                                );
+                              }
+                              const sources = pathParamSources[token.name];
+                              // Params with option sources render as a chip that
+                              // opens the modal (search or free-form value);
+                              // the rest keep the inline input.
+                              if (sources && pickerSandboxRef) {
+                                return (
+                                  <PathParamPickerChip
+                                    key={`${currentPageKey}:${token.name}`}
+                                    sources={sources}
+                                    template={currentPath}
+                                    paramName={token.name}
+                                    value={pathParamValues[token.name] ?? ""}
+                                    sandboxRef={pickerSandboxRef}
+                                    onCommit={(value) =>
+                                      setPathParamValue(token.name, value)
+                                    }
+                                  />
+                                );
+                              }
+                              return (
+                                <PathParamInput
+                                  key={`${currentPageKey}:${token.name}`}
+                                  name={token.name}
+                                  value={pathParamValues[token.name] ?? ""}
+                                  onCommit={(value) =>
+                                    setPathParamValue(token.name, value)
+                                  }
+                                />
+                              );
+                            })}
+                          </span>
+                        )}
+                    </div>
+                    <button
+                      type="button"
+                      className="flex h-full shrink-0 items-center pl-1 pr-2"
+                      onClick={() => setPagesOpen((prev) => !prev)}
+                      aria-label="Choose page"
+                    >
+                      <ChevronDown
+                        size={12}
+                        className={cn(
+                          "shrink-0 text-muted-foreground transition-transform",
+                          pagesOpen && "rotate-180",
+                        )}
+                      />
+                    </button>
+                  </div>
 
                   {pagesOpen && (
                     <div className="absolute left-0 right-0 top-full z-50 mt-1.5 overflow-hidden rounded-lg border bg-popover shadow-lg">
@@ -828,6 +1085,21 @@ export function PreviewContent() {
                           type="text"
                           value={pagesSearch}
                           onChange={(e) => setPagesSearch(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key !== "Enter") return;
+                            const query = pagesSearch.trim();
+                            if (!query) return;
+                            // Enter only navigates when the typed path matches an
+                            // existing page exactly; otherwise it does nothing.
+                            const target = filteredPages.find(
+                              (p) => normPath(p.path) === normPath(query),
+                            );
+                            if (!target) return;
+                            e.preventDefault();
+                            setPagesOpen(false);
+                            setPagesSearch("");
+                            navigatePreviewToPage(target);
+                          }}
                           placeholder="Search pages and components..."
                           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
                           autoFocus
@@ -935,15 +1207,6 @@ export function PreviewContent() {
                     </div>
                   )}
                 </div>
-              </div>
-
-              {/* Group 3: open in new tab + more actions (hidden in code mode) */}
-              <div
-                className={cn(
-                  "flex shrink-0 items-center gap-0.5",
-                  viewMode === "code" && "hidden",
-                )}
-              >
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
@@ -959,7 +1222,9 @@ export function PreviewContent() {
                   </TooltipTrigger>
                   <TooltipContent side="bottom">Open in new tab</TooltipContent>
                 </Tooltip>
+              </div>
 
+              <div className="flex shrink-0 items-center">
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button variant="ghost" size="icon">
@@ -979,8 +1244,12 @@ export function PreviewContent() {
                         {currentPageKey && (
                           <DropdownMenuItem
                             onClick={() => {
-                              setCmsInitialEditSeo(true);
-                              handleViewModeChange("cms");
+                              workspace.editSeo({
+                                kind: "page",
+                                key: currentPageKey,
+                                path: currentPath,
+                              });
+                              activateEditingMode("blocks");
                             }}
                           >
                             <CreditCardSearch size={14} />
@@ -991,10 +1260,11 @@ export function PreviewContent() {
                           <DropdownMenuItem
                             onClick={() => {
                               try {
-                                setCodeFilePath(
-                                  decoBlockFileViewPath(currentPageKey),
+                                goToTab(
+                                  formatCodeTabId(
+                                    decoBlockFileViewPath(currentPageKey),
+                                  ),
                                 );
-                                handleViewModeChange("code");
                               } catch {
                                 toast.error("Invalid page block key");
                               }
@@ -1015,9 +1285,7 @@ export function PreviewContent() {
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
                           onClick={() =>
-                            window.open(
-                              `vscode://file${repoDir}?windowId=_blank`,
-                            )
+                            window.open(ideDeepLink("vscode", repoDir))
                           }
                         >
                           <img
@@ -1030,9 +1298,7 @@ export function PreviewContent() {
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           onClick={() =>
-                            window.open(
-                              `cursor://file${repoDir}?windowId=_blank`,
-                            )
+                            window.open(ideDeepLink("cursor", repoDir))
                           }
                         >
                           <img
@@ -1048,266 +1314,198 @@ export function PreviewContent() {
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
-            </>
-          )}
-
-          {/* IDE buttons — visible only in code mode, right-aligned */}
-          {viewMode === "code" && repoDir && (
-            <div className="ml-auto flex shrink-0 items-center gap-0.5">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Open in VSCode"
-                    onClick={() =>
-                      window.open(`vscode://file${repoDir}?windowId=_blank`)
-                    }
-                  >
-                    <img
-                      src={VSCODE_ICON_URL}
-                      alt="VSCode"
-                      width={14}
-                      height={14}
-                    />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">Open in VSCode</TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Open in Cursor"
-                    onClick={() =>
-                      window.open(`cursor://file${repoDir}?windowId=_blank`)
-                    }
-                  >
-                    <img
-                      src={CURSOR_ICON_URL}
-                      alt="Cursor"
-                      width={14}
-                      height={14}
-                    />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">Open in Cursor</TooltipContent>
-              </Tooltip>
             </div>
           )}
         </div>
       )}
 
-      <div className="flex-1 flex overflow-hidden">
-        {/* Sections editor side panel (left) */}
-        {sectionsOpen && previewUrl && branch && virtualMcpId && (
-          <>
-            <div
-              className="shrink-0 border-r overflow-hidden"
-              style={{ width: panelWidth }}
-            >
-              <Suspense
-                fallback={
-                  <div className="h-full flex items-center justify-center">
-                    <Loading01
-                      size={20}
-                      className="animate-spin text-muted-foreground"
-                    />
-                  </div>
-                }
-              >
-                <SectionsEditor
-                  orgSlug={org.slug}
-                  virtualMcpId={virtualMcpId}
-                  branch={branch}
-                  previewReady={devServerReady}
-                  previewUrl={previewUrl}
-                  currentPath={currentPath}
-                  activePageBlockKey={currentPageKey}
-                  activeGlobalBlockKey={activeGlobalSection?.key ?? null}
-                  externalSelectedIndex={
-                    activeGlobalSection ? null : cmsSelectedSectionIndex
-                  }
-                  onSaved={() => {
-                    setTimeout(
-                      reloadPreviewPreservingScroll,
-                      DEV_SERVER_SETTLE_MS,
-                    );
-                  }}
-                  initialEditSeo={cmsInitialEditSeo}
-                  onExitSeo={() => setCmsInitialEditSeo(false)}
-                  onViewJsonFile={(pageKey) => {
-                    try {
-                      setCodeFilePath(decoBlockFileViewPath(pageKey));
-                      handleViewModeChange("code");
-                    } catch {
-                      toast.error("Invalid page block key");
-                    }
-                  }}
-                  onVariantPreviewOverride={handleVariantPreviewOverride}
-                />
-              </Suspense>
-            </div>
-            <div
-              className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-border transition-colors"
-              onPointerDown={(e) => {
-                isResizingRef.current = true;
-                resizeStartXRef.current = e.clientX;
-                resizeStartWidthRef.current = panelWidth;
-                e.currentTarget.setPointerCapture(e.pointerId);
-              }}
-              onPointerMove={(e) => {
-                if (!isResizingRef.current) return;
-                const delta = e.clientX - resizeStartXRef.current;
-                setPanelWidth(
-                  Math.max(
-                    240,
-                    Math.min(640, resizeStartWidthRef.current + delta),
-                  ),
-                );
-              }}
-              onPointerUp={() => {
-                isResizingRef.current = false;
-              }}
+      <div className="flex-1 overflow-hidden">
+        {isMobile && effectiveEditingMode === "blocks" ? (
+          <div className="relative h-full min-h-0 overflow-hidden">
+            <BlocksPanel
+              virtualMcpId={virtualMcpId}
+              externalSelectedIndex={cmsSelectedSectionIndex}
             />
-          </>
-        )}
-
-        <div
-          className={cn(
-            "flex-1 relative overflow-hidden",
-            previewDeviceSize !== "desktop" &&
-              previewState.kind === "iframe" &&
-              viewMode !== "code" &&
-              "flex justify-center bg-muted/30",
-          )}
-        >
-          {previewState.kind === "starting" && (
-            <div className="absolute inset-0 z-30">
-              <SandboxStateCard
-                kind="starting"
-                progress={progress}
-                claimPhase={claimPhase}
-              />
-            </div>
-          )}
-
-          {previewState.kind === "suspended" && (
-            <div className="absolute inset-0 z-30">
-              <SandboxStateCard kind="suspended" onResume={lifecycle.resume} />
-            </div>
-          )}
-
-          {effectiveViewMode === "visual" && !visualElement && (
-            <div className="absolute top-2 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 rounded-full border border-violet-400/40 bg-violet-500/90 px-3 py-1 text-xs font-medium text-white shadow-md backdrop-blur-sm pointer-events-none select-none">
-              <CursorClick01 size={12} />
-              Click any element to ask the AI
-            </div>
-          )}
-          {effectiveViewMode === "visual" && visualElement && (
-            <VisualEditorPrompt
-              element={visualElement}
-              onDismiss={() => setVisualElement(null)}
-            />
-          )}
-          {/* File explorer (code mode). Gated on daemon-ready, NOT on the
-              dev server: the daemon's FS endpoints (/read, /glob, …) keep
-              serving even when the dev script has crashed, so the user can
-              still browse files to debug a `start-failed`. */}
-          {viewMode === "code" && daemonReady && virtualMcpId && branch && (
-            <div className="absolute inset-0 z-10 bg-background">
-              <Suspense
-                fallback={
-                  <div className="h-full flex items-center justify-center">
-                    <Loading01
-                      size={20}
-                      className="animate-spin text-muted-foreground"
-                    />
-                  </div>
-                }
-              >
-                <FileExplorer
-                  orgSlug={org.slug}
-                  virtualMcpId={virtualMcpId}
-                  branch={branch}
-                  openPath={codeFilePath}
-                />
-              </Suspense>
-            </div>
-          )}
-
-          {previewState.kind === "iframe" && iframeSrc && (
-            <div
+            {floatingPreviewControls}
+          </div>
+        ) : (
+          <ResizablePanelGroup direction="horizontal">
+            <ResizablePanel
+              ref={blocksPanelRef}
+              id="preview-blocks-editor"
+              order={1}
+              defaultSize={effectiveEditingMode === "blocks" ? 40 : 0}
+              minSize={30}
+              collapsible
+              collapsedSize={0}
               className={cn(
-                "h-full transition-[width] duration-250 [transition-timing-function:var(--ease-in-out-cubic)]",
-                previewDeviceSize !== "desktop" &&
-                  viewMode !== "code" &&
-                  "w-full max-w-full border-x border-border bg-background shadow-sm",
+                "overflow-hidden",
+                effectiveEditingMode === "blocks" ? "min-w-[320px]" : "min-w-0",
               )}
-              style={{
-                width:
-                  previewDeviceSize === "desktop" || viewMode === "code"
-                    ? "100%"
-                    : `${PREVIEW_DEVICE_WIDTHS[previewDeviceSize]}px`,
-              }}
             >
-              <iframe
-                // Key on previewUrl: remount when the VM base URL changes (branch
-                // switch). Path navigation is driven by `iframeSrc` state.
-                key={previewState.previewUrl}
-                ref={previewIframeRef}
-                src={iframeSrc}
+              {effectiveEditingMode === "blocks" && (
+                <BlocksPanel
+                  virtualMcpId={virtualMcpId}
+                  externalSelectedIndex={cmsSelectedSectionIndex}
+                />
+              )}
+            </ResizablePanel>
+            <ResizableHandle
+              withHandle
+              className={cn(effectiveEditingMode !== "blocks" && "hidden")}
+            />
+            <ResizablePanel
+              id="preview-canvas"
+              order={2}
+              defaultSize={effectiveEditingMode === "blocks" ? 60 : 100}
+              minSize={35}
+              className="min-w-0 overflow-hidden"
+            >
+              <div
                 className={cn(
-                  "w-full h-full border-0",
-                  viewMode === "code" && "invisible",
+                  "h-full relative overflow-hidden",
+                  previewDeviceSize !== "desktop" &&
+                    previewState.kind === "iframe" &&
+                    "flex justify-center bg-muted/30",
                 )}
-                title="Dev Server Preview"
-                tabIndex={sectionsOpen ? -1 : undefined}
-                onLoad={() => {
-                  // This is the VM dev-server preview (sandboxed running app),
-                  // NOT an MCP app. MCP apps render via <MCPAppRenderer/>.
-                  track("vm_preview_loaded", {
-                    view_mode: viewMode,
-                    vm_id: vmEntry?.sandboxHandle ?? null,
-                    // Intentionally excluding the full previewUrl — it can contain
-                    // ephemeral tokens / user data in the query string.
-                  });
-                  // Sync currentPath when the user navigates inside the iframe.
-                  // Skip while a programmatic navigation is pending — stale
-                  // onLoad events from the previous URL would reset us to "/".
-                  if (!activeGlobalSection) {
-                    try {
-                      const iframePath =
-                        previewIframeRef.current?.contentWindow?.location
-                          ?.pathname;
-                      if (!iframePath) return;
-                      const intended = intendedPathRef.current;
-                      if (intended !== null) {
-                        intendedPathRef.current = null;
-                        if (normPath(iframePath) === normPath(intended)) {
-                          setCurrentPath(iframePath);
+              >
+                {navigating && previewState.kind === "iframe" && (
+                  <div className="absolute inset-x-0 top-0 z-40 h-0.5 overflow-hidden bg-primary/15">
+                    <div className="absolute inset-y-0 w-2/5 rounded-full bg-primary animate-preview-nav" />
+                  </div>
+                )}
+
+                {showBootingOverlay && (
+                  <div className="absolute inset-0 z-30">
+                    <SandboxStateCard
+                      kind="starting"
+                      progress={progress}
+                      claimPhase={claimPhase}
+                    />
+                  </div>
+                )}
+
+                {previewState.kind === "suspended" && (
+                  <div className="absolute inset-0 z-30">
+                    <SandboxStateCard
+                      kind="suspended"
+                      onResume={lifecycle.resume}
+                    />
+                  </div>
+                )}
+
+                {previewState.kind === "errored" && (
+                  <div className="absolute inset-0 z-30">
+                    <SandboxStateCard
+                      kind="errored"
+                      error={previewState.error}
+                      onRetry={lifecycle.retry}
+                      connectionsHref={`/${org.slug}/settings/connections`}
+                    />
+                  </div>
+                )}
+
+                {effectiveEditingMode === "visual" && !visualElement && (
+                  <div className="absolute top-2 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 rounded-full border border-violet-400/40 bg-violet-500/90 px-3 py-1 text-xs font-medium text-white shadow-md backdrop-blur-sm pointer-events-none select-none">
+                    <CursorClick01 size={12} />
+                    Click any element to ask the AI
+                  </div>
+                )}
+                {effectiveEditingMode === "visual" && visualElement && (
+                  <VisualEditorPrompt
+                    element={visualElement}
+                    onDismiss={() => setVisualElement(null)}
+                  />
+                )}
+
+                {floatingPreviewControls}
+
+                {previewState.kind === "iframe" && iframeSrc && (
+                  <div
+                    className={cn(
+                      "h-full transition-[width] duration-250 [transition-timing-function:var(--ease-in-out-cubic)]",
+                      previewDeviceSize !== "desktop" &&
+                        "w-full max-w-full border-x border-border bg-background shadow-sm",
+                    )}
+                    style={{
+                      width:
+                        previewDeviceSize === "desktop"
+                          ? "100%"
+                          : `${PREVIEW_DEVICE_WIDTHS[previewDeviceSize]}px`,
+                    }}
+                  >
+                    <iframe
+                      // Key on previewUrl: remount when the VM base URL changes (branch
+                      // switch). Path navigation is driven by `iframeSrc` state.
+                      key={previewState.previewUrl}
+                      ref={previewIframeRef}
+                      src={iframeSrc}
+                      className="w-full h-full border-0"
+                      title="Dev Server Preview"
+                      onLoad={() => {
+                        // The page finished loading — always clear the navigation
+                        // indicator first, before any of the early returns below.
+                        endNavigation();
+                        // This is the VM dev-server preview (sandboxed running app),
+                        // NOT an MCP app. MCP apps render via <MCPAppRenderer/>.
+                        track("vm_preview_loaded", {
+                          view_mode: editingMode,
+                          vm_id: vmEntry?.sandboxHandle ?? null,
+                          // Intentionally excluding the full previewUrl — it can contain
+                          // ephemeral tokens / user data in the query string.
+                        });
+                        // Sync currentPath when the user navigates inside the iframe.
+                        // Skip while a programmatic navigation is pending — stale
+                        // onLoad events from the previous URL would reset us to "/".
+                        if (!activeGlobalSection) {
+                          try {
+                            const iframePath =
+                              previewIframeRef.current?.contentWindow?.location
+                                ?.pathname;
+                            if (!iframePath) return;
+                            const intended = intendedPathRef.current;
+                            if (intended !== null) {
+                              intendedPathRef.current = null;
+                              // Stale onLoad from the previous URL — ignore.
+                              if (normPath(iframePath) !== normPath(intended)) {
+                                return;
+                              }
+                            }
+                            // Keep the template as currentPath when the loaded
+                            // path is just the template with params filled in —
+                            // otherwise the page match and param inputs are lost.
+                            if (
+                              normPath(iframePath) === normPath(resolvedPath)
+                            ) {
+                              return;
+                            }
+                            setCurrentPath(iframePath);
+                            persistLastPage({
+                              path: iframePath,
+                              pageKey: pinnedPageKey,
+                              params: pathParamValues,
+                            });
+                          } catch {
+                            // Cross-origin — can't read, keep current value
+                          }
                         }
-                        return;
-                      }
-                      setCurrentPath(iframePath);
-                    } catch {
-                      // Cross-origin — can't read, keep current value
-                    }
-                  }
-                  if (viewMode === "visual") injectVisualEditor();
-                  if (viewMode === "cms") injectCmsEditor();
-                }}
-              />
-            </div>
-          )}
-        </div>
+                        if (editingMode === "visual") injectVisualEditor();
+                        if (editingMode === "blocks") injectCmsEditor();
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            </ResizablePanel>
+          </ResizablePanelGroup>
+        )}
       </div>
       <CreatePageModal
         open={createPageDialogOpen}
         onOpenChange={setCreatePageDialogOpen}
         isPending={createPage.isPending}
         error={createPageError}
+        templates={pages}
         onSubmit={handleCreatePage}
       />
 

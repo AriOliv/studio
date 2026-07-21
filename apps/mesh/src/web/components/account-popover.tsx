@@ -20,7 +20,6 @@ import {
 import { cn } from "@deco/ui/lib/utils.ts";
 import { useIsMobile } from "@deco/ui/hooks/use-mobile.ts";
 import {
-  Check,
   Copy01,
   Download01,
   File06,
@@ -28,69 +27,23 @@ import {
   LogOut01,
   Monitor01,
   Moon01,
-  Plus,
-  SearchMd,
   Settings02,
   Shield01,
+  ShieldTick,
   Sun,
   Users03,
   VolumeMax,
   VolumeX,
-  XClose,
 } from "@untitledui/icons";
 import { GitHubIcon } from "@daveyplate/better-auth-ui";
 import { SidebarMenuButton } from "@deco/ui/components/sidebar.tsx";
-import { authClient, useActiveOrganizations } from "@/web/lib/auth-client";
+import { authClient } from "@/web/lib/auth-client";
 import { useProjectContext } from "@decocms/mesh-sdk";
 import { track } from "@/web/lib/posthog-client";
 import { clearPersistedQueryCache } from "@/web/lib/query-persist";
-import { CreateOrganizationDialog } from "@/web/components/create-organization-dialog";
 import { usePreferences, type ThemeMode } from "@/web/hooks/use-preferences.ts";
+import { useDeploymentAdmin } from "@/web/hooks/use-deployment-admin";
 import { toast } from "@deco/ui/components/sonner.js";
-
-function getOrgColorStyle(name: string): {
-  backgroundColor: string;
-  color: string;
-} {
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  const h = Math.abs(hash) % 360;
-  return {
-    backgroundColor: `hsl(${h} 55% 70%)`,
-    color: `hsl(${h} 55% 20%)`,
-  };
-}
-
-function OrgIcon({
-  org,
-  size = "sm",
-}: {
-  org: { name: string; logo?: string | null };
-  size?: "xs" | "sm";
-}) {
-  const sizeClass = size === "xs" ? "size-5" : "size-6";
-  const textClass = size === "xs" ? "text-[9px]" : "text-xs";
-
-  return (
-    <div
-      className={cn(
-        sizeClass,
-        "shrink-0 rounded-md flex items-center justify-center border border-border/50 overflow-hidden",
-      )}
-      style={org.logo ? undefined : getOrgColorStyle(org.name)}
-    >
-      {org.logo ? (
-        <img src={org.logo} alt="" className="size-full object-cover" />
-      ) : (
-        <span className={cn("font-semibold leading-none", textClass)}>
-          {org.name.slice(0, 2).toUpperCase()}
-        </span>
-      )}
-    </div>
-  );
-}
 
 interface MenuItem {
   key: string;
@@ -99,6 +52,8 @@ interface MenuItem {
   onClick?: () => void;
   href?: string;
   external?: boolean;
+  /** Extra classes for a visually distinct item (e.g. admin / impersonation actions). */
+  className?: string;
 }
 
 function MenuItemButton({
@@ -108,8 +63,10 @@ function MenuItemButton({
   item: MenuItem;
   onClose: () => void;
 }) {
-  const baseClass =
-    "flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-left w-full transition-colors text-foreground/80 hover:bg-sidebar-accent hover:text-foreground";
+  const baseClass = cn(
+    "flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-left w-full transition-colors text-foreground/80 hover:bg-sidebar-accent hover:text-foreground",
+    item.className,
+  );
 
   if (item.href) {
     return (
@@ -141,109 +98,144 @@ function MenuItemButton({
   );
 }
 
-function OrganizationsPanel({
-  orgParam,
-  onSelectOrg,
-  onCreateOrg,
+function ImpersonatingPill() {
+  return (
+    <span className="shrink-0 inline-flex items-center rounded-full bg-warning/10 px-2 py-0.5 text-[10px] font-medium text-warning">
+      Impersonating
+    </span>
+  );
+}
+
+function UserInfoHeader({
+  user,
+  userImage,
+  isImpersonating,
+  isMobile,
 }: {
-  orgParam?: string;
-  onSelectOrg: (slug: string) => void;
-  onCreateOrg: () => void;
+  user: { id?: string; name?: string; email?: string } | undefined;
+  userImage?: string;
+  isImpersonating: boolean;
+  isMobile: boolean;
 }) {
-  // Fetched here, not in the parent: this panel only mounts inside the open
-  // popover/drawer, so the (potentially large) organization.list call is
-  // deferred until the switcher is actually opened — it no longer fires on
-  // every page load.
-  const { data: organizations } = useActiveOrganizations();
-  const sortedOrgs = [...(organizations ?? [])].sort((a, b) => {
-    if (a.slug === orgParam) return -1;
-    if (b.slug === orgParam) return 1;
-    return a.name.localeCompare(b.name);
-  });
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-3 px-4",
+        isMobile ? "py-4 border-b border-border" : "py-3 mx-1 mt-1",
+      )}
+    >
+      <Avatar
+        url={userImage}
+        fallback={user?.name ?? "U"}
+        shape="circle"
+        size="sm"
+        className="shrink-0"
+      />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <p className="text-sm font-medium truncate">{user?.name ?? "User"}</p>
+          {isImpersonating && <ImpersonatingPill />}
+        </div>
+        <p className="text-xs text-muted-foreground truncate">{user?.email}</p>
+      </div>
+      <TooltipProvider delayDuration={300}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              tabIndex={-1}
+              onClick={() => {
+                if (!user?.id) return;
+                navigator.clipboard.writeText(user.id).then(() => {
+                  toast.success("User ID copied");
+                });
+              }}
+              className="shrink-0 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <Copy01 size={14} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right">
+            <p className="text-xs">Copy user ID</p>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    </div>
+  );
+}
 
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [query, setQuery] = useState("");
-
-  const q = query.toLowerCase();
-  const filtered = q
-    ? sortedOrgs.filter(
-        (o) =>
-          o.name.toLowerCase().includes(q) || o.slug.toLowerCase().includes(q),
-      )
-    : sortedOrgs;
-
-  const iconBtnClass =
-    "flex items-center justify-center size-7 rounded-md text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors";
-
-  function toggleSearch() {
-    if (searchOpen) setQuery("");
-    setSearchOpen((prev) => !prev);
-  }
+function ThemeSoundVersionBar({
+  themeOptions,
+  preferences,
+  setPreferences,
+  isMobile,
+}: {
+  themeOptions: { value: ThemeMode; icon: React.ReactNode; label: string }[];
+  preferences: ReturnType<typeof usePreferences>[0];
+  setPreferences: ReturnType<typeof usePreferences>[1];
+  isMobile: boolean;
+}) {
+  const buttonSize = isMobile ? "size-8" : "size-7";
 
   return (
-    <>
-      <div className="flex items-center justify-between px-4 py-3">
-        {searchOpen ? (
-          <input
-            autoFocus
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === "Escape" && toggleSearch()}
-            placeholder="Search organizations..."
-            className="flex-1 min-w-0 bg-transparent text-sm outline-none placeholder:text-muted-foreground/60"
-          />
-        ) : (
-          <span className="text-sm font-medium text-muted-foreground/60">
-            Your Organizations
-          </span>
-        )}
-        <div className="flex items-center gap-1 shrink-0">
-          <button type="button" onClick={toggleSearch} className={iconBtnClass}>
-            {searchOpen ? <XClose size={16} /> : <SearchMd size={16} />}
-          </button>
-          <button type="button" onClick={onCreateOrg} className={iconBtnClass}>
-            <Plus size={16} />
-          </button>
-        </div>
-      </div>
-      <div className="flex-1 min-h-0 overflow-y-auto p-1.5 flex flex-col gap-1">
-        {filtered.length === 0 && (
-          <p className="px-3 py-4 text-sm text-muted-foreground/60 text-center">
-            {query
-              ? `No organizations match "${query}"`
-              : "No organizations available"}
-          </p>
-        )}
-        {filtered.map((org) => (
+    <div
+      className={cn(
+        "flex items-center justify-between border-t border-border/50",
+        isMobile ? "px-3 py-3" : "px-2 py-1.5",
+      )}
+    >
+      <div className="flex items-center gap-0.5">
+        {themeOptions.map(({ value, icon, label }) => (
           <button
-            key={org.id}
+            key={value}
             type="button"
-            onClick={() => onSelectOrg(org.slug)}
+            aria-label={label}
+            onClick={() =>
+              setPreferences((prev) => ({ ...prev, theme: value }))
+            }
             className={cn(
-              "flex items-center gap-3 px-3 py-2.5 rounded-md text-sm text-left w-full transition-colors",
-              org.slug === orgParam
-                ? "bg-accent text-accent-foreground"
-                : "text-foreground hover:bg-accent/50",
+              buttonSize,
+              "rounded-md flex items-center justify-center transition-colors",
+              preferences.theme === value
+                ? "bg-sidebar-accent text-foreground"
+                : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
             )}
           >
-            <OrgIcon org={org} size="sm" />
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium truncate">{org.name}</p>
-              <p className="text-xs text-muted-foreground truncate">
-                {org.slug}
-              </p>
-            </div>
-            {org.slug === orgParam && (
-              <Check
-                size={14}
-                className="ml-auto text-muted-foreground shrink-0"
-              />
-            )}
+            {icon}
           </button>
         ))}
       </div>
-    </>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          aria-label={
+            preferences.enableSounds ? "Disable sounds" : "Enable sounds"
+          }
+          onClick={() =>
+            setPreferences((prev) => ({
+              ...prev,
+              enableSounds: !prev.enableSounds,
+            }))
+          }
+          className={cn(
+            buttonSize,
+            "rounded-md flex items-center justify-center transition-colors",
+            preferences.enableSounds
+              ? "text-foreground hover:bg-sidebar-accent/50"
+              : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
+          )}
+        >
+          {preferences.enableSounds ? (
+            <VolumeMax size={14} />
+          ) : (
+            <VolumeX size={14} />
+          )}
+        </button>
+        <span className="text-xs text-muted-foreground/60">
+          v{__MESH_VERSION__}
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -253,267 +245,88 @@ function AccountPopoverContent({
   userImage,
   menuItems,
   signOutItem,
+  stopImpersonatingItem,
+  isImpersonating,
   themeOptions,
   preferences,
   setPreferences,
-  orgParam,
-  onSelectOrg,
-  onCreateOrg,
   close,
   isMobile,
-  open,
 }: {
   user: { id?: string; name?: string; email?: string } | undefined;
   userImage?: string;
   menuItems: MenuItem[];
   signOutItem: MenuItem;
+  stopImpersonatingItem: MenuItem | null;
+  isImpersonating: boolean;
   themeOptions: { value: ThemeMode; icon: React.ReactNode; label: string }[];
   preferences: ReturnType<typeof usePreferences>[0];
   setPreferences: ReturnType<typeof usePreferences>[1];
-  orgParam?: string;
-  onSelectOrg: (slug: string) => void;
-  onCreateOrg: () => void;
   close: () => void;
   isMobile: boolean;
-  open: boolean;
 }) {
   if (isMobile) {
     // Mobile: single-column scrollable layout
     return (
       <div className="flex flex-col h-full overflow-hidden">
-        {/* User info */}
-        <div className="flex items-center gap-3 px-4 py-4 border-b border-border">
-          <Avatar
-            url={userImage}
-            fallback={user?.name ?? "U"}
-            shape="circle"
-            size="sm"
-            className="shrink-0"
-          />
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium truncate">
-              {user?.name ?? "User"}
-            </p>
-            <p className="text-xs text-muted-foreground truncate">
-              {user?.email}
-            </p>
-          </div>
-          <TooltipProvider delayDuration={300}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  onClick={() => {
-                    if (!user?.id) return;
-                    navigator.clipboard.writeText(user.id).then(() => {
-                      toast.success("User ID copied");
-                    });
-                  }}
-                  className="shrink-0 text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <Copy01 size={14} />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="right">
-                <p className="text-xs">Copy user ID</p>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        </div>
+        <UserInfoHeader
+          user={user}
+          userImage={userImage}
+          isImpersonating={isImpersonating}
+          isMobile
+        />
 
         {/* Scrollable content */}
         <div className="flex-1 min-h-0 overflow-y-auto">
-          {/* Org switcher */}
-          <div className="border-b border-border pb-2">
-            <OrganizationsPanel
-              key={String(open)}
-              orgParam={orgParam}
-              onSelectOrg={onSelectOrg}
-              onCreateOrg={onCreateOrg}
-            />
-          </div>
-
           {/* Menu items */}
           <nav className="flex flex-col px-2 pt-2 pb-2 gap-0.5">
             {menuItems.map((item) => (
               <MenuItemButton key={item.key} item={item} onClose={close} />
             ))}
+            {stopImpersonatingItem && (
+              <MenuItemButton item={stopImpersonatingItem} onClose={close} />
+            )}
             <MenuItemButton item={signOutItem} onClose={close} />
           </nav>
         </div>
 
-        {/* Bottom bar: theme + sound + version */}
-        <div className="flex items-center justify-between px-3 py-3 border-t border-border/50">
-          <div className="flex items-center gap-0.5">
-            {themeOptions.map(({ value, icon, label }) => (
-              <button
-                key={value}
-                type="button"
-                aria-label={label}
-                onClick={() =>
-                  setPreferences((prev) => ({ ...prev, theme: value }))
-                }
-                className={cn(
-                  "size-8 rounded-md flex items-center justify-center transition-colors",
-                  preferences.theme === value
-                    ? "bg-sidebar-accent text-foreground"
-                    : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
-                )}
-              >
-                {icon}
-              </button>
-            ))}
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              aria-label={
-                preferences.enableSounds ? "Disable sounds" : "Enable sounds"
-              }
-              onClick={() =>
-                setPreferences((prev) => ({
-                  ...prev,
-                  enableSounds: !prev.enableSounds,
-                }))
-              }
-              className={cn(
-                "size-8 rounded-md flex items-center justify-center transition-colors",
-                preferences.enableSounds
-                  ? "text-foreground hover:bg-sidebar-accent/50"
-                  : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
-              )}
-            >
-              {preferences.enableSounds ? (
-                <VolumeMax size={14} />
-              ) : (
-                <VolumeX size={14} />
-              )}
-            </button>
-            <span className="text-xs text-muted-foreground/60">
-              v{__MESH_VERSION__}
-            </span>
-          </div>
-        </div>
+        <ThemeSoundVersionBar
+          themeOptions={themeOptions}
+          preferences={preferences}
+          setPreferences={setPreferences}
+          isMobile
+        />
       </div>
     );
   }
 
-  // Desktop: two-column layout
+  // Desktop: single-column account menu (org switching lives in the breadcrumb)
   return (
-    <div className="flex min-h-[380px] w-full overflow-hidden">
-      {/* Left panel */}
-      <div className="w-60 shrink-0 flex flex-col border-r border-border bg-sidebar/75">
-        {/* User info */}
-        <div className="flex items-center gap-3 px-4 py-3 mx-1 mt-1">
-          <Avatar
-            url={userImage}
-            fallback={user?.name ?? "U"}
-            shape="circle"
-            size="sm"
-            className="shrink-0"
-          />
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium truncate">
-              {user?.name ?? "User"}
-            </p>
-            <p className="text-xs text-muted-foreground truncate">
-              {user?.email}
-            </p>
-          </div>
-          <TooltipProvider delayDuration={300}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  onClick={() => {
-                    if (!user?.id) return;
-                    navigator.clipboard.writeText(user.id).then(() => {
-                      toast.success("User ID copied");
-                    });
-                  }}
-                  className="shrink-0 text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <Copy01 size={14} />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="right">
-                <p className="text-xs">Copy user ID</p>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        </div>
+    <div className="flex w-full flex-col overflow-hidden">
+      <div className="flex flex-col">
+        <UserInfoHeader
+          user={user}
+          userImage={userImage}
+          isImpersonating={isImpersonating}
+          isMobile={false}
+        />
 
         {/* Navigation items */}
         <nav className="flex-1 flex flex-col px-2 pt-1 overflow-y-auto">
           {menuItems.map((item) => (
             <MenuItemButton key={item.key} item={item} onClose={close} />
           ))}
+          {stopImpersonatingItem && (
+            <MenuItemButton item={stopImpersonatingItem} onClose={close} />
+          )}
           <MenuItemButton item={signOutItem} onClose={close} />
         </nav>
 
-        {/* Bottom bar: theme toggles + sound + version */}
-        <div className="flex items-center justify-between px-2 py-1.5 border-t border-border/50">
-          <div className="flex items-center gap-0.5">
-            {themeOptions.map(({ value, icon, label }) => (
-              <button
-                key={value}
-                type="button"
-                aria-label={label}
-                onClick={() =>
-                  setPreferences((prev) => ({ ...prev, theme: value }))
-                }
-                className={cn(
-                  "size-7 rounded-md flex items-center justify-center transition-colors",
-                  preferences.theme === value
-                    ? "bg-sidebar-accent text-foreground"
-                    : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
-                )}
-              >
-                {icon}
-              </button>
-            ))}
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              aria-label={
-                preferences.enableSounds ? "Disable sounds" : "Enable sounds"
-              }
-              onClick={() =>
-                setPreferences((prev) => ({
-                  ...prev,
-                  enableSounds: !prev.enableSounds,
-                }))
-              }
-              className={cn(
-                "size-7 rounded-md flex items-center justify-center transition-colors",
-                preferences.enableSounds
-                  ? "text-foreground hover:bg-sidebar-accent/50"
-                  : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
-              )}
-            >
-              {preferences.enableSounds ? (
-                <VolumeMax size={14} />
-              ) : (
-                <VolumeX size={14} />
-              )}
-            </button>
-            <span className="text-xs text-muted-foreground/60">
-              v{__MESH_VERSION__}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* Right panel - org selector */}
-      <div className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
-        <OrganizationsPanel
-          key={String(open)}
-          orgParam={orgParam}
-          onSelectOrg={onSelectOrg}
-          onCreateOrg={onCreateOrg}
+        <ThemeSoundVersionBar
+          themeOptions={themeOptions}
+          preferences={preferences}
+          setPreferences={setPreferences}
+          isMobile={false}
         />
       </div>
     </div>
@@ -522,29 +335,24 @@ function AccountPopoverContent({
 
 export function AccountPopover() {
   const { data: session } = authClient.useSession();
-  // Current org comes from the already-loaded shell context (name + logo) so
-  // the trigger paints without fetching organization.list. The full list is
-  // fetched lazily inside OrganizationsPanel when the switcher opens.
+  // Org context is still read for the "Add to Home Screen" (per-org install) and
+  // Preferences deep-links — but org *switching* now lives in the toolbar
+  // breadcrumb, so this popover is account-only.
   const { org: currentOrg } = useProjectContext();
   const navigate = useNavigate();
   const orgMatch = useMatch({ from: "/shell/$org", shouldThrow: false });
   const orgParam = orgMatch?.params.org;
   const [preferences, setPreferences] = usePreferences();
   const isMobile = useIsMobile();
+  const { isAdmin: isDeploymentAdmin } = useDeploymentAdmin();
 
   const [open, setOpen] = useState(false);
-  const [creatingOrg, setCreatingOrg] = useState(false);
 
   const user = session?.user;
   const userImage = (user as { image?: string } | undefined)?.image;
-
-  const handleSelectOrg = (orgSlug: string) => {
-    setOpen(false);
-    navigate({
-      to: "/$org",
-      params: { org: orgSlug },
-    });
-  };
+  const isImpersonating = !!(
+    session?.session as { impersonatedBy?: string } | undefined
+  )?.impersonatedBy;
 
   const close = () => setOpen(false);
 
@@ -614,6 +422,17 @@ export function AccountPopover() {
       href: "https://decocms.com",
       external: true,
     },
+    ...(isDeploymentAdmin
+      ? [
+          {
+            key: "admin-dashboard",
+            label: "Admin Dashboard",
+            icon: <ShieldTick size={16} />,
+            onClick: () => navigate({ to: "/_admin" }),
+            className: "text-warning",
+          } satisfies MenuItem,
+        ]
+      : []),
   ];
 
   const signOutItem: MenuItem = {
@@ -626,6 +445,29 @@ export function AccountPopover() {
       authClient.signOut();
     },
   };
+
+  // Direct client call — safe anywhere: stopImpersonating needs no admin
+  // permission, only the impersonatedBy session + signed admin_session
+  // cookie. Must NOT go through /api/_admin (the impersonated user isn't an
+  // allowlisted admin). The better-auth client returns { error } instead of
+  // throwing, so redirect only on success — otherwise a failed stop would
+  // silently reload the admin still impersonating.
+  const stopImpersonatingItem: MenuItem | null = isImpersonating
+    ? {
+        key: "stop-impersonating",
+        label: "Stop impersonation",
+        icon: <LogOut01 size={16} />,
+        onClick: async () => {
+          const { error } = await authClient.admin.stopImpersonating();
+          if (error) {
+            toast.error(error.message || "Failed to stop impersonation");
+            return;
+          }
+          window.location.href = "/";
+        },
+        className: "text-warning",
+      }
+    : null;
 
   const themeOptions: {
     value: ThemeMode;
@@ -642,18 +484,13 @@ export function AccountPopover() {
     userImage,
     menuItems,
     signOutItem,
+    stopImpersonatingItem,
+    isImpersonating,
     themeOptions,
     preferences,
     setPreferences,
-    orgParam,
-    onSelectOrg: handleSelectOrg,
-    onCreateOrg: () => {
-      setOpen(false);
-      setCreatingOrg(true);
-    },
     close,
     isMobile,
-    open,
   };
 
   return (
@@ -663,29 +500,19 @@ export function AccountPopover() {
           <button
             type="button"
             onClick={() => setOpen(true)}
-            className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg transition-colors text-sm text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
+            className={cn(
+              "flex items-center gap-3 w-full px-3 py-2.5 rounded-lg transition-colors text-sm text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground",
+              isImpersonating && "border-2 border-dashed border-warning",
+            )}
           >
-            <div
-              className="shrink-0 size-5 rounded-md flex items-center justify-center border border-border/50 overflow-hidden"
-              style={
-                currentOrg?.logo
-                  ? undefined
-                  : getOrgColorStyle(currentOrg?.name ?? "")
-              }
-            >
-              {currentOrg?.logo ? (
-                <img
-                  src={currentOrg.logo}
-                  alt=""
-                  className="size-full object-cover"
-                />
-              ) : (
-                <span className="font-semibold leading-none text-[8px]">
-                  {(currentOrg?.name ?? "?").slice(0, 2).toUpperCase()}
-                </span>
-              )}
-            </div>
-            <span className="truncate">{currentOrg?.name ?? "Account"}</span>
+            <Avatar
+              url={userImage}
+              fallback={user?.name ?? "U"}
+              shape="circle"
+              size="2xs"
+              className="shrink-0"
+            />
+            <span className="truncate">{user?.name ?? "Account"}</span>
           </button>
           <DrawerContent className="h-[80dvh] p-0">
             <DrawerTitle className="sr-only">Account</DrawerTitle>
@@ -696,30 +523,20 @@ export function AccountPopover() {
         <Popover open={open} onOpenChange={setOpen}>
           <PopoverTrigger asChild>
             <SidebarMenuButton
-              tooltip={currentOrg?.name ?? "Account"}
-              className="rounded-md"
+              tooltip={user?.name ?? "Account"}
+              className={cn(
+                "rounded-md",
+                isImpersonating && "border-2 border-dashed border-warning",
+              )}
             >
-              <div
-                className="shrink-0 size-6 rounded-md flex items-center justify-center border border-border/50 overflow-hidden"
-                style={
-                  currentOrg?.logo
-                    ? undefined
-                    : getOrgColorStyle(currentOrg?.name ?? "")
-                }
-              >
-                {currentOrg?.logo ? (
-                  <img
-                    src={currentOrg.logo}
-                    alt=""
-                    className="size-full object-cover"
-                  />
-                ) : (
-                  <span className="font-semibold leading-none text-[9px]">
-                    {(currentOrg?.name ?? "?").slice(0, 2).toUpperCase()}
-                  </span>
-                )}
-              </div>
-              <span className="truncate">{currentOrg?.name ?? "Account"}</span>
+              <Avatar
+                url={userImage}
+                fallback={user?.name ?? "U"}
+                shape="circle"
+                size="xs"
+                className="shrink-0"
+              />
+              <span className="truncate">{user?.name ?? "Account"}</span>
             </SidebarMenuButton>
           </PopoverTrigger>
 
@@ -728,18 +545,13 @@ export function AccountPopover() {
             align="end"
             sideOffset={18}
             collisionPadding={16}
-            className="w-[520px] p-0 flex max-h-[520px]"
+            className="w-[280px] p-0 flex flex-col max-h-[520px]"
             onCloseAutoFocus={(e) => e.preventDefault()}
           >
             <AccountPopoverContent {...sharedProps} />
           </PopoverContent>
         </Popover>
       )}
-
-      <CreateOrganizationDialog
-        open={creatingOrg}
-        onOpenChange={setCreatingOrg}
-      />
     </>
   );
 }

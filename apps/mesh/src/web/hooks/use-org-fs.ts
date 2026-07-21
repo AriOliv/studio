@@ -71,18 +71,20 @@ function fsUrl(
   return `/api/${encodeURIComponent(orgSlug)}/fs/${encodeURIComponent(volume)}/${op}${qs ? `?${qs}` : ""}`;
 }
 
-async function fsFetch(url: string, init?: RequestInit): Promise<Response> {
+async function fsFetch(
+  url: string,
+  init?: RequestInit,
+  opts?: { allow404?: boolean },
+): Promise<Response> {
   const res = await fetch(url, init);
-  if (!res.ok) {
-    let detail = "";
-    try {
-      detail = ((await res.json()) as { error?: string }).error ?? "";
-    } catch {
-      // non-JSON body
-    }
-    throw new Error(detail || `HTTP ${res.status}`);
+  if (res.ok || (opts?.allow404 && res.status === 404)) return res;
+  let detail = "";
+  try {
+    detail = ((await res.json()) as { error?: string }).error ?? "";
+  } catch {
+    // non-JSON body
   }
-  return res;
+  throw new Error(detail || `HTTP ${res.status}`);
 }
 
 /** Children of `path` ("" = volume root), dirs first then by name. */
@@ -123,9 +125,12 @@ export function useOrgFsStat(
           query.state.data ? false : (opts.refetchIntervalWhenAbsent ?? false)
       : undefined,
     queryFn: async (): Promise<OrgFsEntry | null> => {
-      const res = await fetch(fsUrl(org.slug, volume ?? "", "stat", { path }));
+      const res = await fsFetch(
+        fsUrl(org.slug, volume ?? "", "stat", { path }),
+        undefined,
+        { allow404: true },
+      );
       if (res.status === 404) return null;
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return ((await res.json()) as { entry: OrgFsEntry }).entry;
     },
   });
@@ -161,6 +166,26 @@ export function useOrgFsRecent(limit = 60, opts?: { enabled?: boolean }) {
   });
 }
 
+/**
+ * Path search (case-insensitive substring) across every volume, newest
+ * first — the Library's search box. Only runs for non-empty queries;
+ * previous results stay on screen while a new query loads.
+ */
+export function useOrgFsSearch(query: string, limit = 50) {
+  const { org } = useProjectContext();
+  return useQuery({
+    queryKey: KEYS.orgFsSearch(org.id, query),
+    enabled: query.length > 0,
+    placeholderData: keepPreviousData,
+    queryFn: async () => {
+      const res = await fsFetch(
+        `/api/${encodeURIComponent(org.slug)}/fs/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+      );
+      return ((await res.json()) as { entries: OrgFsRecentEntry[] }).entries;
+    },
+  });
+}
+
 /** A skill folder (dir containing SKILL.md) in the org filesystem. */
 export interface OrgFsSkill {
   volume: string;
@@ -168,9 +193,11 @@ export interface OrgFsSkill {
 }
 
 /**
- * Skill folders (dirs containing SKILL.md) across the home volume and the
- * deployment's public skill sets — the attachable-skill set for agent
- * knowledge. Lists each volume's root and keeps the `hasSkill` dirs.
+ * The attachable-skill set for agent knowledge — the SAME catalog the runtime
+ * surfaces in `<available-skills>` (server-side `buildSkillCatalog`: the org's
+ * home root, `home/skills/*`, and the deployment's public sets). Consuming the
+ * shared `/fs/skills` endpoint keeps the picker and the run from ever drifting
+ * on what counts (and where) as a skill.
  */
 export function useOrgFsSkills(opts?: { enabled?: boolean }) {
   const { org } = useProjectContext();
@@ -178,25 +205,161 @@ export function useOrgFsSkills(opts?: { enabled?: boolean }) {
     queryKey: KEYS.orgFsSkills(org.id),
     enabled: opts?.enabled,
     queryFn: async (): Promise<OrgFsSkill[]> => {
-      const setsRes = await fsFetch(
-        `/api/${encodeURIComponent(org.slug)}/fs/public-sets`,
+      const res = await fsFetch(
+        `/api/${encodeURIComponent(org.slug)}/fs/skills`,
       );
-      const { sets } = (await setsRes.json()) as { sets: string[] };
-      const volumes = ["home", ...sets.map((s) => `public-${s}`)];
-      const perVolume = await Promise.all(
-        volumes.map(async (volume) => {
-          const res = await fsFetch(
-            fsUrl(org.slug, volume, "list", { path: "" }),
-          );
-          const { entries } = (await res.json()) as { entries: OrgFsEntry[] };
-          return entries
-            .filter((e) => e.kind === "dir" && e.hasSkill)
-            .map((e) => ({ volume, path: e.path }));
-        }),
-      );
-      return perVolume.flat();
+      const { skills } = (await res.json()) as {
+        skills: Array<{ volume: string; path: string }>;
+      };
+      return skills.map((s) => ({ volume: s.volume, path: s.path }));
     },
   });
+}
+
+/**
+ * Full skill catalog entry as returned by `/fs/skills` (the SAME shape the
+ * server's `buildSkillCatalog` emits). Unlike `OrgFsSkill` (attach picker,
+ * volume+path only) this carries the display + resolution fields the chat
+ * slash picker needs: the `id` the `skill` tool takes, the description shown
+ * in the dropdown, and the `sandboxPath` referenced files live under.
+ */
+export interface OrgFsSkillCatalogEntry {
+  id: string;
+  name: string;
+  description: string | null;
+  source: string;
+  volume: string;
+  path: string;
+  sandboxPath: string;
+}
+
+/** Fetch the full skill catalog (used by the chat `/` picker, not react-query). */
+export async function fetchOrgFsSkillCatalog(
+  orgSlug: string,
+): Promise<OrgFsSkillCatalogEntry[]> {
+  const res = await fsFetch(`/api/${encodeURIComponent(orgSlug)}/fs/skills`);
+  const { skills } = (await res.json()) as {
+    skills: OrgFsSkillCatalogEntry[];
+  };
+  return skills;
+}
+
+/** Read a file's contents as UTF-8 text (org-fs `/read` endpoint). */
+async function fetchOrgFsText(
+  orgSlug: string,
+  volume: string,
+  path: string,
+): Promise<string> {
+  const res = await fsFetch(fsUrl(orgSlug, volume, "read", { path }));
+  return res.text();
+}
+
+/** A text file inside a skill folder, collected for inlining into chat. */
+export interface OrgFsSkillFile {
+  /** Path relative to the skill dir (e.g. "SKILL.md", "references/style.md"). */
+  relPath: string;
+  content: string;
+}
+
+// Markdown/text docs whose content we inline (bake into the message). Every
+// other file — scripts, configs, binaries, assets — is left on disk and only
+// its path is surfaced, so the agent knows what exists and where.
+const SKILL_INLINE_EXTENSIONS = new Set([
+  "md",
+  "mdx",
+  "markdown",
+  "txt",
+  "text",
+]);
+const SKILL_MAX_FILES = 25;
+const SKILL_MAX_FILE_BYTES = 64 * 1024;
+const SKILL_MAX_TOTAL_BYTES = 256 * 1024;
+const SKILL_MAX_DEPTH = 4;
+
+function isInlineDoc(path: string): boolean {
+  const dot = path.lastIndexOf(".");
+  if (dot === -1) return false;
+  return SKILL_INLINE_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
+}
+
+/**
+ * Walk a skill folder (bounded by depth/count/bytes) and split its files:
+ * markdown/text docs are read and inlined (`files`, content baked in), every
+ * other file — plus any doc that failed to read or blew a cap — is left on
+ * disk and returned as a relative path in `omittedPaths`. Best-effort: a list
+ * failure just skips that subtree.
+ */
+export async function fetchOrgFsSkillFiles(
+  orgSlug: string,
+  volume: string,
+  dirPath: string,
+): Promise<{ files: OrgFsSkillFile[]; omittedPaths: string[] }> {
+  const prefix = dirPath ? `${dirPath}/` : "";
+  const rel = (p: string) =>
+    p.startsWith(prefix) ? p.slice(prefix.length) : p;
+
+  const inlineCandidates: string[] = [];
+  const omittedPaths: string[] = [];
+  const queue: Array<{ path: string; depth: number }> = [
+    { path: dirPath, depth: 0 },
+  ];
+  while (queue.length > 0) {
+    const next = queue.shift();
+    if (!next) break;
+    let entries: OrgFsEntry[];
+    try {
+      const res = await fsFetch(
+        fsUrl(orgSlug, volume, "list", { path: next.path }),
+      );
+      entries = ((await res.json()) as { entries: OrgFsEntry[] }).entries;
+    } catch {
+      continue;
+    }
+    for (const e of [...entries].sort((a, b) => a.path.localeCompare(b.path))) {
+      if (e.kind === "dir") {
+        if (next.depth < SKILL_MAX_DEPTH)
+          queue.push({ path: e.path, depth: next.depth + 1 });
+        continue;
+      }
+      if (
+        isInlineDoc(e.path) &&
+        e.size <= SKILL_MAX_FILE_BYTES &&
+        inlineCandidates.length < SKILL_MAX_FILES
+      ) {
+        inlineCandidates.push(e.path);
+      } else {
+        omittedPaths.push(rel(e.path));
+      }
+    }
+  }
+
+  const contents = await Promise.all(
+    inlineCandidates.map((p) =>
+      fetchOrgFsText(orgSlug, volume, p).catch(() => null),
+    ),
+  );
+  const files: OrgFsSkillFile[] = [];
+  let total = 0;
+  inlineCandidates.forEach((p, i) => {
+    const content = contents[i];
+    if (content == null || total + content.length > SKILL_MAX_TOTAL_BYTES) {
+      omittedPaths.push(rel(p));
+      return;
+    }
+    total += content.length;
+    files.push({ relPath: rel(p), content });
+  });
+
+  // SKILL.md first, then alphabetical, so the rendered block is stable.
+  files.sort((a, b) =>
+    a.relPath === "SKILL.md"
+      ? -1
+      : b.relPath === "SKILL.md"
+        ? 1
+        : a.relPath.localeCompare(b.relPath),
+  );
+  omittedPaths.sort();
+  return { files, omittedPaths };
 }
 
 /** The deployment's shared public skill sets (readonly volumes). */
@@ -309,11 +472,12 @@ export function useOrgFsSetShareMode(volume: string) {
       queryClient.invalidateQueries({
         queryKey: KEYS.orgFsStat(org.id, volume, input.path),
       });
-      // Refresh the browser listings + recent feed so public badges re-render.
+      // Refresh the browser listings + feeds so public badges re-render.
       queryClient.invalidateQueries({
         queryKey: KEYS.orgFsVolume(org.id, volume),
       });
       queryClient.invalidateQueries({ queryKey: KEYS.orgFsRecent(org.id) });
+      queryClient.invalidateQueries({ queryKey: KEYS.orgFsSearchRoot(org.id) });
     },
   });
 }
@@ -327,6 +491,7 @@ export function useOrgFsMutations(volume: string) {
       queryKey: KEYS.orgFsVolume(org.id, volume),
     });
     queryClient.invalidateQueries({ queryKey: KEYS.orgFsRecent(org.id) });
+    queryClient.invalidateQueries({ queryKey: KEYS.orgFsSearchRoot(org.id) });
   };
 
   const upload = useMutation({

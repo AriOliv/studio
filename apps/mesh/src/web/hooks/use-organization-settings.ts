@@ -41,6 +41,7 @@ export interface OrganizationSettings {
   registry_config: RegistryConfig | null;
   simple_mode: SimpleModeConfig | null;
   default_home_agents: DefaultHomeAgentsConfig | null;
+  reports_only: boolean | null;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -52,6 +53,7 @@ const EMPTY_SETTINGS: OrganizationSettings = {
   registry_config: null,
   simple_mode: null,
   default_home_agents: null,
+  reports_only: null,
 };
 
 const EMPTY_SIMPLE_MODE: SimpleModeConfig = {
@@ -70,10 +72,7 @@ const EMPTY_SIMPLE_MODE: SimpleModeConfig = {
  * and non-suspense hooks below and by parallel-prefetch batches, so all callers
  * build the same query key + queryFn and read one cache entry.
  */
-export function organizationSettingsQueryOptions(
-  orgSlug: string,
-  orgId: string,
-) {
+function organizationSettingsQueryOptions(orgSlug: string, orgId: string) {
   return {
     queryKey: KEYS.organizationSettings(orgId),
     queryFn: async (): Promise<OrganizationSettings> => {
@@ -137,6 +136,7 @@ type OrgSettingsUpdateInput = Partial<
     | "registry_config"
     | "simple_mode"
     | "default_home_agents"
+    | "reports_only"
   >
 >;
 
@@ -222,6 +222,17 @@ export function useUpdateSimpleMode() {
       options?: OrgSettingsMutateOptions,
     ) => mutation.mutateAsync({ simple_mode: config }, options),
   };
+}
+
+/**
+ * Whether the org uses the curated commerce (reports) look: the full Studio
+ * shell stays, but agent navigation, the home Customize button, and the
+ * Settings / Automations tabs are hidden. Non-blocking read — used for cosmetic
+ * gating where a brief pre-resolution render is harmless.
+ */
+export function useReportsOnly(): boolean {
+  const { data } = useOrganizationSettings((s) => s.reports_only ?? false);
+  return data ?? false;
 }
 
 export function useRegistryConfig(): RegistryConfig | null {

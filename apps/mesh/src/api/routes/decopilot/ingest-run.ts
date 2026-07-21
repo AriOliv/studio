@@ -1,7 +1,7 @@
 /**
  * The ONE shared ingest unit (spec §unified-pipeline / Phase B).
  *
- * Both execution paths — agent-sandbox (in-mesh) and user-desktop (relay) —
+ * Both execution paths — agent-sandbox (in-studio) and user-desktop (relay) —
  * route through `ingestRun`. It does two things, in lockstep, per chunk:
  *
  *  1. **Publish** the raw chunk to `DECOPILOT_STREAMS` with a seq-keyed
@@ -67,6 +67,25 @@ export interface IngestRunInput {
    * consulted — a single-message window suffices.
    */
   originalMessages?: UIMessage[];
+}
+
+/**
+ * Duck-typed shape a caller can read off a caught `ingestRun` failure (see
+ * `ingestRun`'s `sourceError` handling below). `lastAckSeq` is the highest
+ * CONTIGUOUS published seq at the moment of failure (0 if no chunk was ever
+ * confirmed) — a caller that must publish its own fence-scoped terminal after
+ * catching this (see `hosted-harness-workflow.ts`'s `publishHostedHarnessFailure`)
+ * needs it to pick a seq that keeps the run's JetStream log contiguous instead
+ * of colliding with (or leaving a gap before) already-published content chunks.
+ *
+ * Plain own-enumerable property, not a class/`instanceof` check — DBOS
+ * serializes a step's thrown error through `serialize-error` for its durable
+ * journal and reconstructs a plain `Error` on replay (losing any subclass),
+ * but own-enumerable properties survive that round trip. Same idiom as
+ * `PermanentRunError.permanent` (see `core/dispatch-errors.ts`).
+ */
+export interface WithLastAckSeq {
+  lastAckSeq?: number;
 }
 
 export interface IngestRunDeps {
@@ -182,8 +201,16 @@ export async function ingestRun(
   await whenComplete;
 
   // A source/publish throw poisons the run: re-raise so the caller fails and we
-  // never stamp a {done} marker on a partial run.
-  if (sourceError !== undefined) throw sourceError;
+  // never stamp a {done} marker on a partial run. Stamp the highest contiguous
+  // published seq onto the error first (see `WithLastAckSeq`) so a caller that
+  // must publish its own terminal after this (the hosted-harness child's catch)
+  // can continue the run's seq counter instead of colliding with seq 1..ackSeq.
+  if (sourceError !== undefined) {
+    if (sourceError instanceof Error) {
+      (sourceError as Error & WithLastAckSeq).lastAckSeq = ackSeq;
+    }
+    throw sourceError;
+  }
 
   // Authoritative terminal sentinel: published ONLY after a clean run (no throw
   // from the source stream or the kernel), fence-scoped so the projector keys

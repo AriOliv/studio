@@ -90,10 +90,10 @@ export const VirtualMcpUILayoutSchema = z.object({
     .nullable()
     .optional(),
   /**
-   * When true, the chat panel is open alongside the main view on first
-   * load. Ignored when `defaultMainView.type === "chat"` (chat is always
-   * open in that case). Absent / null / false → chat is closed unless the
-   * default view is chat.
+   * When true, Chat is selected in the side panel alongside the main view on
+   * first load. Ignored when `defaultMainView.type === "chat"` (Chat is always
+   * selected in that case). Absent / null / false → the side panel is closed
+   * unless the default view is Chat.
    */
   chatDefaultOpen: z.boolean().nullable().optional(),
   tabs: z.array(VirtualMcpUILayoutTabSchema).optional(),
@@ -581,7 +581,7 @@ export const VirtualMCPEntitySchema = z.object({
         .nullable()
         .optional()
         .describe(
-          "Allowlist of Virtual MCP (agent) IDs this agent may delegate to via subtask. null/absent = all active org agents; empty array = itself only (no cross-agent delegation).",
+          "Allowlist of Virtual MCP (agent) or concrete MCP connection IDs this agent may delegate to via subtask. Concrete connections create ephemeral subagents. null/absent = all active org targets; empty array = itself only.",
         ),
       liveAgentId: z
         .string()
@@ -625,6 +625,27 @@ export const VirtualMCPEntitySchema = z.object({
 export type VirtualMCPEntity = z.infer<typeof VirtualMCPEntitySchema>;
 
 /**
+ * A kickstart prompt seeded on an agent at creation time. Persisted to org-fs
+ * (not on the agent row) and surfaced as a native MCP prompt on the agent's
+ * gateway — so it shows up as an icebreaker, on the org home, and via `/`
+ * mentions, exactly like a prompt exposed by a connected MCP.
+ */
+export const AgentKickstartPromptSchema = z.object({
+  title: z.string().min(1).max(120).describe("Short label shown on the chip"),
+  description: z
+    .string()
+    .max(280)
+    .optional()
+    .describe("One-line subtitle shown under the title"),
+  text: z
+    .string()
+    .min(1)
+    .describe("The message sent to the agent when the prompt is clicked"),
+});
+
+export type AgentKickstartPrompt = z.infer<typeof AgentKickstartPromptSchema>;
+
+/**
  * Input schema for creating virtual MCPs
  */
 export const VirtualMCPCreateDataSchema = z.object({
@@ -658,7 +679,7 @@ export const VirtualMCPCreateDataSchema = z.object({
         .nullable()
         .optional()
         .describe(
-          "Allowlist of Virtual MCP (agent) IDs this agent may delegate to via subtask. null/absent = all active org agents; empty array = itself only (no cross-agent delegation).",
+          "Allowlist of Virtual MCP (agent) or concrete MCP connection IDs this agent may delegate to via subtask. Concrete connections create ephemeral subagents. null/absent = all active org targets; empty array = itself only.",
         ),
       liveAgentId: z
         .string()
@@ -697,6 +718,12 @@ export const VirtualMCPCreateDataSchema = z.object({
     .describe(
       "Connections to include/exclude (can be empty for exclusion mode)",
     ),
+  prompts: z
+    .array(AgentKickstartPromptSchema)
+    .optional()
+    .describe(
+      "Optional kickstart prompts to seed on the agent. Each becomes a clickable conversation starter (icebreaker) on the agent. Author them from the agent's role and the tools it will have so they're coherent and immediately useful.",
+    ),
 });
 
 export type VirtualMCPCreateData = z.infer<typeof VirtualMCPCreateDataSchema>;
@@ -731,7 +758,7 @@ export const VirtualMCPUpdateDataSchema = z.object({
         .nullable()
         .optional()
         .describe(
-          "Allowlist of Virtual MCP (agent) IDs this agent may delegate to via subtask. null/absent = all active org agents; empty array = itself only (no cross-agent delegation).",
+          "Allowlist of Virtual MCP (agent) or concrete MCP connection IDs this agent may delegate to via subtask. Concrete connections create ephemeral subagents. null/absent = all active org targets; empty array = itself only.",
         ),
       liveAgentId: z
         .string()
@@ -769,6 +796,12 @@ export const VirtualMCPUpdateDataSchema = z.object({
     .array(VirtualMCPConnectionInputSchema)
     .optional()
     .describe("New connections (replaces existing)"),
+  prompts: z
+    .array(AgentKickstartPromptSchema)
+    .optional()
+    .describe(
+      "Replace the agent's kickstart prompts with this full set. Omit to leave them unchanged; pass an empty array to remove all. Each becomes a clickable conversation starter (icebreaker).",
+    ),
 });
 
 export type VirtualMCPUpdateData = z.infer<typeof VirtualMCPUpdateDataSchema>;

@@ -43,6 +43,12 @@ import {
 import { generateBranchName } from "../../shared/branch-name";
 import { PACKAGE_MANAGER_CONFIG } from "../../shared/runtime-defaults";
 import { resolveSandboxProvider } from "../../sandbox/resolve-provider";
+import {
+  getThreadGithubRepo,
+  setThreadSandboxMapEntry,
+  syntheticBranchToGitRef,
+  threadIdFromBranch,
+} from "./thread-repo";
 import { deriveOffloadAllowlist } from "../../object-storage/offload-allowlist";
 import { getSettings } from "../../settings";
 import { getPublicUrl } from "../../core/server-constants";
@@ -104,7 +110,11 @@ export const SANDBOX_START = defineTool({
     requireAuth(ctx);
     const organization = requireOrganization(ctx);
     await ctx.access.check();
-    const resolvedBranch = input.branch ?? generateBranchName();
+    const resolvedBranch =
+      input.branch ??
+      generateBranchName(
+        ctx.auth.user?.name ?? ctx.auth.user?.email?.split("@")[0],
+      );
 
     // Resolve kind after loading metadata so recorded sandboxMap entries can
     // pin the provider when the caller did not pass an explicit kind.
@@ -143,7 +153,18 @@ export const SANDBOX_START = defineTool({
       providerKind,
     );
 
-    const githubRepo = (metadata as GithubRepoMeta).githubRepo ?? null;
+    // Thread-scoped repo (bound by `load_repo`) wins over the agent's repo — the
+    // same rule as `ensureSandbox`. Without this the frontend's auto-start
+    // provisions a repo-LESS sandbox for the synthetic Decopilot agent (whose
+    // metadata has no repo), so nothing clones and the dev server stays idle.
+    // Derive the thread id from the branch since this path has no
+    // `ctx.metadata.threadId`.
+    const threadRepo = await getThreadGithubRepo(
+      ctx,
+      threadIdFromBranch(resolvedBranch) ?? ctx.metadata?.threadId,
+    );
+    const githubRepo =
+      threadRepo ?? (metadata as GithubRepoMeta).githubRepo ?? null;
 
     const { entry, isNewVm } = await provisionSandbox({
       ctx,
@@ -241,7 +262,18 @@ export async function ensureSandbox(
     });
   }
 
-  const githubRepo = (metadata as GithubRepoMeta).githubRepo ?? null;
+  // Thread-scoped repo wins over the agent's own repo: `load_repo` binds a repo
+  // to the thread (the only place it can persist for the synthetic Decopilot
+  // agent), and it's the per-conversation override for real repo-agents too.
+  // Recover the thread id from the branch (`thread:<id>[/<conn>]`) so the
+  // repo binding is found even on the frontend's SANDBOX_START auto-start path,
+  // which doesn't set `ctx.metadata.threadId`. Falls back to the ctx value.
+  const threadRepo = await getThreadGithubRepo(
+    ctx,
+    threadIdFromBranch(input.branch) ?? ctx.metadata?.threadId,
+  );
+  const githubRepo =
+    threadRepo ?? (metadata as GithubRepoMeta).githubRepo ?? null;
   const { entry } = await provisionSandbox({
     ctx,
     userId,
@@ -293,6 +325,7 @@ async function provisionSandbox(
   let repoOpts:
     | {
         cloneUrl: string;
+        connectionId?: string;
         userName: string;
         userEmail: string;
         branch: string;
@@ -370,11 +403,22 @@ async function provisionSandbox(
       }
     }
 
+    // The git branch the daemon actually checks out and pushes. A synthetic
+    // isolation key (thread:*) maps to a real, deterministic ref so work is
+    // persisted to git on its own branch — never the repo default. The isolation
+    // key itself (projectRef, handle, sandboxMap) stays synthetic below.
+    const gitBranch = branch.startsWith("thread:")
+      ? syntheticBranchToGitRef(branch)
+      : branch;
     repoOpts = {
       cloneUrl,
+      // Persisted so the runner can re-mint on recovery; absent for anonymous.
+      ...(githubRepo.connectionId
+        ? { connectionId: githubRepo.connectionId }
+        : {}),
       userName: gitUserName,
       userEmail: gitUserEmail,
-      branch,
+      branch: gitBranch,
       displayName: `${githubRepo.owner}/${githubRepo.name}`,
     };
   }
@@ -525,6 +569,21 @@ async function provisionSandbox(
     params.providerKind,
     entry,
   );
+  // Thread-scoped branch: the agent write above is a no-op for the synthetic
+  // Decopilot agent, so also persist the record on the thread — the only place
+  // the frontend reads previewUrl/handle from for these sandboxes. Applies to
+  // EVERY provisioning path (load_repo, SANDBOX_START auto-start, fs tools).
+  const threadId = threadIdFromBranch(branch);
+  if (threadId) {
+    await setThreadSandboxMapEntry(
+      ctx,
+      threadId,
+      userId,
+      branch,
+      params.providerKind,
+      entry,
+    );
+  }
 
   // Different handle = new sandbox (stale entry / orphan recovery / state miss).
   const isNewVm = !existing || existing.sandboxHandle !== sandbox.handle;

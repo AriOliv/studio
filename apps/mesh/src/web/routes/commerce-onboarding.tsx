@@ -1,30 +1,46 @@
-import { normalizeCommerceSiteUrl } from "@/commerce-discovery/site-url";
+import {
+  isConnectionClaimedForSite,
+  normalizeReportsSiteUrl,
+  siteUrlToHost,
+} from "@/reports/site-url";
 import { AuthEntry } from "@/web/components/auth-entry";
+import { ErrorBoundary } from "@/web/components/error-boundary";
 import { AuthSplitLayout } from "@/web/components/auth-split-layout";
 import { OrganizationChoice } from "@/web/components/organization-choice";
-import { formatPinnedViewTabId } from "@/web/layouts/main-panel-tabs/tab-id";
+import { ScrollReveal } from "@/web/components/scroll-reveal";
 import {
   authClient,
   invalidateOrganizationListCache,
   useActiveOrganizations,
 } from "@/web/lib/auth-client";
-import { LOCALSTORAGE_KEYS } from "@/web/lib/localstorage-keys";
+import { isPostHogInitialized, track } from "@/web/lib/posthog-client";
 import { KEYS } from "@/web/lib/query-keys";
 import { Button } from "@deco/ui/components/button.tsx";
 import { Input } from "@deco/ui/components/input.tsx";
 import {
-  COMMERCE_DISCOVERY_REPORT_TOOL_NAME,
   getCommerceDiscoveryAgentId,
+  getWellKnownDecopilotVirtualMCP,
   SELF_MCP_ALIAS_ID,
   useMCPClient,
   WellKnownOrgMCPId,
 } from "@decocms/mesh-sdk";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { useNavigate, useSearch } from "@tanstack/react-router";
-import { ArrowRight, Loading01 } from "@untitledui/icons";
-import { Suspense, useRef, useState } from "react";
-import type { FormEvent } from "react";
-import { CompanionMcpsSection } from "./commerce-onboarding/companion-mcps-section.tsx";
+import {
+  QueryErrorResetBoundary,
+  useMutation,
+  useSuspenseQuery,
+} from "@tanstack/react-query";
+import { Navigate, useNavigate, useSearch } from "@tanstack/react-router";
+import { ArrowRight } from "@untitledui/icons";
+import { createContext, Suspense, useContext, useRef, useState } from "react";
+import type { ComponentProps, FormEvent, ReactNode } from "react";
+import { CompanionMcpsSectionSkeleton } from "./commerce-onboarding/companion-mcps-section.tsx";
+import {
+  buildScheduleMeetingUrl,
+  ScheduleMeetingVisual,
+} from "./commerce-onboarding/schedule-meeting.tsx";
+import { SiteBadge } from "./commerce-onboarding/site-badge.tsx";
+import { CommerceOnboardingLoadingIndicator } from "./commerce-onboarding/loading-state.tsx";
+import { parseSelfToolResult } from "./commerce-onboarding/self-tool-result.ts";
 
 interface CommerceOrganization {
   id: string;
@@ -53,36 +69,149 @@ interface CollectionGetResult<T = unknown> {
   item: T | null;
 }
 
-interface CommerceDiscoveryReportApp {
-  connectionId: string;
-  virtualMcpId: string;
-  toolName: typeof COMMERCE_DISCOVERY_REPORT_TOOL_NAME;
-}
-
-interface CommerceDiscoverySetupResult {
-  reportApp?: CommerceDiscoveryReportApp;
-}
-
-interface SelfToolResult {
-  structuredContent?: unknown;
-  isError?: boolean;
-  content?: Array<{ text?: string }>;
-}
-
 export default function CommerceOnboardingRoute() {
   return <CommerceOnboardingPage />;
 }
 
+/**
+ * Hostname derived from the `siteUrl` query param (e.g. "fila.com.br"),
+ * provided to the whole onboarding experience so every header renders the
+ * deco + site badge. `null` when no valid `siteUrl` is present.
+ */
+const CommerceSiteHostContext = createContext<string | null>(null);
+
+const useCommerceSiteHost = () => useContext(CommerceSiteHostContext);
+
+type CommerceOnboardingLayoutProps = ComponentProps<typeof AuthSplitLayout>;
+
+function CommerceOnboardingLayout({
+  visual,
+  ...props
+}: CommerceOnboardingLayoutProps) {
+  const search = useSearch({ from: "/commerce-onboarding" });
+  const { data: session } = authClient.useSession();
+  const meetingUrl = buildScheduleMeetingUrl({
+    siteUrl: search.siteUrl,
+    email: session?.user?.email,
+  });
+
+  return (
+    <AuthSplitLayout
+      {...props}
+      visual={visual ?? <ScheduleMeetingVisual href={meetingUrl} />}
+    />
+  );
+}
+
+const COMMERCE_AUTH_COPY = {
+  signUpFailed: "Falha ao criar conta",
+  signInFailed: "Falha ao entrar",
+  authenticationFailed: "Falha na autenticação",
+  resetEmailFailed: "Não foi possível enviar o e-mail de redefinição",
+  otpSendFailed: "Não foi possível enviar o código",
+  invalidCode: "Código inválido",
+  invalidEmail: "E-mail inválido",
+  invalidEmailOrPassword: "E-mail ou senha inválidos. Tente novamente.",
+  accountExists:
+    "Já existe uma conta com este e-mail. Tente entrar em vez de criar uma nova conta.",
+  networkError: "Erro de rede. Verifique sua conexão e tente novamente.",
+  tooManyAttempts: "Muitas tentativas. Aguarde um momento e tente novamente.",
+  invalidOrExpiredCode: "Código inválido ou expirado. Tente novamente.",
+  genericError: "Algo deu errado. Tente novamente.",
+  resetPasswordTitle: "Redefinir sua senha",
+  verificationCodeTitle: "Informe o código de verificação",
+  welcomeTitle: "Bem-vindo à deco",
+  resetPasswordSubtitle: "Enviaremos um link de redefinição",
+  codeSentTo: (email: string) => `Código enviado para ${email}`,
+  defaultSubtitle: "Entre ou crie uma nova conta",
+  resetEmailSent: "Verifique seu e-mail para redefinir a senha.",
+  continueWith: (provider: string) => `Continuar com ${provider}`,
+  divider: "ou",
+  emailLabel: "E-mail",
+  emailPlaceholder: "Endereço de e-mail",
+  sending: "Enviando...",
+  sendCode: "Enviar código",
+  verificationCodeLabel: "Código de verificação",
+  enterCodePlaceholder: "Informe o código",
+  verifying: "Verificando...",
+  verify: "Verificar",
+  useDifferentEmail: "Usar outro e-mail",
+  sendResetLink: "Enviar link de redefinição",
+  nameLabel: "Nome",
+  namePlaceholder: "Seu nome",
+  passwordLabel: "Senha",
+  forgotPassword: "Esqueceu a senha?",
+  creatingAccount: "Criando conta...",
+  signingIn: "Entrando...",
+  continue: "Continuar",
+  backToSignIn: "Voltar para entrar",
+  signInWithPassword: "Entrar com senha",
+  alreadyHaveAccount: "Já tem uma conta? ",
+  dontHaveAccount: "Não tem uma conta? ",
+  signIn: "Entrar",
+  signUp: "Criar conta",
+  signInWithEmailCode: "Entrar com código por e-mail",
+};
+
+function commerceSiteUrlErrorPtBr(error: string): string {
+  switch (error) {
+    case "Enter a website URL.":
+      return "Informe a URL de um site.";
+    case "Use an HTTP or HTTPS website URL.":
+      return "Use uma URL de site HTTP ou HTTPS.";
+    case "Enter a valid website URL.":
+      return "Informe uma URL de site válida.";
+    default:
+      return error;
+  }
+}
+
+// One-shot per SPA load, render-time (useEffect is banned in this app; same
+// pattern as PostHogIdentitySync). This is the LP→studio funnel seam: the
+// diagnostic deck's CTAs land here, so this event is funnel step "arrived in
+// studio", joinable to the LP journey via the bootstrapped ph_did identity.
+let onboardingViewTracked = false;
+
 function CommerceOnboardingPage() {
   const search = useSearch({ from: "/commerce-onboarding" });
   const { org: requestedOrgSlug, siteUrl } = search;
+  const siteHost = siteUrlToHost(siteUrl);
+
+  if (!onboardingViewTracked && isPostHogInitialized()) {
+    onboardingViewTracked = true;
+    track("commerce_onboarding_viewed", {
+      site_url: siteUrl,
+      domain: siteHost ?? undefined,
+      // Person-level copy so the store follows the user across sessions.
+      ...(siteHost ? { $set: { last_scanned_domain: siteHost } } : {}),
+    });
+  }
+
+  return (
+    <CommerceSiteHostContext.Provider value={siteHost}>
+      <CommerceOnboardingScreens
+        requestedOrgSlug={requestedOrgSlug}
+        siteUrl={siteUrl}
+      />
+    </CommerceSiteHostContext.Provider>
+  );
+}
+
+function CommerceOnboardingScreens({
+  requestedOrgSlug,
+  siteUrl,
+}: {
+  requestedOrgSlug?: string;
+  siteUrl?: string;
+}) {
   const { data: session, isPending: sessionLoading } = authClient.useSession();
+  const siteHost = useCommerceSiteHost();
 
   if (sessionLoading) {
     return (
-      <AuthSplitLayout>
-        <LoadingState label="Preparing commerce onboarding..." />
-      </AuthSplitLayout>
+      <CommerceOnboardingLayout>
+        <CommerceOnboardingLoadingIndicator variant="generic" />
+      </CommerceOnboardingLayout>
     );
   }
 
@@ -93,9 +222,16 @@ function CommerceOnboardingPage() {
         : `${window.location.pathname}${window.location.search}`;
 
     return (
-      <AuthSplitLayout>
-        <AuthEntry callbackUrl={callbackUrl} allowAutoLogin={false} />
-      </AuthSplitLayout>
+      <CommerceOnboardingLayout>
+        <AuthEntry
+          callbackUrl={callbackUrl}
+          allowAutoLogin={false}
+          title="Desbloqueie seu diagnóstico completo"
+          subtitle={null}
+          brand={siteHost ? <SiteBadge host={siteHost} /> : undefined}
+          copy={COMMERCE_AUTH_COPY}
+        />
+      </CommerceOnboardingLayout>
     );
   }
 
@@ -157,18 +293,18 @@ function CommerceOnboardingContent({
 
   if (organizationsQuery.isPending) {
     return (
-      <AuthSplitLayout>
-        <LoadingState label="Preparing commerce onboarding..." />
-      </AuthSplitLayout>
+      <CommerceOnboardingLayout>
+        <CommerceOnboardingLoadingIndicator variant="workspace" />
+      </CommerceOnboardingLayout>
     );
   }
 
   if (organizationsQuery.error) {
     return (
       <CommerceErrorState
-        title="We could not load your organizations"
-        description="Retry to continue commerce setup from this page."
-        actionLabel="Retry"
+        title="Não foi possível carregar suas organizações"
+        description="Tente novamente para continuar a configuração de commerce nesta página."
+        actionLabel="Tentar novamente"
         onRetry={() => organizationsQuery.refetch()}
       />
     );
@@ -185,9 +321,9 @@ function CommerceOnboardingContent({
   if (requestedOrgSlug) {
     return (
       <CommerceErrorState
-        title="Organization not found"
-        description="We could not find that organization for your account."
-        actionLabel="Retry"
+        title="Organização não encontrada"
+        description="Não conseguimos encontrar essa organização na sua conta."
+        actionLabel="Tentar novamente"
         onRetry={() => organizationsQuery.refetch()}
       />
     );
@@ -205,21 +341,28 @@ function CommerceOnboardingContent({
 
   if (activeOrganizations.length > 1) {
     return (
-      <AuthSplitLayout>
+      <CommerceOnboardingLayout>
         <div className="grid gap-10">
           <CommerceHeader
-            title="Choose an organization"
-            description="Select where commerce diagnostics should continue."
+            title="Escolha uma organização"
+            description="Selecione onde o diagnóstico de commerce deve continuar."
           />
-          <div className="-mx-1 max-h-[60vh] overflow-y-auto px-1">
+          <ScrollReveal className="-mx-1 max-h-[60vh] overflow-y-auto px-1">
             <OrganizationChoice
               organizations={activeOrganizations}
-              selectLabel="Continue"
-              onSelected={(organization) => setSelectedOrg(organization)}
+              selectLabel="Continuar"
+              onSelected={(organization) =>
+                // Persisted in the URL (not local state) so a refresh doesn't
+                // lose the pick and force reselecting among active orgs.
+                navigate({
+                  to: "/commerce-onboarding",
+                  search: { org: organization.slug, siteUrl },
+                })
+              }
             />
-          </div>
+          </ScrollReveal>
         </div>
-      </AuthSplitLayout>
+      </CommerceOnboardingLayout>
     );
   }
 
@@ -255,13 +398,13 @@ function CommerceOnboardingContent({
     ensureResult.organizations.length > 0
   ) {
     return (
-      <AuthSplitLayout>
+      <CommerceOnboardingLayout>
         <div className="grid gap-10">
           <CommerceHeader
-            title="Choose an organization"
-            description="Your email can access more than one organization. Choose where commerce setup should continue."
+            title="Escolha uma organização"
+            description="Seu e-mail pode acessar mais de uma organização. Escolha onde a configuração de commerce deve continuar."
           />
-          <div className="-mx-1 max-h-[60vh] overflow-y-auto px-1">
+          <ScrollReveal className="-mx-1 max-h-[60vh] overflow-y-auto px-1">
             <OrganizationChoice
               organizations={ensureResult.organizations}
               domain={ensureResult.domain ?? undefined}
@@ -274,20 +417,20 @@ function CommerceOnboardingContent({
                 });
               }}
             />
-          </div>
+          </ScrollReveal>
         </div>
-      </AuthSplitLayout>
+      </CommerceOnboardingLayout>
     );
   }
 
   return (
     <CommerceErrorState
-      title="Commerce onboarding needs support"
+      title="O onboarding de commerce precisa de suporte"
       description={
         ensureResult?.error ??
-        "We could not determine a commerce organization for this account."
+        "Não conseguimos determinar uma organização de commerce para esta conta."
       }
-      actionLabel="Try again"
+      actionLabel="Tentar novamente"
       onRetry={() => {
         setSettledEnsureResult(null);
         ensureOrganizationMutation.reset();
@@ -316,20 +459,20 @@ function EnsureOrganizationRecovery({
   if (mutation.error) {
     return (
       <CommerceErrorState
-        title="Commerce onboarding is unavailable"
-        description="We could not prepare an organization for commerce setup. Retry from this page or contact support."
-        actionLabel="Retry"
+        title="Onboarding de commerce indisponível"
+        description="Não foi possível preparar uma organização para a configuração de commerce. Tente novamente por esta página ou fale com o suporte."
+        actionLabel="Tentar novamente"
         onRetry={onRetry}
       />
     );
   }
 
   return (
-    <AuthSplitLayout>
+    <CommerceOnboardingLayout>
       <div ref={triggerRecovery}>
-        <LoadingState label="Preparing your commerce workspace..." />
+        <CommerceOnboardingLoadingIndicator variant="generic" />
       </div>
-    </AuthSplitLayout>
+    </CommerceOnboardingLayout>
   );
 }
 
@@ -337,40 +480,38 @@ function CommerceHeader({
   title,
   description,
 }: {
-  title: string;
-  description: string;
+  title?: string;
+  description?: string;
 }) {
+  const siteHost = useCommerceSiteHost();
   return (
     <div className="grid gap-10">
-      <img
-        src="/logos/deco logo.svg"
-        alt="Deco"
-        className="h-12 w-12 dark:hidden"
-      />
-      <img
-        src="/logos/deco logo negative.svg"
-        alt="Deco"
-        className="h-12 w-12 hidden dark:block"
-      />
-      <div className="space-y-2">
-        <h1 className="text-2xl font-medium leading-8">{title}</h1>
-        <p className="text-base text-muted-foreground leading-6">
-          {description}
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function LoadingState({ label }: { label: string }) {
-  return (
-    <div
-      className="flex items-center gap-2 py-4"
-      role="status"
-      aria-live="polite"
-    >
-      <Loading01 size={14} className="animate-spin text-muted-foreground" />
-      <span className="text-sm text-muted-foreground">{label}</span>
+      {siteHost ? (
+        <SiteBadge host={siteHost} />
+      ) : (
+        <div>
+          <img
+            src="/logos/deco logo.svg"
+            alt="Deco"
+            className="h-12 w-12 dark:hidden"
+          />
+          <img
+            src="/logos/deco logo negative.svg"
+            alt="Deco"
+            className="h-12 w-12 hidden dark:block"
+          />
+        </div>
+      )}
+      {(title || description) && (
+        <div className="space-y-2">
+          {title && <h1 className="text-2xl font-medium leading-8">{title}</h1>}
+          {description && (
+            <p className="text-base text-muted-foreground leading-6">
+              {description}
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -387,30 +528,15 @@ function CommerceErrorState({
   onRetry: () => void;
 }) {
   return (
-    <AuthSplitLayout>
+    <CommerceOnboardingLayout>
       <div className="grid gap-10">
         <CommerceHeader title={title} description={description} />
         <Button type="button" size="xl" className="w-full" onClick={onRetry}>
           {actionLabel}
         </Button>
       </div>
-    </AuthSplitLayout>
+    </CommerceOnboardingLayout>
   );
-}
-
-function getToolErrorMessage(result: SelfToolResult): string {
-  return (
-    result.content?.find((item) => item.text)?.text ??
-    "Commerce Discovery setup failed."
-  );
-}
-
-function parseSelfToolResult<T>(result: unknown): T {
-  const toolResult = result as SelfToolResult;
-  if (toolResult.isError) {
-    throw new Error(getToolErrorMessage(toolResult));
-  }
-  return (toolResult.structuredContent ?? result) as T;
 }
 
 function CommerceSetup({
@@ -420,42 +546,108 @@ function CommerceSetup({
   org: CommerceOrganization;
   initialSiteUrl?: string;
 }) {
+  const { data: session } = authClient.useSession();
+  const meetingUrl = buildScheduleMeetingUrl({
+    siteUrl: initialSiteUrl,
+    email: session?.user?.email,
+  });
+  const meetingVisual = (
+    <ScheduleMeetingVisual href={meetingUrl} orgId={org.id} />
+  );
+
   return (
-    <AuthSplitLayout>
-      <Suspense fallback={<LoadingState label="Connecting workspace..." />}>
-        <CommerceSetupContent
-          key={`${org.id}:${initialSiteUrl ?? ""}`}
-          org={org}
-          initialSiteUrl={initialSiteUrl}
-        />
-      </Suspense>
-    </AuthSplitLayout>
+    <QueryErrorResetBoundary>
+      {({ reset }) => (
+        <ErrorBoundary
+          fallback={({ error, resetError }) => (
+            <CommerceOnboardingLayout visual={meetingVisual}>
+              <CommerceSetupErrorState
+                orgName={org.name}
+                message={
+                  error instanceof Error
+                    ? error.message
+                    : "Não foi possível verificar a configuração do Commerce Discovery."
+                }
+                onRetry={() => {
+                  reset();
+                  resetError();
+                }}
+              />
+            </CommerceOnboardingLayout>
+          )}
+        >
+          <Suspense
+            fallback={<CommerceDiagnosticLoading visual={meetingVisual} />}
+          >
+            <CommerceSetupContent
+              key={`${org.id}:${initialSiteUrl ?? ""}`}
+              org={org}
+              initialSiteUrl={initialSiteUrl}
+              sessionEmail={session?.user?.email}
+            />
+          </Suspense>
+        </ErrorBoundary>
+      )}
+    </QueryErrorResetBoundary>
+  );
+}
+
+function CommerceDiagnosticLoading({ visual }: { visual?: ReactNode }) {
+  return (
+    <CommerceOnboardingLayout align="fill" visual={visual}>
+      <div className="flex min-h-0 flex-1 flex-col gap-6 md:grid md:gap-4">
+        <CommerceHeader />
+        <CompanionMcpsSectionSkeleton />
+      </div>
+    </CommerceOnboardingLayout>
+  );
+}
+
+function CommerceSetupErrorState({
+  orgName,
+  message,
+  onRetry,
+}: {
+  orgName: string;
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="grid gap-10">
+      <CommerceHeader
+        title="Diagnóstico de commerce"
+        description={`A configuração de commerce continuará em ${orgName}.`}
+      />
+      <InlineError message={message} />
+      <Button type="button" size="xl" className="w-full" onClick={onRetry}>
+        Tentar novamente
+      </Button>
+    </div>
   );
 }
 
 function CommerceSetupContent({
   org,
   initialSiteUrl,
+  sessionEmail,
 }: {
   org: CommerceOrganization;
   initialSiteUrl?: string;
+  sessionEmail?: string | null;
 }) {
-  const navigate = useNavigate();
   const selfClient = useMCPClient({
     connectionId: SELF_MCP_ALIAS_ID,
     orgId: org.id,
     orgSlug: org.slug,
   });
   const [siteUrlInput, setSiteUrlInput] = useState(initialSiteUrl ?? "");
-  const [setupResult, setSetupResult] =
-    useState<CommerceDiscoverySetupResult | null>(null);
   const [inlineError, setInlineError] = useState<string | null>(null);
   const autoSetupStartedRef = useRef(false);
 
   const connectionId = WellKnownOrgMCPId.COMMERCE_DISCOVERY(org.id);
   const virtualMcpId = getCommerceDiscoveryAgentId(org.id);
 
-  const connectionQuery = useQuery({
+  const connectionQuery = useSuspenseQuery({
     queryKey: KEYS.commerceDiscoveryConnection(org.id, connectionId),
     queryFn: async () => {
       const result = await selfClient.callTool({
@@ -467,7 +659,7 @@ function CommerceSetupContent({
     retry: false,
   });
 
-  const virtualMcpQuery = useQuery({
+  const virtualMcpQuery = useSuspenseQuery({
     queryKey: KEYS.commerceDiscoveryVirtualMcp(org.id, virtualMcpId),
     queryFn: async () => {
       const result = await selfClient.callTool({
@@ -485,34 +677,73 @@ function CommerceSetupContent({
         name: "COMMERCE_DISCOVERY_SETUP",
         arguments: { siteUrl },
       });
-      return parseSelfToolResult<CommerceDiscoverySetupResult>(result);
+      return parseSelfToolResult<unknown>(result);
     },
     retry: false,
-    onSuccess: (result) => {
-      setSetupResult(result);
+    onSuccess: (_result, submittedSiteUrl) => {
+      track("commerce_onboarding_setup_succeeded", {
+        domain: siteUrlToHost(submittedSiteUrl) ?? undefined,
+        organization_id: org.id,
+      });
       setInlineError(null);
       void connectionQuery.refetch();
       void virtualMcpQuery.refetch();
     },
-    onError: (error) => {
+    onError: (error, submittedSiteUrl) => {
+      track("commerce_onboarding_setup_failed", {
+        domain: siteUrlToHost(submittedSiteUrl) ?? undefined,
+        organization_id: org.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
       setInlineError(
         error instanceof Error
           ? error.message
-          : "Commerce Discovery setup failed.",
+          : "A configuração do Commerce Discovery falhou.",
       );
     },
   });
 
-  const setupQueriesLoading =
-    connectionQuery.isPending || virtualMcpQuery.isPending;
-  const setupQueriesError = connectionQuery.error ?? virtualMcpQuery.error;
-  const setupReady =
-    !!connectionQuery.data?.item && !!virtualMcpQuery.data?.item;
+  const connectionExists =
+    !!connectionQuery.data.item && !!virtualMcpQuery.data.item;
+  // A returning session may arrive with no ?siteUrl param and an empty form while
+  // the connection already exists. Recover the site from the connection metadata
+  // (persisted at setup) so the run can still be triggered.
+  const connectionItem = connectionQuery.data.item as unknown as
+    | { metadata?: Record<string, unknown> | null }
+    | null
+    | undefined;
+  const connectionSiteUrl =
+    typeof connectionItem?.metadata?.siteUrl === "string"
+      ? (connectionItem.metadata.siteUrl as string)
+      : undefined;
+  // The CD connection is per-ORG, but its token is claimed per-SITE (setup calls
+  // /upgrade, which mints a token scoped to one site and persists it here). So an
+  // org that already has a connection for site A, then opens the onboarding for
+  // site B, must RE-RUN setup to re-claim B — otherwise the report renders A's
+  // diagnostic (the wrong store) and COMMERCE_DISCOVERY_RUN(B) returns
+  // not_upgraded. Treat the connection as ready ONLY when it's claimed for the
+  // requested site; when the site differs, fall through to setup (idempotent
+  // re-claim) so the token + metadata.siteUrl follow the site being onboarded.
+  const requestedSite = initialSiteUrl || siteUrlInput || "";
+  const claimedForRequestedSite = isConnectionClaimedForSite(
+    requestedSite,
+    connectionSiteUrl,
+  );
+  const setupReady = connectionExists && claimedForRequestedSite;
+  const currentSiteUrl =
+    initialSiteUrl || siteUrlInput || connectionSiteUrl || "";
+  const currentMeetingUrl = buildScheduleMeetingUrl({
+    siteUrl: currentSiteUrl,
+    email: sessionEmail,
+  });
+  const currentMeetingVisual = (
+    <ScheduleMeetingVisual href={currentMeetingUrl} orgId={org.id} />
+  );
 
   const runSetup = (rawSiteUrl: string) => {
-    const normalized = normalizeCommerceSiteUrl(rawSiteUrl);
+    const normalized = normalizeReportsSiteUrl(rawSiteUrl);
     if (!normalized.ok) {
-      setInlineError(normalized.error);
+      setInlineError(commerceSiteUrlErrorPtBr(normalized.error));
       return;
     }
     setInlineError(null);
@@ -520,13 +751,7 @@ function CommerceSetupContent({
   };
 
   const triggerInitialSetup = (node: HTMLDivElement | null) => {
-    if (
-      !node ||
-      autoSetupStartedRef.current ||
-      setupQueriesLoading ||
-      setupReady ||
-      !initialSiteUrl
-    ) {
+    if (!node || autoSetupStartedRef.current || setupReady || !initialSiteUrl) {
       return;
     }
 
@@ -536,141 +761,107 @@ function CommerceSetupContent({
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const normalizedForTracking = normalizeReportsSiteUrl(siteUrlInput);
+    if (normalizedForTracking.ok) {
+      track("commerce_onboarding_site_url_submitted", {
+        domain: new URL(normalizedForTracking.value).hostname,
+        organization_id: org.id,
+      });
+    }
     runSetup(siteUrlInput);
   };
 
-  const reportApp = setupResult?.reportApp ?? {
-    connectionId,
-    virtualMcpId,
-    toolName: COMMERCE_DISCOVERY_REPORT_TOOL_NAME,
-  };
-
-  const openReport = () => {
-    localStorage.setItem(
-      LOCALSTORAGE_KEYS.sidebarOpen(),
-      JSON.stringify(false),
-    );
-    navigate({
-      to: "/$org/$taskId",
-      params: { org: org.slug, taskId: crypto.randomUUID() },
-      search: {
-        virtualmcpid: reportApp.virtualMcpId,
-        main: formatPinnedViewTabId(reportApp.connectionId, reportApp.toolName),
-        chat: 0,
-      },
-    });
-  };
-
-  if (setupQueriesLoading) {
-    return (
-      <div className="grid gap-10">
-        <CommerceHeader
-          title="Commerce diagnostics"
-          description={`Commerce setup will continue for ${org.name}.`}
-        />
-        <LoadingState label="Checking Commerce Discovery setup..." />
-      </div>
-    );
-  }
-
-  if (setupQueriesError) {
-    const message =
-      setupQueriesError instanceof Error
-        ? setupQueriesError.message
-        : "We could not check Commerce Discovery setup.";
-
-    return (
-      <div className="grid gap-10">
-        <CommerceHeader
-          title="Commerce diagnostics"
-          description={`Commerce setup will continue for ${org.name}.`}
-        />
-        <InlineError message={message} />
-        <Button
-          type="button"
-          size="xl"
-          className="w-full"
-          onClick={() => {
-            void connectionQuery.refetch();
-            void virtualMcpQuery.refetch();
-          }}
-        >
-          Retry
-        </Button>
-      </div>
-    );
-  }
-
+  // Site is claimed → hand off to the org. The blocking connections modal
+  // (mounted by the org shell when it sees `?connect=1`) takes over from here:
+  // the user connects at least one data source over the blurred ORG HOME, then
+  // the modal triggers the run and opens the report. We land on the Super Agent
+  // home thread (not `/$org`, which reports-only orgs bounce back here) so the
+  // modal sits over real org content instead of a blank report.
   if (setupReady) {
     return (
-      <CommerceDiscoveryReady
-        org={org}
-        reportApp={reportApp}
-        onOpenReport={openReport}
+      <Navigate
+        to="/$org/$taskId"
+        params={{ org: org.slug, taskId: crypto.randomUUID() }}
+        search={{
+          virtualmcpid: getWellKnownDecopilotVirtualMCP(org.id).id,
+          connect: "1",
+          siteUrl: currentSiteUrl || undefined,
+        }}
+        replace
       />
     );
   }
 
+  if (setupMutation.isPending) {
+    return <CommerceDiagnosticLoading visual={currentMeetingVisual} />;
+  }
+
   if (initialSiteUrl) {
-    const normalized = normalizeCommerceSiteUrl(initialSiteUrl);
+    const normalized = normalizeReportsSiteUrl(initialSiteUrl);
 
     if (!normalized.ok) {
       return (
-        <div className="grid gap-10">
-          <CommerceHeader
-            title="Commerce diagnostics"
-            description={`Commerce setup will continue for ${org.name}.`}
-          />
-          <InlineError message={normalized.error} />
-          <SiteUrlForm
-            siteUrl={siteUrlInput}
-            error={inlineError}
-            isSubmitting={setupMutation.isPending}
-            onSiteUrlChange={setSiteUrlInput}
-            onSubmit={handleSubmit}
-          />
-        </div>
-      );
-    }
-
-    return (
-      <div ref={triggerInitialSetup} className="grid gap-10">
-        <CommerceHeader
-          title="Commerce diagnostics"
-          description={`Commerce Discovery is being prepared for ${normalized.value}.`}
-        />
-        {inlineError ? (
-          <>
-            <InlineError message={inlineError} />
+        <CommerceOnboardingLayout visual={currentMeetingVisual}>
+          <div className="grid gap-10">
+            <CommerceHeader
+              title="Diagnóstico de commerce"
+              description={`A configuração de commerce continuará em ${org.name}.`}
+            />
+            <InlineError message={commerceSiteUrlErrorPtBr(normalized.error)} />
             <SiteUrlForm
               siteUrl={siteUrlInput}
-              error={null}
+              error={inlineError}
               isSubmitting={setupMutation.isPending}
               onSiteUrlChange={setSiteUrlInput}
               onSubmit={handleSubmit}
             />
-          </>
-        ) : (
-          <LoadingState label="Setting up Commerce Discovery..." />
-        )}
-      </div>
+          </div>
+        </CommerceOnboardingLayout>
+      );
+    }
+
+    return (
+      <CommerceOnboardingLayout visual={currentMeetingVisual}>
+        <div ref={triggerInitialSetup} className="grid gap-10">
+          <CommerceHeader
+            title="Diagnóstico de commerce"
+            description={`O Commerce Discovery está sendo preparado para ${normalized.value}.`}
+          />
+          {inlineError ? (
+            <>
+              <InlineError message={inlineError} />
+              <SiteUrlForm
+                siteUrl={siteUrlInput}
+                error={null}
+                isSubmitting={setupMutation.isPending}
+                onSiteUrlChange={setSiteUrlInput}
+                onSubmit={handleSubmit}
+              />
+            </>
+          ) : (
+            <CompanionMcpsSectionSkeleton />
+          )}
+        </div>
+      </CommerceOnboardingLayout>
     );
   }
 
   return (
-    <div className="grid gap-10">
-      <CommerceHeader
-        title="Commerce diagnostics"
-        description={`Commerce setup will continue for ${org.name}.`}
-      />
-      <SiteUrlForm
-        siteUrl={siteUrlInput}
-        error={inlineError}
-        isSubmitting={setupMutation.isPending}
-        onSiteUrlChange={setSiteUrlInput}
-        onSubmit={handleSubmit}
-      />
-    </div>
+    <CommerceOnboardingLayout visual={currentMeetingVisual}>
+      <div className="grid gap-10">
+        <CommerceHeader
+          title="Diagnóstico de commerce"
+          description={`A configuração de commerce continuará em ${org.name}.`}
+        />
+        <SiteUrlForm
+          siteUrl={siteUrlInput}
+          error={inlineError}
+          isSubmitting={setupMutation.isPending}
+          onSiteUrlChange={setSiteUrlInput}
+          onSubmit={handleSubmit}
+        />
+      </div>
+    </CommerceOnboardingLayout>
   );
 }
 
@@ -691,7 +882,7 @@ function SiteUrlForm({
     <form className="grid gap-4" onSubmit={onSubmit}>
       <div className="grid gap-2">
         <label className="text-sm font-medium" htmlFor="commerce-site-url">
-          Website URL
+          URL do site
         </label>
         <Input
           id="commerce-site-url"
@@ -711,44 +902,10 @@ function SiteUrlForm({
         className="w-full"
         disabled={isSubmitting}
       >
-        {isSubmitting ? (
-          <>
-            <Loading01 size={14} className="animate-spin" />
-            Setting up
-          </>
-        ) : (
-          <>
-            Continue
-            <ArrowRight size={16} />
-          </>
-        )}
+        Continuar
+        <ArrowRight size={16} />
       </Button>
     </form>
-  );
-}
-
-function CommerceDiscoveryReady({
-  org,
-  reportApp,
-  onOpenReport,
-}: {
-  org: CommerceOrganization;
-  reportApp: CommerceDiscoveryReportApp;
-  onOpenReport: () => void;
-}) {
-  return (
-    <div className="grid gap-10">
-      <CommerceHeader
-        title="Commerce Discovery"
-        description={`Commerce Discovery is connected for ${org.name}.`}
-      />
-      <CompanionMcpsSection
-        org={org}
-        cdConnectionId={reportApp.connectionId}
-        reportDisabled={!reportApp.virtualMcpId}
-        onOpenReport={onOpenReport}
-      />
-    </div>
   );
 }
 

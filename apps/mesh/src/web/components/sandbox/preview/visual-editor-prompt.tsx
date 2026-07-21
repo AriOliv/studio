@@ -26,7 +26,9 @@ export function formatVisualEditorMessage(
 
   if (payload.manifestKey) {
     lines.push(
-      `**Section source file:** \`${sanitizeMd(payload.manifestKey)}\``,
+      `**Section resolveType:** \`${sanitizeMd(payload.manifestKey)}\``,
+      "",
+      "This is a Deco resolveType, not a literal file path. The leading segment is the app name, not a directory — the actual source file lives under a sections directory whose root varies by site (commonly `sections/`, `src/sections/`, or `site/sections/`). Locate the file by searching for the trailing path (e.g. the component filename), don't assume the resolveType is a valid path on disk.",
       "",
     );
   }
@@ -91,13 +93,13 @@ export function VisualEditorPrompt({
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const { sendMessage } = useChatStream();
-  const { setChatOpen } = usePanelActions();
+  const { openSidePanel } = usePanelActions();
 
   const handleSend = () => {
     if (!input.trim()) return;
 
     const text = formatVisualEditorMessage(element, input);
-    setChatOpen(true);
+    openSidePanel("chat");
     sendMessage({ parts: [{ type: "text", text }] });
     onDismiss();
   };

@@ -9,6 +9,7 @@ import { VariantRenameDialog } from "@/web/components/sections-editor/variant-re
 import {
   MatcherPicker,
   type MatcherEntry,
+  type MatcherGlobalEntry,
 } from "@/web/components/sections-editor/matcher-picker";
 
 /**
@@ -73,6 +74,7 @@ export function PageVariantTabsHarness({
         onSelect={(index) => push({ type: "select", index })}
         onReorder={(from, to) => push({ type: "reorder", from, to })}
         onRename={(index) => push({ type: "rename", index })}
+        onDuplicate={(index) => push({ type: "duplicate", index })}
         onDelete={(index) => push({ type: "delete", index })}
         onAdd={() => push({ type: "add" })}
       />
@@ -111,11 +113,15 @@ export function VariantRenameDialogHarness({
 export function MatcherPickerHarness({
   currentRt,
   currentLabel,
+  currentGlobalKey,
   matchers,
+  globals,
 }: {
   currentRt: string;
   currentLabel: string;
+  currentGlobalKey?: string;
   matchers: MatcherEntry[];
+  globals?: MatcherGlobalEntry[];
 }) {
   const [events, setEvents] = useState<unknown[]>([]);
   const push = (e: unknown) => setEvents((prev) => [...prev, e]);
@@ -124,8 +130,11 @@ export function MatcherPickerHarness({
       <MatcherPicker
         currentRt={currentRt}
         currentLabel={currentLabel}
+        currentGlobalKey={currentGlobalKey}
         matchers={matchers}
+        globals={globals}
         onSelect={(resolveType) => push({ type: "select", resolveType })}
+        onSelectGlobal={(blockKey) => push({ type: "selectGlobal", blockKey })}
       />
       <EventLog events={events} />
     </div>

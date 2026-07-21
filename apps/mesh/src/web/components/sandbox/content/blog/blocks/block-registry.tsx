@@ -3,6 +3,7 @@ import {
   resolveSchema,
   type LiveMeta,
 } from "@/web/components/sections-editor/resolve-schema";
+import type { RunBlockSandboxRef } from "@/web/components/sandbox/content/use-run-block";
 import { RichTextBlock } from "./rich-text-block";
 import { CodeBlock, HeadingBlock, ListBlock, QuoteBlock } from "./plain-blocks";
 import {
@@ -21,6 +22,7 @@ import {
   StepsBlock,
 } from "./list-blocks";
 import { ProductCardBlock, ProductShelfBlock } from "./product-blocks";
+import { TableBlock } from "./table-block";
 import { blockComponentName, isBlogPostBlockResolveType } from "../blog-data";
 import { str } from "./primitives";
 
@@ -36,10 +38,13 @@ export function BlockEditor({
   block,
   meta,
   onChange,
+  sandboxRef,
 }: {
   block: RawBlock;
   meta: LiveMeta;
   onChange: (next: RawBlock) => void;
+  /** Running sandbox coords — enables the VTEX product picker when present. */
+  sandboxRef?: RunBlockSandboxRef | null;
 }) {
   const resolveType = block.__resolveType ?? "";
   const componentName = blockComponentName(resolveType);
@@ -166,10 +171,38 @@ export function BlockEditor({
             onChange={(next) => onChange({ ...block, ...next })}
           />
         );
+      case "Table":
+        return (
+          <TableBlock
+            headers={
+              typeof block.headers === "string"
+                ? block.headers
+                : JSON.stringify(block.headers ?? [])
+            }
+            rows={
+              typeof block.rows === "string"
+                ? block.rows
+                : JSON.stringify(block.rows ?? [])
+            }
+            onChange={(next) => onChange({ ...block, ...next })}
+          />
+        );
       case "ProductCard":
-        return <ProductCardBlock block={block} onChange={onChange} />;
+        return (
+          <ProductCardBlock
+            block={block}
+            onChange={onChange}
+            sandboxRef={sandboxRef}
+          />
+        );
       case "ProductShelf":
-        return <ProductShelfBlock block={block} onChange={onChange} />;
+        return (
+          <ProductShelfBlock
+            block={block}
+            onChange={onChange}
+            sandboxRef={sandboxRef}
+          />
+        );
       default:
         break;
     }

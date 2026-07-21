@@ -13,15 +13,22 @@
  *     completes but its chunks are dropped.
  *
  * Architecture: dispatch-run owns the shared infrastructure (run-registry
- * lifecycle, memory load, JetStream buffering, registry FINISH dispatch,
- * posthog events). The actual streamText loop + tool assembly +
- * system-prompt construction is delegated to a Harness via
- * `localDispatch(harnessId, harnessInput, ctx)`. The three in-tree harnesses
- * (`decopilot`, `claude-code`, `codex`) each produce `UIMessageChunk`
- * streams consumed by the harness kernel (`consumeHarnessStream`) — the
- * ONLY consume-side stream layer. dispatch-run feeds the kernel a lazy
- * chunk source and run-lifecycle hooks (registry STEP_DONE/FINISH, thread
- * status, posthog); the kernel's output stream is the run's uiStream.
+ * liveness bookkeeping, memory load, JetStream buffering, registry
+ * STEP_DONE/FINISH dispatch). Terminal-status DB writes and the
+ * `chat_message_completed` / `chat_message_failed` / usage posthog events are
+ * OWNED BY THE PROJECTOR (`runProjectorWorkflowBody`'s `recordCompleted` /
+ * `recordFailed`), fired once from the run's fenced JetStream log — the same
+ * mechanism for hosted and desktop. This module's `chat_message_started`
+ * (pre-stream) and `chat_message_aborted` (user cancel) posthog events are
+ * the only ones still emitted from here, since neither has a projector
+ * equivalent. The actual streamText loop + tool assembly + system-prompt
+ * construction is delegated to a Harness via `localDispatch(harnessId,
+ * harnessInput, ctx)`. The three in-tree harnesses (`decopilot`,
+ * `claude-code`, `codex`) each produce `UIMessageChunk` streams published to
+ * JetStream via `ingestRun` (see `buildAgentSandboxUiStream`) — the ONLY
+ * consume-side stream layer for the hosted live path. dispatch-run feeds it a
+ * lazy chunk source and run-lifecycle hooks (registry STEP_DONE/FINISH
+ * liveness bookkeeping, thread status SSE).
  */
 
 import type { StudioContext } from "@/core/studio-context";
@@ -33,10 +40,7 @@ import {
   shouldOffload,
   type MessagesRef,
 } from "@decocms/harness/offload-messages";
-import {
-  findStudioPackAgentByMcpId,
-  resolveStudioPackRuntime,
-} from "@/tools/virtual/studio-pack";
+import { resolveEffectiveStudioPackVirtualMcp } from "@/tools/virtual/studio-pack";
 import { computeClaimHandle } from "@/sandbox/claim-handle";
 import { composeSandboxRef } from "@decocms/sandbox/provider";
 import { normalizeCoAuthorIdentity } from "@decocms/sandbox/shared";
@@ -69,10 +73,7 @@ import type {
 } from "@decocms/harness/types";
 import { WORKSPACE_CWD_REPO } from "@decocms/harness/workspace-cwd";
 import { createProviderFromSecret } from "@decocms/harness/decopilot/provider-from-secret";
-import {
-  classifyStreamError,
-  stringifyError,
-} from "@decocms/harness/stream-error";
+import { stringifyError } from "@decocms/harness/stream-error";
 import { isCliHarness } from "@decocms/harness/cli-harness";
 import { DEFAULT_WINDOW_SIZE, generateMessageId } from "./constants";
 import { mintRunFenceToken } from "./dispatch-fence";
@@ -80,7 +81,6 @@ import { synthesizedErrorMessageId } from "./message-ids";
 import { loadDecopilotContext } from "@/harnesses/decopilot/context-loader";
 import { PartEmitter } from "./part-emitter";
 import { foldedToUIMessage } from "./projector-seed";
-import { ProgressBumpThrottle } from "./progress-bump";
 import { uploadFileParts, resolveStorageRefs } from "./file-materializer";
 import type { ToolApprovalLevel } from "./helpers";
 import { type ChatMode } from "./mode-config";
@@ -94,11 +94,13 @@ import {
   publishRunStatusStage,
   shouldPublishClusterRunStatus,
 } from "./run-status-stage";
+import { publishUserMessage } from "./user-message-stream";
 import type {
   HarnessStreamConsumerHooks,
   HarnessStreamTitleOptions,
 } from "./consume-harness-stream";
 import { ingestRun } from "./ingest-run";
+import { withLivenessHeartbeat } from "./with-liveness-heartbeat";
 import {
   checkModelPermission,
   fetchModelPermissions,
@@ -111,7 +113,8 @@ import type { StreamBuffer } from "./stream-buffer";
 import type { ChatMessage, ModelsConfig as ClientModelsConfig } from "./types";
 import type { CancelBroadcast } from "./cancel-broadcast";
 import { resolveCliSessionRef } from "./cli-session-messages";
-import { getInternalUrl, getPublicUrl } from "@/core/server-constants";
+import { getPublicUrl } from "@/core/server-constants";
+import { mintMcpEndpoint } from "@/mcp-clients/virtual-mcp/mint-endpoint";
 import { mintOrgFsConfigJson } from "@/file-storage/mount/provisioning";
 import { meter, traced } from "@/observability";
 import { safeMemoryUsage } from "@/observability/profiling/safe-memory";
@@ -136,46 +139,6 @@ const finishDurationHistogram = meter.createHistogram(
 const FINISH_TRACE = process.env.DECOPILOT_FINISH_TRACE === "1";
 
 /**
- * Process-wide progress-bump throttle (Task 9, A1/A2). One instance shared by
- * every run on this pod — it dedupes `last_progress_at` writes to ≤1 per ~3s
- * per task. Lives at module scope (not per-run) so its per-task last-bump map
- * survives across the multiple `prepareRun` invocations a thread may see.
- */
-const progressThrottle = new ProgressBumpThrottle();
-
-/**
- * Tap a UI stream so each chunk drives a THROTTLED `last_progress_at` bump.
- * Pure pass-through: every chunk is forwarded unchanged; the bump is a
- * fire-and-forget side effect that never blocks or fails the stream. This is
- * the run's liveness heartbeat — the reaper reads `last_progress_at` to decide
- * whether a run is stuck.
- */
-function tapProgress(
-  stream: ReadableStream<unknown>,
-  ctx: StudioContext,
-  taskId: string,
-): ReadableStream<unknown> {
-  return stream.pipeThrough(
-    new TransformStream<unknown, unknown>({
-      transform(chunk, controller) {
-        if (progressThrottle.shouldBump(taskId)) {
-          ctx.storage.threads.bumpProgress(taskId).catch(() => {
-            // Heartbeat is best-effort; a failed bump just means the reaper
-            // may rely on an older timestamp. Never surface to the stream.
-          });
-        }
-        controller.enqueue(chunk);
-      },
-      flush() {
-        // Run ended — drop this task's throttle state so the map can't grow
-        // unbounded across many short-lived threads.
-        progressThrottle.clear(taskId);
-      },
-    }),
-  );
-}
-
-/**
  * Defer stream construction until the first consumer pull.
  *
  * `prepareRun` must NOT start any harness work unless its `uiStream` is
@@ -190,10 +153,10 @@ function tapProgress(
  * factory.
  *
  * `highWaterMark: 0` is load-bearing: with the default (1) the stream calls
- * `pull` at construction to pre-fill its queue, defeating the laziness.
- * For the same reason the factory must contain any `pipeThrough` wrapping
- * (e.g. `tapProgress`) — piping into a transform with the default writable
- * high-water mark eagerly pulls one chunk even with no downstream consumer.
+ * `pull` at construction to pre-fill its queue, defeating the laziness. For
+ * the same reason, any future `pipeThrough` wrapping must live INSIDE the
+ * factory — piping into a transform with the default writable high-water
+ * mark eagerly pulls one chunk even with no downstream consumer.
  */
 function lazyStream<T>(factory: () => ReadableStream<T>): ReadableStream<T> {
   let reader: ReadableStreamDefaultReader<T> | null = null;
@@ -248,12 +211,16 @@ export interface AgentSandboxUiStreamInput {
  *
  * The raw harness chunks are wrapped as `(seq, chunk)` (monotonic counter) and
  * fed through the shared `ingestRun` unit, which publishes each chunk to
- * JetStream with a seq-keyed `Nats-Msg-Id` and drives the live hooks (usage /
- * posthog completion / SSE finish) + title-chunk injection. `ingestRun`
- * neutralizes title/message persistence so the durable projector is the sole
- * writer of parts + status + title. The returned stream yields NOTHING (raw
- * chunks are the NATS source); the pump that drains it still publishes the
- * `{done}` sentinel so tails close.
+ * JetStream with a seq-keyed `Nats-Msg-Id` and drives the live hooks
+ * (run-registry STEP_DONE/FINISH liveness bookkeeping, the abort-only
+ * `chat_message_aborted` posthog event) + title-chunk injection. Completion
+ * / failure analytics and usage recording are NOT driven from here — the
+ * durable projector is the sole source (`recordCompleted`/`recordFailed`),
+ * same as it's the sole writer of parts + status + title. The returned
+ * stream yields NOTHING (raw chunks are the NATS source); the pump that
+ * drains it still publishes the `{done}` sentinel so tails close, and now
+ * propagates a mid-stream `ingestRun` failure to its caller instead of
+ * swallowing it (see `NatsStreamBuffer.pump`).
  */
 export function buildAgentSandboxUiStream(
   input: AgentSandboxUiStreamInput,
@@ -360,64 +327,6 @@ async function resolveSecretModelSource(
   });
 }
 
-/**
- * Mint a 1h-TTL API key + return the MCP endpoint URL/headers a CLI
- * harness will use to talk to mesh's virtual-MCP gateway over HTTP. Only
- * called for harnesses that actually open an HTTP MCP connection
- * (claude-code, codex); decopilot's in-process passthrough doesn't need
- * this.
- *
- * `sandboxProviderKind` decides which base URL to mint:
- *   - `"agent-sandbox"` — `getInternalUrl()` (loopback; the harness runs
- *     in hosted execution alongside the API).
- *   - `"user-desktop"` — `getPublicUrl()` (the harness runs on the user's
- *     laptop and dials mesh back over the public network).
- */
-const MCP_KEY_TTL_SECONDS = 3600;
-
-async function mintMcpEndpoint(
-  ctx: StudioContext,
-  agentId: string,
-  organization: { id: string; slug?: string; name?: string },
-  apiKeyName: string,
-  sandboxProviderKind: DispatchTarget["sandboxProviderKind"],
-): Promise<{
-  url: string;
-  headers: Record<string, string>;
-  expiresAt: number;
-}> {
-  const apiKey = await ctx.boundAuth.apiKey.create({
-    name: apiKeyName,
-    // The per-run key is the agent's own callback credential — it proxies to
-    // `/mcp/virtual-mcp/<agentId>` (a `vir_*` resource) and acts on behalf of
-    // the user for the duration of the run, so it needs full access. With no
-    // implicit default (auth/index.ts), the scope must be explicit; wildcard
-    // matches the prior behavior (full access via the admin bypass).
-    permissions: { "*": ["*"] },
-    expiresIn: MCP_KEY_TTL_SECONDS,
-    metadata: {
-      organization: {
-        id: organization.id,
-        slug: organization.slug,
-        name: organization.name,
-      },
-    },
-  });
-  const baseUrl =
-    sandboxProviderKind === "user-desktop" ? getPublicUrl() : getInternalUrl();
-  return {
-    url: `${baseUrl}/mcp/virtual-mcp/${agentId}`,
-    headers: {
-      Authorization: `Bearer ${apiKey.key}`,
-      "x-org-id": organization.id,
-    },
-    // Wire-shape: HarnessStreamInputWire requires expiresAt for the
-    // remote-cli path so the daemon can pre-empt expiry with a refresh
-    // (v2 — currently only used for logging / forward-compat).
-    expiresAt: Date.now() + MCP_KEY_TTL_SECONDS * 1000,
-  };
-}
-
 // ============================================================================
 // Types
 // ============================================================================
@@ -467,6 +376,9 @@ export interface DispatchRunInput {
   userId: string;
   taskId?: string;
   triggerId?: string;
+  /** Per-run metadata forwarded to downstream MCP tool calls as the
+   *  `x-mesh-run-metadata` header (set from a webhook trigger's `run_metadata`). */
+  runMetadata?: Record<string, string>;
   windowSize?: number;
   abortSignal?: AbortSignal;
   isResume?: boolean;
@@ -517,10 +429,25 @@ export interface FrozenRunSnapshot {
   mode: ChatMode;
   windowSize?: number;
   triggerId?: string;
+  /** Carried through the frozen snapshot so replayed/durable runs keep forwarding
+   *  it to downstream MCP tool calls (see DispatchRunInput.runMetadata). */
+  runMetadata?: Record<string, string>;
   branch?: string | null;
   sandboxProviderKind?: SandboxProviderKind | null;
   harnessId?: HarnessId | null;
   target?: DispatchTarget;
+  /**
+   * Per-turn system context the client attached to this user turn (the
+   * `role:"system"` message in the POST body — e.g. the currently-open file,
+   * selected agent, viewed resource; see `useContext` on the web client).
+   *
+   * Carried in the frozen snapshot rather than reloaded from history because
+   * it is ephemeral: the system message is NOT persisted as a thread message,
+   * so the durable dispatch branch (which reloads history from the DB) would
+   * otherwise lose it. Rehydrated into `systemMessages` and appended to the
+   * server-built base system prompt for this run only.
+   */
+  systemContext?: string;
 }
 
 export interface DurableDispatchRunInput extends FrozenRunSnapshot {
@@ -528,7 +455,7 @@ export interface DurableDispatchRunInput extends FrozenRunSnapshot {
   userId: string;
   taskId: string;
   messageId: string;
-  runFenceToken: string;
+  runFenceToken?: string;
   abortSignal?: AbortSignal;
   isResume?: boolean;
 }
@@ -547,7 +474,7 @@ export function buildDurableDispatchInput(
   input: DispatchRunInput,
   options: {
     messageId: string;
-    runFenceToken: string;
+    runFenceToken?: string;
     branch?: string | null;
     sandboxProviderKind?: SandboxProviderKind | null;
     harnessId?: HarnessId | null;
@@ -557,6 +484,20 @@ export function buildDurableDispatchInput(
   if (!input.taskId) {
     throw new Error("buildDurableDispatchInput: taskId is required");
   }
+
+  // The client attaches per-turn context as a `role:"system"` message that is
+  // never persisted, so fold its text into the frozen snapshot before the
+  // durable branch drops the `messages` array entirely.
+  const systemContext = input.messages
+    .filter((m) => m.role === "system")
+    .flatMap((m) => m.parts)
+    .filter(
+      (p): p is { type: "text"; text: string } =>
+        p.type === "text" && typeof p.text === "string",
+    )
+    .map((p) => p.text)
+    .join("\n\n")
+    .trim();
 
   return {
     models: input.models,
@@ -579,6 +520,9 @@ export function buildDurableDispatchInput(
     mode: input.mode,
     ...(input.windowSize !== undefined ? { windowSize: input.windowSize } : {}),
     ...(input.triggerId !== undefined ? { triggerId: input.triggerId } : {}),
+    ...(input.runMetadata !== undefined
+      ? { runMetadata: input.runMetadata }
+      : {}),
     branch: options.branch ?? input.branch ?? null,
     sandboxProviderKind:
       options.sandboxProviderKind ?? input.sandboxProviderKind ?? null,
@@ -588,8 +532,11 @@ export function buildDurableDispatchInput(
     userId: input.userId,
     taskId: input.taskId,
     messageId: options.messageId,
-    runFenceToken: options.runFenceToken,
+    ...(options.runFenceToken !== undefined
+      ? { runFenceToken: options.runFenceToken }
+      : {}),
     ...(input.isResume !== undefined ? { isResume: input.isResume } : {}),
+    ...(systemContext ? { systemContext } : {}),
   };
 }
 
@@ -694,7 +641,17 @@ export async function dispatchRunAndWait(
         : null;
 
       if (buffer && tail) {
-        buffer.pump(uiStream, taskId, registrySignal, input.organizationId);
+        const pumpDone = buffer.pump(
+          uiStream,
+          taskId,
+          registrySignal,
+          input.organizationId,
+        );
+        // Pre-arm: if the tail-read loop below throws before we reach the
+        // await, pumpDone's rejection must not become an unhandled
+        // rejection — the pre-armed no-op catch marks it handled while
+        // `await pumpDone` below still rejects for the normal path.
+        void pumpDone.catch(() => {});
         const reader = tail.getReader();
         try {
           while (true) {
@@ -704,6 +661,17 @@ export async function dispatchRunAndWait(
         } finally {
           reader.releaseLock();
         }
+        // The tail closes on ANY `{done}` marker — including the legacy
+        // UNFENCED sentinel `pump()` publishes in its `finally` even after a
+        // mid-stream failure (so a live tail never hangs). That marker alone
+        // would make this function return as if the run finished cleanly.
+        // `pumpDone` is what actually carries the failure (pump() re-throws
+        // whatever it caught from `uiStream`, i.e. `ingestRun`'s propagated
+        // error) — by the time the tail sees a done marker, `pump()`'s own
+        // try/catch/finally has already run (publishing that very marker is
+        // downstream of it), so this await settles immediately and surfaces
+        // a mid-stream ingest failure the tail's close alone would swallow.
+        await pumpDone;
       } else {
         // Fallback: no JetStream tail available — drain uiStream directly.
         // This still executes the hosted producer path; when the streamBuffer
@@ -838,28 +806,12 @@ export async function resolveEffectiveVirtualMcpForHarness({
   organizationId: string;
   ctx: StudioContext;
 }): Promise<VirtualMCPEntity> {
-  const studioPackAgent = findStudioPackAgentByMcpId(agentId);
-  if (!studioPackAgent) return virtualMcp;
-
-  const resolved = await resolveStudioPackRuntime(studioPackAgent, {
-    orgId: organizationId,
+  return resolveEffectiveStudioPackVirtualMcp({
+    virtualMcp,
+    agentId,
+    organizationId,
     ctx,
   });
-  const selectedTools = resolved.selectedTools
-    ? [...resolved.selectedTools]
-    : null;
-
-  return {
-    ...virtualMcp,
-    metadata: {
-      ...((virtualMcp.metadata as Record<string, unknown>) ?? {}),
-      instructions: resolved.instructions,
-    },
-    connections: virtualMcp.connections.map((connection) => ({
-      ...connection,
-      selected_tools: selectedTools,
-    })),
-  };
 }
 
 /**
@@ -960,7 +912,11 @@ async function prepareRun(
       const allowedModels = await fetchModelPermissions(
         ctx.db,
         input.organizationId,
-        ctx.auth.user?.role,
+        // `ctx.organization?.role` is the path-resolved role for
+        // `input.organizationId` (set by resolveOrgFromPath); ctx.auth.user?.role
+        // is the session's active-org role and may belong to a different org
+        // when the caller's active org differs from the dispatch target.
+        ctx.organization?.role ?? ctx.auth.user?.role,
       );
 
       if (
@@ -1155,6 +1111,7 @@ async function prepareRun(
           windowSize: input.windowSize,
           triggerId: input.triggerId,
         },
+        messageId: (input as { messageId?: string }).messageId,
       });
     }
     runStarted = true;
@@ -1175,12 +1132,14 @@ async function prepareRun(
     // fence-scoped JetStream dedup key (`runId:fenceToken:seq`) and the
     // projector's per-(runId, fenceToken) accumulator never collide two turns.
     //
-    // Durable submit callers pass the route-minted fence on
-    // `input.runFenceToken`, so we USE that value and skip the write (the route
-    // already persisted it before starting DBOS). Legacy/direct callers that
-    // omit it still mint + write here. Either way the same value flows into the
-    // wire harness input, the NATS msg ids, and the projector/consume fence
-    // checks.
+    // Durable submit callers arrive here with `input.runFenceToken` already
+    // set: the thread gate's dispatch step claims + persists the fence via
+    // `claimRunFenceForDispatch` (thread-gate-workflow.ts) while it holds the
+    // thread's partition slot, and bakes that value into the request this
+    // function receives — so we USE it and skip the write. The mint-and-write
+    // fallback below only fires for legacy/direct callers that bypass the
+    // gate. Either way the same value flows into the wire harness input, the
+    // NATS msg ids, and the projector/consume fence checks.
     // Note: a failed link run leaves run_fence_token set until Task 7 clears it
     // (harmless: next run overwrites; ws/cloud never read it).
     let runFenceToken: string;
@@ -1223,8 +1182,15 @@ async function prepareRun(
       }
     }
 
-    // Purge stale buffered chunks from any previous run on this thread
-    streamBuffer?.purge(mem.thread.id);
+    // Purge stale buffered chunks from any PREVIOUS run on this thread — but
+    // NOT on resume. A resumed run (DBOS recovery after its owner pod died) IS
+    // "the previous run": purging here beheads the very chunk log its projector
+    // must replay, so replay hits a StreamGapError ("missing seq 1") and the
+    // recovered run is marked `failed` instead of completing. Recovery depends
+    // on the seq 1..N log surviving the pod that owned it.
+    if (!input.isResume) {
+      streamBuffer?.purge(mem.thread.id);
+    }
 
     let systemMessages: ChatMessage[] = [];
     let materializedRequestMessage: ChatMessage | undefined;
@@ -1236,6 +1202,18 @@ async function prepareRun(
         durableHistory,
         input.messageId,
       );
+      // Rehydrate the per-turn system context folded into the frozen snapshot
+      // (it isn't a persisted thread message, so it's absent from history).
+      // Deterministic id keyed by messageId so DBOS replay is stable.
+      if (input.systemContext) {
+        systemMessages = [
+          {
+            id: `system-${input.messageId}`,
+            role: "system",
+            parts: [{ type: "text", text: input.systemContext }],
+          } as ChatMessage,
+        ];
+      }
     } else {
       // Split system messages from user message.
       systemMessages = input.messages.filter((m) => m.role === "system");
@@ -1274,6 +1252,20 @@ async function prepareRun(
       }
     }
 
+    // Mirror the user prompt onto the run stream AFTER the purge above (which
+    // clears the previous run) so it survives the whole run — a viewer who
+    // JOINS mid-run replays it via `deliverPolicy: "all"`, not only viewers
+    // already connected at POST time. Best-effort and published before the
+    // run's assistant chunks so it sorts first. Uses the persisted message
+    // shape so the live chunk and a later DB refetch reconcile by id, no swap.
+    if (materializedRequestMessage) {
+      await publishUserMessage(
+        streamBuffer,
+        mem.thread.id,
+        materializedRequestMessage as UIMessage,
+      );
+    }
+
     const pendingOps: Promise<void>[] = [];
 
     // CLI-harness delta + resume only holds on the long-lived desktop daemon:
@@ -1305,7 +1297,7 @@ async function prepareRun(
     //   - `prepareLinkWorkDispatch` returns it verbatim so the thread gate can
     //     publish it as the link work item's `harnessInput`.
 
-    // Resolve mesh-storage: URIs to fresh presigned URLs for the current user
+    // Resolve studio-storage: URIs to fresh presigned URLs for the current user
     // message only. The v3 harness contract carries one wire-ready userMessage;
     // long-lived CLI context is represented separately by harness.sessionId.
     const wireUserMessage = materializedRequestMessage
@@ -1507,159 +1499,147 @@ async function prepareRun(
     // `whenComplete` resolves, so awaiting it from there would deadlock. The
     // ordering that matters now is that the same lazy kernel path publishes
     // the JetStream chunks before invoking the finish hook.
-    // The progress tap (the run's liveness heartbeat) lives INSIDE the lazy
-    // factory: `pipeThrough` at the return site would eagerly pull one chunk
-    // through the lazy stream even with no consumer (transform writable
-    // high-water mark), starting the harness for never-consumed link runs.
+    //
+    // No progress tap wraps this stream: `buildAgentSandboxUiStream`'s
+    // returned `ReadableStream` never enqueues a value (it only
+    // closes/errors — raw chunks go to JetStream via `ingestRun`
+    // internally), so a chunk-driven tap here would never fire. The
+    // projector's `tapProgressStream` (progress-bump.ts, driven from the
+    // JetStream-sourced chunkStream in projector-workflow.ts) is the single
+    // liveness heartbeat for both hosted and desktop runs.
     const uiStream = lazyStream(() =>
-      tapProgress(
-        buildAgentSandboxUiStream({
-          runId: mem.thread.id,
-          fenceToken: runFenceToken,
-          streamBuffer: streamBuffer ?? {
-            publishRawChunk: async () => false,
-            publishDone: async () => false,
+      buildAgentSandboxUiStream({
+        runId: mem.thread.id,
+        fenceToken: runFenceToken,
+        streamBuffer: streamBuffer ?? {
+          publishRawChunk: async () => false,
+          publishDone: async () => false,
+        },
+        // Heartbeat wraps the RAW harness source, before ingestRun's
+        // seq-wrapper (unified-control-plane T5) — a `data-liveness`
+        // chunk injected during a silent model/tool wait gets a real seq
+        // through the exact same publish path as every other chunk (see
+        // with-liveness-heartbeat.ts's module doc for the full contract).
+        chunks: withLivenessHeartbeat(dispatchHarnessChunks()),
+        // Deterministic per turn (runId + fence) so a synthesized error
+        // message dedupes across the live write + projector retries while
+        // distinct turns of the same thread never collide. See message-ids.ts.
+        errorMessageId: synthesizedErrorMessageId(mem.thread.id, runFenceToken),
+        // Seed the hook reassembly with the trailing persisted message so a
+        // tool-approval CONTINUATION reconciles its tool-output against the
+        // proposal (and adopts its id) instead of throwing. Mirrors the
+        // projector's `loadWindow` seed. Lazy + only `.at(-1)` is used, so a
+        // single-row window is enough; V1 threads (no part storage) skip it.
+        loadOriginalMessages: partEmitter
+          ? async () =>
+              (
+                await ctx.storage.threads
+                  .messageParts()
+                  .loadWindow(mem.thread.id, { limit: 1 })
+              ).messages.map(foldedToUIMessage)
+          : undefined,
+        title: {
+          currentThreadTitle: mem.thread.title,
+          threadId: mem.thread.id,
+          // Projector owns the title write — `ingestRun` neutralizes this
+          // persistence callback. The projector is the sole sidebar-SSE
+          // source for both hosted and desktop now.
+          persistTitle: async (threadId, title) => {
+            await ctx.storage.threads.update(threadId, { title });
           },
-          chunks: dispatchHarnessChunks(),
-          // Deterministic per turn (runId + fence) so a synthesized error
-          // message dedupes across the live write + projector retries while
-          // distinct turns of the same thread never collide. See message-ids.ts.
-          errorMessageId: synthesizedErrorMessageId(
-            mem.thread.id,
-            runFenceToken,
-          ),
-          // Seed the hook reassembly with the trailing persisted message so a
-          // tool-approval CONTINUATION reconciles its tool-output against the
-          // proposal (and adopts its id) instead of throwing. Mirrors the
-          // projector's `loadWindow` seed. Lazy + only `.at(-1)` is used, so a
-          // single-row window is enough; V1 threads (no part storage) skip it.
-          loadOriginalMessages: partEmitter
-            ? async () =>
-                (
-                  await ctx.storage.threads
-                    .messageParts()
-                    .loadWindow(mem.thread.id, { limit: 1 })
-                ).messages.map(foldedToUIMessage)
-            : undefined,
-          title: {
-            currentThreadTitle: mem.thread.title,
-            threadId: mem.thread.id,
-            // Projector owns the title write — `ingestRun` neutralizes this
-            // persistence callback. The projector is the sole sidebar-SSE
-            // source for both hosted and desktop now.
-            persistTitle: async (threadId, title) => {
-              await ctx.storage.threads.update(threadId, { title });
-            },
+        },
+        hooks: {
+          onStep: () => {
+            const transitions = runRegistry.dispatch({
+              type: "STEP_DONE",
+              taskId: mem.thread.id,
+            });
+            pendingOps.push(
+              runRegistry.react(transitions).catch((e) => {
+                console.error(
+                  "[decopilot:stream] onStepFinish reactor failed",
+                  e,
+                );
+              }),
+            );
           },
-          hooks: {
-            onStep: () => {
-              const transitions = runRegistry.dispatch({
-                type: "STEP_DONE",
-                taskId: mem.thread.id,
-              });
-              pendingOps.push(
-                runRegistry.react(transitions).catch((e) => {
-                  console.error(
-                    "[decopilot:stream] onStepFinish reactor failed",
-                    e,
-                  );
+          onFinish: async (responseMessage, finishReason) => {
+            const pendingCount = pendingOps.length;
+
+            // Phase 1 (settle): await the dispatch-level side-effect ops
+            // accumulated during the run (step reactors). The kernel already
+            // settled its own pending before invoking this hook, so this
+            // segment isolates the dispatch-side flush cost.
+            const settleStart = performance.now();
+            await Promise.allSettled(pendingOps);
+            finishDurationHistogram.record(performance.now() - settleStart, {
+              phase: "settle",
+            });
+
+            if (registrySignal.aborted) return;
+
+            // Yield a macrotask before the synchronous finish bookkeeping so
+            // the settle-burst of pending-op continuations and the FINISH
+            // reactor's DB write don't run in one tick — lets queued I/O
+            // (health probes) get a turn and caps the worst onFinish
+            // event-loop stalls.
+            await sleep(0);
+
+            const heapBefore = FINISH_TRACE ? safeMemoryUsage() : null;
+            const saveStart = performance.now();
+
+            const threadStatus = resolveThreadStatus(
+              finishReason,
+              responseMessage?.parts as {
+                type: string;
+                state?: string;
+                text?: string;
+              }[],
+            );
+
+            await runRegistry.execute({
+              type: "FINISH",
+              taskId: mem.thread.id,
+              threadStatus,
+            });
+
+            const saveMs = performance.now() - saveStart;
+            finishDurationHistogram.record(saveMs, { phase: "save" });
+
+            if (FINISH_TRACE && heapBefore) {
+              const heapAfter = safeMemoryUsage() ?? heapBefore;
+              let messageBytes = -1;
+              try {
+                messageBytes = JSON.stringify(responseMessage)?.length ?? -1;
+              } catch {
+                // circular/oversized — leave -1
+              }
+              console.warn(
+                JSON.stringify({
+                  msg: "decopilot-finish-trace",
+                  threadId: mem.thread.id,
+                  pendingOps: pendingCount,
+                  saveMs: Math.round(saveMs),
+                  parts: responseMessage?.parts?.length ?? 0,
+                  messageBytes,
+                  rssDelta: heapAfter.rss - heapBefore.rss,
+                  heapUsedDelta: heapAfter.heapUsed - heapBefore.heapUsed,
+                  externalDelta: heapAfter.external - heapBefore.external,
                 }),
               );
-            },
-            onFinish: async (responseMessage, finishReason) => {
-              const pendingCount = pendingOps.length;
+            }
 
-              // Phase 1 (settle): await the dispatch-level side-effect ops
-              // accumulated during the run (step reactors). The kernel already
-              // settled its own pending before invoking this hook, so this
-              // segment isolates the dispatch-side flush cost.
-              const settleStart = performance.now();
-              await Promise.allSettled(pendingOps);
-              finishDurationHistogram.record(performance.now() - settleStart, {
-                phase: "settle",
-              });
-
-              if (registrySignal.aborted) return;
-
-              // Yield a macrotask before the synchronous finish bookkeeping so
-              // the settle-burst of pending-op continuations and the FINISH
-              // reactor's DB write don't run in one tick — lets queued I/O
-              // (health probes) get a turn and caps the worst onFinish
-              // event-loop stalls.
-              await sleep(0);
-
-              const heapBefore = FINISH_TRACE ? safeMemoryUsage() : null;
-              const saveStart = performance.now();
-
-              const threadStatus = resolveThreadStatus(
-                finishReason,
-                responseMessage?.parts as {
-                  type: string;
-                  state?: string;
-                  text?: string;
-                }[],
-              );
-
-              await runRegistry.execute({
-                type: "FINISH",
-                taskId: mem.thread.id,
-                threadStatus,
-              });
-
-              const saveMs = performance.now() - saveStart;
-              finishDurationHistogram.record(saveMs, { phase: "save" });
-
-              if (FINISH_TRACE && heapBefore) {
-                const heapAfter = safeMemoryUsage() ?? heapBefore;
-                let messageBytes = -1;
-                try {
-                  messageBytes = JSON.stringify(responseMessage)?.length ?? -1;
-                } catch {
-                  // circular/oversized — leave -1
-                }
-                console.warn(
-                  JSON.stringify({
-                    msg: "decopilot-finish-trace",
-                    threadId: mem.thread.id,
-                    pendingOps: pendingCount,
-                    saveMs: Math.round(saveMs),
-                    parts: responseMessage?.parts?.length ?? 0,
-                    messageBytes,
-                    rssDelta: heapAfter.rss - heapBefore.rss,
-                    heapUsedDelta: heapAfter.heapUsed - heapBefore.heapUsed,
-                    externalDelta: heapAfter.external - heapBefore.external,
-                  }),
-                );
-              }
-
-              // Completion analytics are emitted by the projector after the
-              // same fenced JetStream log is durably materialized.
-            },
-            onError: (error) => {
-              if (registrySignal.aborted) {
-                // User cancelled (frontend stop button), tab closed mid-stream,
-                // or run was force-failed. Frontend chat_message_stopped covers
-                // the first case; this server event also covers the other two.
-                posthog.capture({
-                  distinctId: input.userId,
-                  event: "chat_message_aborted",
-                  groups: { organization: input.organizationId },
-                  properties: {
-                    organization_id: input.organizationId,
-                    thread_id: mem.thread.id,
-                    agent_id: input.agent.id,
-                    model_id: models.thinking.id,
-                    mode: input.mode,
-                    duration_ms: Date.now() - streamStartAt,
-                    is_resume: input.isResume ?? false,
-                  },
-                });
-                return;
-              }
-              console.error("[decopilot] stream error:", stringifyError(error));
+            // Completion analytics are emitted by the projector after the
+            // same fenced JetStream log is durably materialized.
+          },
+          onError: (error) => {
+            if (registrySignal.aborted) {
+              // User cancelled (frontend stop button), tab closed mid-stream,
+              // or run was force-failed. Frontend chat_message_stopped covers
+              // the first case; this server event also covers the other two.
               posthog.capture({
                 distinctId: input.userId,
-                event: "chat_message_failed",
+                event: "chat_message_aborted",
                 groups: { organization: input.organizationId },
                 properties: {
                   organization_id: input.organizationId,
@@ -1668,30 +1648,33 @@ async function prepareRun(
                   model_id: models.thinking.id,
                   mode: input.mode,
                   duration_ms: Date.now() - streamStartAt,
-                  error_category: classifyStreamError(error),
-                  error_message:
-                    error instanceof Error
-                      ? error.message
-                      : stringifyError(error),
                   is_resume: input.isResume ?? false,
                 },
               });
+              return;
+            }
+            console.error("[decopilot] stream error:", stringifyError(error));
+            // Failure analytics (`chat_message_failed`) are emitted by the
+            // projector's `recordFailed`, same as the completion event above —
+            // this hook used to double-capture it here. The projector fires
+            // once the run's fenced terminal (in-band error chunk +
+            // `{done}`) is durably materialized, which happens for every
+            // caught failure now that `dispatchRunAndWait` propagates a
+            // mid-stream ingest error instead of swallowing it (see
+            // `hosted-harness-workflow.ts`'s catch).
 
-              runRegistry
-                .execute({
-                  type: "FINISH",
-                  taskId: mem.thread.id,
-                  threadStatus: "failed",
-                })
-                .catch((e) => {
-                  console.error("[decopilot:stream] onError reactor failed", e);
-                });
-            },
+            runRegistry
+              .execute({
+                type: "FINISH",
+                taskId: mem.thread.id,
+                threadStatus: "failed",
+              })
+              .catch((e) => {
+                console.error("[decopilot:stream] onError reactor failed", e);
+              });
           },
-        }),
-        ctx,
-        mem.thread.id,
-      ),
+        },
+      }),
     );
 
     // Setup complete — hand the uiStream back to `dispatchRunAndWait`,
@@ -1699,12 +1682,9 @@ async function prepareRun(
     // finishes. The harness does not start until that first pull (see
     // `lazyStream`). When a streamBuffer is configured the run also pumps
     // into JetStream so `/stream` tails see chunks live across runs and tabs.
-    //
-    // The stream is wrapped (inside the lazy factory) with a throttled
-    // progress tap (Task 9): every chunk that flows out is "progress",
-    // collapsed to ≤1 `last_progress_at` write per ~3s per run. The single
-    // consumer downstream (pump or direct drain) pulls through this tap, so
-    // the heartbeat fires regardless of which consumption path runs.
+    // The run's liveness heartbeat is driven by the projector's own tap on
+    // its JetStream-sourced chunk consumption (see progress-bump.ts), not
+    // this stream.
     return {
       taskId: mem.thread.id,
       uiStream,

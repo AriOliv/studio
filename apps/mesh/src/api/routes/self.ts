@@ -1,7 +1,7 @@
 /**
  * Self MCP Server
  *
- * Exposes MCP Mesh management tools via MCP protocol at /mcp/self endpoint
+ * Exposes Studio management tools via MCP protocol at /mcp/self endpoint
  * Tools: PROJECT_CREATE, PROJECT_LIST, CONNECTION_CREATE, etc.
  */
 import { Hono } from "hono";
@@ -13,7 +13,7 @@ import { serveMcpRequest } from "../utils/serve-mcp";
 
 // Define Hono variables type
 type Variables = {
-  meshContext: StudioContext;
+  studioContext: StudioContext;
 };
 
 type SelfEnv = { Variables: Variables };
@@ -28,7 +28,7 @@ export const createSelfRoutes = () => {
    * Exposes all PROJECT_* and CONNECTION_* tools via MCP protocol
    */
   app.all("/", async (c) => {
-    const ctx = c.get("meshContext");
+    const ctx = c.get("studioContext");
     const allowed = getAllowedToolsForRole(ctx.access.getRole());
     const server = await managementMCP(
       ctx,

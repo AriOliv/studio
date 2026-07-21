@@ -1,8 +1,12 @@
+import { normalizeReportsSiteUrl } from "@/reports/site-url";
+import { ErrorBoundary } from "@/web/components/error-boundary";
+import { ScrollReveal } from "@/web/components/scroll-reveal";
 import { authClient } from "@/web/lib/auth-client";
 import { SELF_MCP_ALIAS_ID, useMCPClient } from "@decocms/mesh-sdk";
 import { Button } from "@deco/ui/components/button.tsx";
-import { ArrowRight } from "@untitledui/icons";
-import { CompanionCard } from "./companion-card.tsx";
+import { QueryErrorResetBoundary } from "@tanstack/react-query";
+import { Suspense, useState } from "react";
+import { CompanionCard, CompanionCardSkeleton } from "./companion-card.tsx";
 import { useCommerceCompanions } from "./use-commerce-companions.ts";
 import { useConnectCompanion } from "./use-connect-companion.ts";
 
@@ -11,113 +15,223 @@ interface CompanionOrg {
   slug: string;
 }
 
-export function CompanionMcpsSection({
+// Shared between the live section, its Suspense fallback, and its error fallback
+// so the layout can't drift between the three — see CompanionMcpsSectionSkeleton
+// and CompanionMcpsSectionError.
+const SECTION_CONTAINER_CLASS =
+  "flex min-h-0 flex-1 flex-col gap-4 md:grid md:flex-none md:gap-4";
+
+function SectionIntro() {
+  // Matches the onboarding title scale (CommerceHeader / auth screen use the
+  // same text-2xl font-medium leading-8).
+  return (
+    <h1 className="text-lg font-medium leading-6 text-foreground lg:text-2xl lg:leading-8">
+      Conecte suas ferramentas para ver o diagnóstico completo
+    </h1>
+  );
+}
+
+function CompanionCardSkeletons() {
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      {[0, 1, 2, 3].map((i) => (
+        <CompanionCardSkeleton key={i} />
+      ))}
+    </div>
+  );
+}
+
+// Suspense fallback for the whole section. `useCommerceCompanions` (and the MCP
+// clients it/the cards open) are Suspense queries, so the card loading state now
+// lives here as a stable boundary fallback instead of an `isLoading` branch that
+// could tear down and re-mount as deeper queries resolve.
+export function CompanionMcpsSectionSkeleton() {
+  return (
+    <div className={SECTION_CONTAINER_CLASS}>
+      <SectionIntro />
+      <CompanionCardSkeletons />
+    </div>
+  );
+}
+
+function CompanionMcpsSectionError({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div className={SECTION_CONTAINER_CLASS}>
+      <SectionIntro />
+      <div
+        role="alert"
+        className="rounded-2xl border border-border bg-card p-4"
+      >
+        <p className="text-sm text-foreground">
+          Não foi possível carregar as integrações complementares.
+        </p>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Algo deu errado ao carregar suas integrações.
+        </p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="mt-3"
+          onClick={onRetry}
+        >
+          Tentar novamente
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+export function CompanionMcpsSection(props: {
+  org: CompanionOrg;
+  cdConnectionId: string;
+  siteUrl?: string;
+  /** Called once cards resolve with whether at least one is connected (or
+   *  none are required). Lets the report CTA above this section gate on it. */
+  onReadinessChange?: (hasConnectedSource: boolean) => void;
+}) {
+  return (
+    <QueryErrorResetBoundary>
+      {({ reset }) => (
+        <ErrorBoundary
+          fallback={({ resetError }) => (
+            <CompanionMcpsSectionError
+              onRetry={() => {
+                reset();
+                resetError();
+              }}
+            />
+          )}
+        >
+          <Suspense fallback={<CompanionMcpsSectionSkeleton />}>
+            <CompanionMcpsSectionContent {...props} />
+          </Suspense>
+        </ErrorBoundary>
+      )}
+    </QueryErrorResetBoundary>
+  );
+}
+
+function CompanionMcpsSectionContent({
   org,
   cdConnectionId,
-  reportDisabled,
-  onOpenReport,
+  siteUrl,
+  onReadinessChange,
 }: {
   org: CompanionOrg;
   cdConnectionId: string;
-  reportDisabled: boolean;
-  onOpenReport: () => void;
+  siteUrl?: string;
+  onReadinessChange?: (hasConnectedSource: boolean) => void;
 }) {
   const { data: session } = authClient.useSession();
   const userId = session?.user?.id ?? "";
+  const normalizedSite = siteUrl ? normalizeReportsSiteUrl(siteUrl) : null;
+  let siteHost: string | undefined;
+  if (normalizedSite?.ok) {
+    try {
+      siteHost = new URL(normalizedSite.value).hostname;
+    } catch {
+      siteHost = undefined;
+    }
+  }
   const selfClient = useMCPClient({
     connectionId: SELF_MCP_ALIAS_ID,
     orgId: org.id,
     orgSlug: org.slug,
   });
 
-  const { cards, isLoading, error } = useCommerceCompanions({
+  const { cards } = useCommerceCompanions({
     selfClient,
     org,
     cdConnectionId,
+    siteUrl,
   });
   const {
     connect,
     connectingFieldKey,
+    disconnect,
+    disconnectingFieldKey,
     error: connectError,
   } = useConnectCompanion({
     selfClient,
     org,
     userId,
     cdConnectionId,
+    domain: siteHost,
+    siteUrl,
   });
+  const [autoOpenConfigFieldKey, setAutoOpenConfigFieldKey] = useState<
+    string | null
+  >(null);
 
-  const cta = (
-    <Button
-      type="button"
-      size="xl"
-      className="w-full"
-      onClick={onOpenReport}
-      disabled={reportDisabled}
-    >
-      See full report
-      <ArrowRight size={16} />
-    </Button>
-  );
+  // Nothing required, or at least one connected → the report CTA may proceed.
+  // Called during render (derived from query data, not an effect) so the
+  // parent's button re-enables the same render pass a source connects.
+  onReadinessChange?.(cards.length === 0 || cards.some((c) => c.satisfied));
 
-  // Empty: no requirements survive → just the report CTA (section header hidden).
-  if (!isLoading && !error && cards.length === 0) {
-    return <div className="grid gap-10">{cta}</div>;
+  // Empty: nothing to connect → render nothing (the parent footer still shows
+  // the report CTA).
+  if (cards.length === 0) {
+    return null;
   }
 
-  const busy = connectingFieldKey !== null;
+  const busy = connectingFieldKey !== null || disconnectingFieldKey !== null;
 
   return (
-    <div className="grid gap-6">
-      <div className="grid gap-1.5">
-        <p className="text-2xl font-medium text-foreground">
-          Unlock your full diagnostic
-        </p>
-        <p className="text-base text-muted-foreground">
-          Connect your tools to unlock 100+ checks across your funnel.
-        </p>
-      </div>
+    // Mobile: fill the parent's remaining height — the header + intro copy stay
+    // pinned while the card list scrolls. md+: natural block with a capped
+    // scroll area so the right panel stays visible.
+    <div className={SECTION_CONTAINER_CLASS}>
+      <SectionIntro />
 
-      {error ? (
-        <div
-          role="alert"
-          className="rounded-2xl border border-border bg-background/60 p-4"
-        >
-          <p className="text-sm text-foreground">
-            Couldn't load companion integrations.
+      <ScrollReveal
+        wrapperClassName="flex min-h-0 flex-1 flex-col md:block"
+        // md cap is viewport-aware: ~330px is the column's fixed chrome (header,
+        // title, paddings, report CTA), so on short windows the cards scroll
+        // internally instead of pushing the CTA below the fold.
+        className="-mx-1 min-h-0 flex-1 overflow-y-auto px-1 md:max-h-[min(60vh,calc(100dvh-330px))] md:flex-none"
+      >
+        {connectError && (
+          <p role="alert" className="mb-3 text-sm text-destructive">
+            {connectError}
           </p>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Reload the page to try again.
-          </p>
-        </div>
-      ) : isLoading ? (
-        <div className="grid gap-4">
-          {[0, 1, 2].map((i) => (
-            <div
-              key={i}
-              className="h-24 animate-pulse rounded-2xl border border-border bg-muted/40"
-            />
-          ))}
-        </div>
-      ) : (
-        <div className="grid gap-4">
-          {connectError && (
-            <p role="alert" className="text-sm text-destructive">
-              {connectError}
-            </p>
-          )}
-          {cards.map((card) => (
-            <CompanionCard
-              key={card.fieldKey}
-              card={card}
-              connecting={connectingFieldKey === card.fieldKey}
-              disabled={busy && connectingFieldKey !== card.fieldKey}
-              onConnect={() => void connect(card)}
-            />
-          ))}
-        </div>
-      )}
+        )}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {cards.map((card) => {
+            const handleConnect = async () => {
+              const connected = await connect(card);
+              if (connected) {
+                setAutoOpenConfigFieldKey(card.fieldKey);
+              }
+            };
 
-      {cta}
+            return (
+              <CompanionCard
+                key={card.fieldKey}
+                card={card}
+                connecting={connectingFieldKey === card.fieldKey}
+                disconnecting={disconnectingFieldKey === card.fieldKey}
+                disabled={
+                  busy &&
+                  connectingFieldKey !== card.fieldKey &&
+                  disconnectingFieldKey !== card.fieldKey
+                }
+                org={org}
+                selfClient={selfClient}
+                siteUrl={siteUrl}
+                autoOpenConfigFieldKey={autoOpenConfigFieldKey}
+                onAutoOpenConfigHandled={() =>
+                  setAutoOpenConfigFieldKey((current) =>
+                    current === card.fieldKey ? null : current,
+                  )
+                }
+                onConnect={() => void handleConnect()}
+                onDisconnect={() => void disconnect(card)}
+              />
+            );
+          })}
+        </div>
+      </ScrollReveal>
     </div>
   );
 }

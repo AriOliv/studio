@@ -31,7 +31,10 @@
  */
 
 import { sleep } from "@decocms/std";
+import { detachMountAsync } from "./detach-mount";
 import type { MountHandle, Mounter } from "./mount-manager";
+
+export { detachMount } from "./detach-mount";
 
 /** How long to wait for the mount to attach before giving up. */
 const READY_TIMEOUT_MS = 15_000;
@@ -50,11 +53,11 @@ const READY_POLL_MS = 200;
  *    healthy it answers in microseconds, dead it refuses the connection — so
  *    this only ever trips when rclone is genuinely gone, turning the classic NFS
  *    hard-mount hang (+ persistent reconnect dialog) into a fast, recoverable
- *    error. Writes land in rclone's local VFS cache first, so a slow mesh never
+ *    error. Writes land in rclone's local VFS cache first, so a slow studio never
  *    makes a write slow enough to trip this.
  *  - timeo=100 (tenths of a sec → 10s) / retrans=2: generous per-request
  *    headroom so a legitimately slow read (first open of a large uncached file
- *    that rclone must fetch whole from the mesh) is not killed, while still
+ *    that rclone must fetch whole from the studio) is not killed, while still
  *    bounding a dead-server hang to ~tens of seconds. Tuning knob: lower timeo
  *    for snappier dead-mount recovery only if large-read tests still pass.
  *  - nobrowse: keep the volume out of the Finder sidebar/desktop, reducing the
@@ -108,34 +111,6 @@ export function buildMountArgs(opts: {
   ];
 }
 
-/**
- * Force-detach whatever is mounted at `mountPath` (best-effort, never throws).
- * Used both to tear down our own mount and to reclaim a stale ghost left by a
- * previously-killed session before mounting fresh. On a path that isn't a mount
- * point every command exits non-zero and we simply move on.
- */
-export function detachMount(mountPath: string, isMac: boolean): void {
-  // NFS + FUSE both unmount via `umount`; on Linux `fusermount -u` is the
-  // unprivileged path, so try it first there.
-  const cmds: string[][] = isMac
-    ? [["umount", "-f", mountPath]]
-    : [
-        ["fusermount", "-u", mountPath],
-        ["umount", mountPath],
-      ];
-  for (const cmd of cmds) {
-    // `umount -f` is the non-blocking force path, but bound it anyway: this
-    // runs on every mount (reclaim) and at shutdown, and a wedged kernel
-    // unmount must never hang the daemon.
-    const p = Bun.spawnSync(cmd, {
-      stdout: "ignore",
-      stderr: "ignore",
-      timeout: 5000,
-    });
-    if (p.exitCode === 0) break;
-  }
-}
-
 export function createRcloneMounter(
   rclonePath: string,
   opts: {
@@ -146,11 +121,26 @@ export function createRcloneMounter(
   } = {},
 ): Mounter {
   const isMac = process.platform === "darwin";
+  const isWindows = process.platform === "win32";
   return {
     async mount({ webdavUrl, mountPath, rcAddr, readonly }) {
+      // rclone's nfsmount/mount (and the umount/fusermount detach below) have
+      // no Windows equivalent. This is unreachable in practice: MountManager
+      // gates on win32 BEFORE ever calling mountOne (see its constructor doc),
+      // so `active` stays empty there and this Mounter is never invoked. Throw
+      // defensively rather than hand back a fake success handle — a caller
+      // that bypassed the manager gate must not get an indistinguishable-from-
+      // real MountHandle, since that would let downstream link logic
+      // (ensureOrgRepoLink / repointOutputLinkForRun) symlink into an unbacked
+      // directory and silently strand files (see entry.ts's link-gate doc).
+      if (isWindows) {
+        throw new Error("org-fs mounts are not supported on Windows");
+      }
       // Reclaim: clear a stale mount from a prior killed session so we don't
-      // layer a fresh mount over a hung one (no-op on a clean path).
-      detachMount(mountPath, isMac);
+      // layer a fresh mount over a hung one (no-op on a clean path). Async so
+      // a wedged fusermount/umount can't freeze the daemon's event loop (see
+      // detach-mount.ts's detachMountAsync doc).
+      await detachMountAsync(mountPath, isMac);
 
       const args = buildMountArgs({
         isMac,
@@ -223,8 +213,13 @@ async function waitForMount(
   throw new Error(`rclone ${subcommand} not ready for ${mountPath} in time`);
 }
 
+/** Cap on how long we wait for rclone to exit after SIGTERM before SIGKILLing.
+ *  Well under the pod's terminationGracePeriod so all mounts can drain in
+ *  parallel and still leave slack. */
+const RCLONE_EXIT_TIMEOUT_MS = 5_000;
+
 function makeHandle(
-  proc: { kill: () => void; exited: Promise<number> },
+  proc: { kill: (signal?: number) => void; exited: Promise<number> },
   mountPath: string,
   isMac: boolean,
 ): MountHandle {
@@ -234,13 +229,31 @@ function makeHandle(
     exited: proc.exited,
     async unmount() {
       // Detach the OS mount first, then stop the foreground rclone child.
-      detachMount(mountPath, isMac);
+      await detachMountAsync(mountPath, isMac);
       try {
         proc.kill();
       } catch {
         // already gone
       }
-      await proc.exited.catch(() => {});
+      // rclone flushes its --vfs-cache-mode full write-back cache on SIGTERM;
+      // against a slow or unreachable studio that flush can outlast the pod's
+      // terminationGracePeriod and hang shutdown → the sidecar is SIGKILLed
+      // (exit 137). Bound the wait, then SIGKILL rclone so teardown always
+      // makes progress. Unflushed writes at teardown are best-effort anyway.
+      const exited = proc.exited.catch(() => {});
+      const timeout = Symbol("timeout");
+      const outcome = await Promise.race([
+        exited.then(() => null),
+        sleep(RCLONE_EXIT_TIMEOUT_MS).then(() => timeout),
+      ]);
+      if (outcome === timeout) {
+        try {
+          proc.kill(9);
+        } catch {
+          // already gone
+        }
+        await exited;
+      }
     },
   };
 }

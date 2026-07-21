@@ -1,14 +1,18 @@
 import { ErrorBoundary } from "@/web/components/error-boundary";
 import { useProjectSidebarItems } from "@/web/hooks/use-project-sidebar-items";
 import { Suspense } from "react";
-import { Separator } from "@deco/ui/components/separator.tsx";
 import { NavigationSidebar } from "./navigation";
 import { MobileNavigationSidebar } from "./navigation-mobile";
-import { SidebarInboxFooter } from "./footer/inbox";
-import { SidebarInboxFooterMobile } from "./footer/inbox-mobile";
+import { SidebarAccountFooter } from "./footer/sidebar-footer";
+import { SidebarAccountFooterMobile } from "./footer/sidebar-footer-mobile";
 import { TaskGroupsList } from "./task-groups/task-groups-list";
 import { TaskGroupsSkeleton } from "./task-groups/task-groups-skeleton";
 import { SidebarAgentGroupsProvider } from "./sidebar-agent-groups-context";
+import {
+  AgentSwitcherCrumb,
+  OrgSwitcherCrumb,
+} from "@/web/components/header/shell-breadcrumb";
+import { useReportsOnly } from "@/web/hooks/use-organization-settings";
 
 export type {
   NavigationSidebarItem,
@@ -17,6 +21,21 @@ export type {
   Invitation,
 } from "./types";
 
+function SidebarOwnHeader() {
+  const reportsOnly = useReportsOnly();
+  // Commerce (reports-only) orgs get no agent navigation in the sidebar header —
+  // just the org, named.
+  if (reportsOnly) {
+    return <OrgSwitcherCrumb showName />;
+  }
+  return (
+    <>
+      <OrgSwitcherCrumb />
+      <AgentSwitcherCrumb />
+    </>
+  );
+}
+
 export function StudioSidebar() {
   const sections = useProjectSidebarItems();
 
@@ -24,18 +43,11 @@ export function StudioSidebar() {
     <SidebarAgentGroupsProvider>
       <NavigationSidebar
         sections={sections}
-        footer={<SidebarInboxFooter />}
+        footer={<SidebarAccountFooter />}
+        header={<SidebarOwnHeader />}
         additionalContent={
           <ErrorBoundary>
-            <Suspense
-              fallback={
-                <>
-                  <Separator className="mb-2" />
-                  <TaskGroupsSkeleton />
-                </>
-              }
-            >
-              <Separator className="mb-2" />
+            <Suspense fallback={<TaskGroupsSkeleton />}>
               <TaskGroupsList />
             </Suspense>
           </ErrorBoundary>
@@ -53,18 +65,10 @@ export function StudioSidebarMobile({ onClose }: { onClose: () => void }) {
       <MobileNavigationSidebar
         sections={sections}
         onClose={onClose}
-        footer={<SidebarInboxFooterMobile />}
+        footer={<SidebarAccountFooterMobile />}
         additionalContent={
           <ErrorBoundary>
-            <Suspense
-              fallback={
-                <>
-                  <Separator className="mb-2" />
-                  <TaskGroupsSkeleton />
-                </>
-              }
-            >
-              <Separator className="mb-2" />
+            <Suspense fallback={<TaskGroupsSkeleton />}>
               <TaskGroupsList onNavigate={onClose} />
             </Suspense>
           </ErrorBoundary>

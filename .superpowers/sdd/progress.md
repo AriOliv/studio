@@ -1,20 +1,23 @@
-# SDD Progress: decopilot message-id unification
+# Companion Config Selectable List — Progress
 
-Plan: docs/superpowers/plans/2026-06-29-decopilot-message-id-unification.md
-Branch: eta-telescopii
-Start BASE: (the spec+plan commit — recorded in Log below)
-
-(Replaces the prior ledger for 2026-06-26-decopilot-projection-single-workflow — all 12 of its tasks complete and committed; its WIP tail is folded into this plan's baseline checkpoint.)
-
-## Goal
-One id authority = the harness-stamped `start.messageId`, consumed verbatim by client + JetStream + DB, so approval/tool-output continuations merge onto the proposal message instead of duplicating it.
+BASE: 35624272969e8fb84ee2b793f3d12d7e8e6947a4
 
 ## Tasks
-- [ ] Task 1: share one message-id generator; stamp start.messageId in all 3 harnesses (decopilot, codex, claude-code)
-- [ ] Task 2: consumeHarnessStream — adopt harness id + continuation merge from originalMessages
-- [ ] Task 3: terminal projector — drop the remap, delete projectionMessageIdGenerator + continuationAssistantMessageId
-- [ ] Task 4: checkpoint + live ingest — thread originalMessages into checkpoint fold, delete assistantMessageIdGenerator
-- [ ] Task 5: e2e — approval continuation persists exactly one assistant message
+- [x] Task 1: SelectableList presentational component (commit 39c071d, review clean)
+- [x] Task 2: GA form (commit dd5f82e, review clean)
+- [x] Task 3: GSC form (commit f19bb0b, review clean)
+- [x] Task 4: verification (build/lint/fmt clean, app renders no console errors; live GA/GSC dialog needs OAuth - not reachable here)
 
-## Log
-(start) Baseline: mesh `tsc --noEmit` green before checkpoint.
+## Minor findings (for final review)
+
+---
+- Task 1 minors (non-blocking, no fix): index key for unlabeled groups; aria-checked boolean serialization; list-level disabled only.
+
+## Final review
+- Whole-branch review (opus): mergeable, 1 Important a11y finding -> fixed in f145a43 (keyboard nav + accessible name).
+- Re-review (opus): clean and mergeable. Remaining Minor (dataset.value! redundancy) left as-is.
+
+Commits: 39c071d, dd5f82e, f19bb0b, f145a43
+
+## PR
+- https://github.com/decocms/studio/pull/4265 (tau-cancri -> main, pushed via SSH)

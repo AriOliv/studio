@@ -24,9 +24,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { Link, useParams } from "@tanstack/react-router";
-import { ChevronLeft, ChevronRight } from "@untitledui/icons";
 import { cn } from "@deco/ui/lib/utils.ts";
-import { ToolbarIconButton } from "@/web/components/toolbar-icon-button";
 import { DEFAULT_LOGO, usePublicConfig } from "@/web/hooks/use-public-config";
 
 type ToolbarCtx = {
@@ -93,7 +91,7 @@ function ToolbarHeader({
   return (
     <div
       className={cn(
-        "app-titlebar wco-drag shrink-0 grid grid-cols-3 items-center pl-1 pr-2 pt-0.25 h-12 bg-sidebar",
+        "app-titlebar wco-drag relative z-10 shrink-0 grid grid-cols-3 items-center pl-1 pr-2 h-12 bg-sidebar",
         className,
       )}
       {...props}
@@ -116,27 +114,6 @@ function ToolbarRightColumn({ children }: { children?: ReactNode }) {
     <div className="flex items-center justify-end gap-0.5 min-w-0 justify-self-end">
       {children}
     </div>
-  );
-}
-
-function ToolbarNav() {
-  return (
-    <>
-      <ToolbarIconButton
-        onClick={() => window.history.back()}
-        aria-label="Go back"
-        title="Go back"
-      >
-        <ChevronLeft size={16} />
-      </ToolbarIconButton>
-      <ToolbarIconButton
-        onClick={() => window.history.forward()}
-        aria-label="Go forward"
-        title="Go forward"
-      >
-        <ChevronRight size={16} />
-      </ToolbarIconButton>
-    </>
   );
 }
 
@@ -254,7 +231,6 @@ Toolbar.Provider = ToolbarProviderImpl;
 Toolbar.Header = ToolbarHeader;
 Toolbar.LeftColumn = ToolbarLeftColumn;
 Toolbar.RightColumn = ToolbarRightColumn;
-Toolbar.Nav = ToolbarNav;
 Toolbar.Logo = ToolbarLogo;
 Toolbar.LogoLink = ToolbarLogoLink;
 Toolbar.CenterSlot = ToolbarCenterSlot;

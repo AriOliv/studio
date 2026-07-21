@@ -23,7 +23,7 @@ import {
 import { KEYS } from "@/web/lib/query-keys";
 import { useStudioTools } from "@/web/lib/studio-tools";
 import {
-  OPENAI_COMPATIBLE_PRESETS,
+  getPreset,
   type OpenAICompatiblePreset,
 } from "@/web/utils/openai-compatible-presets";
 
@@ -179,6 +179,7 @@ function EditForm({
               <button
                 type="button"
                 onClick={() => setShowKey(!showKey)}
+                aria-label={showKey ? "Hide API key" : "Show API key"}
                 className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
               >
                 {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
@@ -220,7 +221,7 @@ export function EditProviderKeyDialog({
 
   const preset: OpenAICompatiblePreset | undefined =
     provider.id === "openai-compatible" && providerKey.presetId
-      ? OPENAI_COMPATIBLE_PRESETS.find((p) => p.id === providerKey.presetId)
+      ? getPreset(providerKey.presetId)
       : undefined;
 
   const displayName = preset?.name ?? provider.name;

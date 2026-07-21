@@ -47,11 +47,14 @@ import {
   tryResolveTier,
 } from "@/core/resolve-tier";
 import { isPermanentRunError } from "@/core/dispatch-errors";
+import { PartEmitter } from "@/api/routes/decopilot/part-emitter";
+import type { AnyMessage } from "@/api/routes/decopilot/part-row-builder";
 import type { AutomationsStorage } from "@/storage/automations";
 import type { Automation } from "@/storage/types";
 import type { SimpleModeTier } from "@/tools/organization/schema";
 import {
   buildStreamRequest,
+  contextMessageId,
   type ResolvedAutomationModel,
 } from "./build-stream-request";
 import { computeNextRunAt, type StudioContextFactory } from "./fire";
@@ -89,7 +92,6 @@ export const AUTOMATIONS_PARTITION_CONCURRENCY = 10;
 export const AUTOMATIONS_POLL_INTERVAL_MS = 5_000;
 /** Prefix of the retired per-org queues — kept only for migration cleanup. */
 const AUTOMATIONS_ORG_QUEUE_PREFIX = "automations-org-";
-const AUTOMATIONS_RUN_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * MIGRATION (remove once no `automations-org-*` rows remain): delete the
@@ -124,8 +126,7 @@ export async function cleanupOrphanedOrgQueues(pool: Pool): Promise<void> {
 
 export interface AutomationRuntime {
   storage: AutomationsStorage;
-  meshContextFactory: StudioContextFactory;
-  runTimeoutMs?: number;
+  studioContextFactory: StudioContextFactory;
 }
 
 let runtime: AutomationRuntime | null = null;
@@ -166,6 +167,10 @@ export interface FireAutomationContext {
   organizationId: string;
   triggerId: string | null;
   contextMessages?: ContextMessage[];
+  /** Trusted per-run metadata (e.g. from a webhook trigger's `run_metadata`),
+   *  forwarded to downstream MCP tool calls as `x-mesh-run-metadata`. Distinct
+   *  from `contextMessages`, which is untrusted payload shown to the model. */
+  runMetadata?: Record<string, string>;
 }
 
 export type FireAutomationOutcome =
@@ -202,11 +207,11 @@ async function prepareFireStep(
   if (!automation) return { skip: "not_found" };
   if (!automation.active) return { skip: "inactive" };
 
-  const meshCtx = await rt.meshContextFactory(
+  const studioCtx = await rt.studioContextFactory(
     automation.organization_id,
     automation.created_by,
   );
-  if (!meshCtx) {
+  if (!studioCtx) {
     console.warn(
       `[fireAutomationWorkflow] deactivating "${automation.name}" — creator ${automation.created_by} no longer in org ${automation.organization_id}`,
     );
@@ -243,11 +248,11 @@ async function prepareFireStep(
   // even when the org has Perplexity/Gemini Deep Research configured.
   const [resolved, image, webSearch, deepResearch] = await Promise.all([
     pinned
-      ? resolveSpecificModel(meshCtx, pinned.credentialId, pinned.modelId)
-      : resolveTier(meshCtx, tier),
-    tryResolveTier(meshCtx, "image"),
-    tryResolveTier(meshCtx, "web_search"),
-    tryResolveTier(meshCtx, "deep_research"),
+      ? resolveSpecificModel(studioCtx, pinned.credentialId, pinned.modelId)
+      : resolveTier(studioCtx, tier),
+    tryResolveTier(studioCtx, "image"),
+    tryResolveTier(studioCtx, "web_search"),
+    tryResolveTier(studioCtx, "deep_research"),
   ]);
   const toModel = (r: Awaited<ReturnType<typeof resolveTier>>) => ({
     id: r.modelId,
@@ -324,7 +329,7 @@ type BuildDispatchRequestOutcome =
 /**
  * Pre-flight for the dispatch: membership pre-check + `buildStreamRequest`.
  *
- * Runs as a step so the request payload — including `crypto.randomUUID()`
+ * Runs as a step so the request payload — including the taskId-derived
  * message ids — is recorded in the workflow journal and replay returns the
  * same payload. `runDispatchSteps` is invoked from the workflow body (not
  * here) because its inner steps can't be nested inside another step.
@@ -340,11 +345,11 @@ async function buildDispatchRequestStep(
 ): Promise<BuildDispatchRequestOutcome> {
   const rt = requireRuntime();
 
-  const meshCtx = await rt.meshContextFactory(
+  const studioCtx = await rt.studioContextFactory(
     automation.organization_id,
     automation.created_by,
   );
-  if (!meshCtx) {
+  if (!studioCtx) {
     return { ok: false, reason: "creator membership lost mid-fire" };
   }
 
@@ -353,6 +358,7 @@ async function buildDispatchRequestStep(
     ctx.triggerId,
     taskId,
     resolvedModel,
+    ctx.runMetadata,
   );
   if (ctx.contextMessages && ctx.contextMessages.length > 0) {
     // The dispatch path (`dispatch-run.ts`) persists and forwards only the
@@ -367,9 +373,34 @@ async function buildDispatchRequestStep(
     } else {
       request.messages = [
         ...request.messages,
-        { id: crypto.randomUUID(), role: "user", parts: extraParts },
+        { id: contextMessageId(taskId), role: "user", parts: extraParts },
       ] as typeof request.messages;
     }
+  }
+
+  // Persist the trigger/user turn BEFORE dispatch so it lands with an early
+  // created_at. The projector anchors the assistant reply at
+  // max(existing created_at)+1; without a pre-persisted user turn it can run
+  // before the hosted child's own user-message emit, read no user parts, and
+  // stamp the reply at Date.now() — inverting their order in the UI (reply
+  // first, then the trigger message trailed by "No response was generated").
+  // Idempotent: the child's emit reuses this message id and ON CONFLICT keeps
+  // these rows. Mirrors the task-board path (enqueue-super-agent.ts).
+  const userTurn = request.messages.find((m) => m.role !== "system");
+  if (userTurn) {
+    await new PartEmitter({
+      storage: studioCtx.storage.threads.messageParts(),
+      orgId: automation.organization_id,
+      threadId: taskId,
+      runId: taskId,
+    })
+      .emitRequestMessage(userTurn as AnyMessage)
+      .catch((err) =>
+        console.error(
+          "[fireAutomationWorkflow] request-message pre-persist failed",
+          err,
+        ),
+      );
   }
 
   // Strip the (non-serializable, locally-built) abort signal — the
@@ -378,10 +409,14 @@ async function buildDispatchRequestStep(
   return { ok: true, request: serializableRequest };
 }
 
-async function markRunFailedStep(taskId: string): Promise<void> {
+async function markRunFailedStep(
+  taskId: string,
+  reason?: string,
+  kind?: string,
+): Promise<void> {
   const rt = requireRuntime();
   try {
-    await rt.storage.markRunFailed(taskId);
+    await rt.storage.markRunFailed(taskId, reason, kind);
   } catch {
     // best-effort
   }
@@ -439,18 +474,16 @@ async function fireAutomationWorkflowFn(
     { name: "buildDispatchRequest" },
   );
   if (!built.ok) {
-    await DBOS.runStep(() => markRunFailedStep(taskId), {
+    await DBOS.runStep(() => markRunFailedStep(taskId, built.reason, "setup"), {
       name: "markRunFailed",
     });
     return { taskId, error: built.reason };
   }
 
-  const rt = requireRuntime();
   try {
     await runDispatchSteps({
       threadId: taskId,
       request: built.request,
-      timeoutMs: rt.runTimeoutMs ?? AUTOMATIONS_RUN_TIMEOUT_MS,
       source: "automation",
     });
   } catch (err) {
@@ -462,16 +495,17 @@ async function fireAutomationWorkflowFn(
       await DBOS.runStep(() => deactivateAutomationStep(prep.automation.id), {
         name: "deactivateAutomation",
       });
-      await DBOS.runStep(() => markRunFailedStep(taskId), {
-        name: "markRunFailed",
-      });
+      await DBOS.runStep(
+        () => markRunFailedStep(taskId, runError, "permanent"),
+        { name: "markRunFailed" },
+      );
       return { taskId, error: runError };
     }
     console.error(
       `[fireAutomationWorkflow] ERROR "${prep.automation.name}" taskId=${taskId}:`,
       runError,
     );
-    await DBOS.runStep(() => markRunFailedStep(taskId), {
+    await DBOS.runStep(() => markRunFailedStep(taskId, runError, "error"), {
       name: "markRunFailed",
     });
     return { taskId, error: runError };

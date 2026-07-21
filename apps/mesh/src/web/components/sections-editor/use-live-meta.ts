@@ -1,4 +1,5 @@
 import { type Query, useQuery } from "@tanstack/react-query";
+import { exponentialBackoffWithJitter } from "@decocms/std";
 import { KEYS } from "@/web/lib/query-keys";
 import type { LiveMeta } from "./resolve-schema";
 
@@ -19,13 +20,17 @@ export function useLiveMeta(
       | ((query: Query<LiveMeta>) => number | false | undefined);
   },
 ) {
-  const key = params
-    ? `${params.orgSlug}/${params.virtualMcpId}/${params.branch}/${params.previewUrl ?? ""}`
-    : "";
   const fetchEnabled = options?.fetchEnabled ?? true;
   const previewUrl = params?.previewUrl;
   return useQuery({
-    queryKey: KEYS.liveMeta(key),
+    queryKey: params
+      ? KEYS.liveMeta(
+          params.orgSlug,
+          params.virtualMcpId,
+          params.branch,
+          previewUrl ?? "",
+        )
+      : KEYS.liveMeta(""),
     queryFn: async () => {
       const url = new URL("/live/_meta", previewUrl!).href;
       const res = await fetch(url, { cache: "no-store" });
@@ -45,6 +50,7 @@ export function useLiveMeta(
     // a known-down endpoint and spams 5xx logs.
     retry: (failureCount, error) =>
       (error as { status?: number }).status !== 502 && failureCount < 3,
-    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 5000),
+    retryDelay: (attempt) =>
+      exponentialBackoffWithJitter(5000, 1000, attempt, 2, 0),
   });
 }

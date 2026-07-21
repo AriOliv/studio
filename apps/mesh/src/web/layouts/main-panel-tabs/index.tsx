@@ -11,17 +11,22 @@
 import { Suspense, lazy } from "react";
 import { useMainPanelTabs } from "./use-main-panel-tabs";
 import { SettingsTab } from "./settings-tab";
+import { OverviewTab } from "./overview-tab";
+import { TaskBoardPage } from "@/web/layouts/task-board";
 import { GitTab } from "@/web/components/thread/github/git-tab";
 import { PreviewTab } from "./preview-tab";
+import { CodeTab } from "./code-tab";
 import { ContentTab } from "./content-tab";
 import { AutomationTab } from "./automation-tab";
 import { AutomationsListTab } from "./automations-list-tab";
 import { FileTab } from "./file-tab";
 import { DeckTab } from "./deck-tab";
 import { LibraryFileTab } from "./library-file-tab";
+import { LibraryTab } from "./library-tab";
 import { MainPanelLoading } from "./main-panel-loading";
 import {
   isLegacySettingsTab,
+  parseCodeTabId,
   parseDeckTabId,
   parseFileTabId,
   parseLibraryFileTabId,
@@ -65,6 +70,19 @@ function TabBody({
     throw new Error(`forced tab error: ${activeTab}`);
   }
 
+  if (activeTab === "overview") {
+    return <OverviewTab />;
+  }
+  if (activeTab === "board") {
+    // Task board opened next to chat via the Tasks toggle (`?main=board`).
+    // The main panel already supplies the card chrome, so render the inner
+    // page inside a full-height flex column (mirrors the standalone route).
+    return (
+      <div className="flex h-full min-h-0 flex-col overflow-hidden">
+        <TaskBoardPage />
+      </div>
+    );
+  }
   if (isLegacySettingsTab(activeTab)) {
     return <SettingsTab virtualMcpId={virtualMcpId} />;
   }
@@ -77,8 +95,15 @@ function TabBody({
   if (activeTab === "preview") {
     return <PreviewTab virtualMcpId={virtualMcpId} />;
   }
+  const codeTab = parseCodeTabId(activeTab);
+  if (codeTab) {
+    return <CodeTab openPath={codeTab.path} />;
+  }
   if (activeTab === "content") {
     return <ContentTab virtualMcpId={virtualMcpId} />;
+  }
+  if (activeTab === "files") {
+    return <LibraryTab />;
   }
   if (automationTabParsed) {
     return <AutomationTab tabId={activeTab} />;

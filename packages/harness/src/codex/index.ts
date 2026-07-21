@@ -4,7 +4,7 @@
  *
  * Unlike Decopilot, this harness:
  *  - Does NOT register built-in tools (the CLI manages its own tools and
- *    reaches mesh's MCP endpoint directly).
+ *    reaches studio's MCP endpoint directly).
  *  - Does NOT build a system prompt (the CLI has its own).
  *  - Supports resume: each turn spawns a fresh codex app-server process, but
  *    `resume: input.harness.sessionId` reloads the on-disk thread (the app
@@ -39,6 +39,7 @@ import { streamText, type UIMessageChunk } from "ai";
 import { generateMessageId } from "../message-id";
 import { createCodexModel, resolveCodexModelId } from "./model";
 import { buildCodingWorkspacePrompt } from "../coding-workspace-prompt";
+import { localWorkspaceIsDecoSite } from "../coding-workspace-deco";
 import { effectiveCwd } from "../workspace-cwd";
 import { extractUserText, prepCliMessages } from "../cli-message-prep";
 import { createCliMessageMetadata } from "../cli-stream-metadata";
@@ -48,6 +49,7 @@ import {
 } from "../cli-session-error";
 import { mergeTitleResult, shouldGenerateTitle } from "../title-merge";
 import { buildCurrentContextPrompt } from "../current-context-prompt";
+import { NO_BACKGROUND_TASKS_PROMPT } from "../no-background-tasks-prompt";
 import { genTitle } from "../title-generator";
 import type {
   Harness,
@@ -86,10 +88,18 @@ export function buildCodexDeveloperInstructions(input: {
   now?: Date;
 }): string | undefined {
   const parts = [
-    buildCodingWorkspacePrompt(input.workspace),
+    buildCodingWorkspacePrompt(
+      input.workspace
+        ? {
+            ...input.workspace,
+            isDecoSite: localWorkspaceIsDecoSite(input.workspace.cwd),
+          }
+        : input.workspace,
+    ),
     input.agentInstructions?.trim()
       ? `<agent-instructions>\n${input.agentInstructions.trim()}\n</agent-instructions>`
       : null,
+    NO_BACKGROUND_TASKS_PROMPT,
     buildCurrentContextPrompt(input.now ?? new Date()),
   ].filter((part): part is string => Boolean(part?.trim()));
 
@@ -103,7 +113,7 @@ export const codexHarnessFactory: HarnessFactory = {
       id: "codex",
       async *stream(input: HarnessStreamInput): AsyncIterable<UIMessageChunk> {
         // 1. Resolve the composite `codex:<model>` id to the SDK model
-        //    name (e.g. `gpt-5.4`). Mirrors stream-core line 922.
+        //    name (e.g. `gpt-5.6-terra`). Mirrors stream-core line 922.
         const sdkModelId = resolveCodexModelId(input.models.thinking.id);
 
         // 2. Translate the workspace cwd to an SDK option. `null` means no
@@ -166,14 +176,14 @@ export const codexHarnessFactory: HarnessFactory = {
           const titleSetup = needsTitle
             ? (() => {
                 const { model: titleModel, provider: titleProvider } =
-                  createCodexModel(resolveCodexModelId("codex:gpt-5.4-mini"), {
+                  createCodexModel(resolveCodexModelId("codex:gpt-5.6-luna"), {
                     toolApprovalLevel: "readonly",
                     isPlanMode: true,
                     cwd,
                   });
                 const handle = genTitle({
                   abortSignal: input.signal,
-                  model: titleModel,
+                  models: [() => titleModel],
                   userMessage: extractUserText(messages),
                 });
                 const closed = handle.promise.finally(() =>

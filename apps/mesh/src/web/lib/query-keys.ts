@@ -11,6 +11,10 @@ export const KEYS = {
   // Public config (no auth required)
   publicConfig: () => ["publicConfig"] as const,
 
+  // Polled separately from publicConfig (which is cached forever) to detect
+  // a deployed version newer than the client's own build.
+  appVersionCheck: () => ["appVersionCheck"] as const,
+
   // Auth-related queries
   session: () => ["session"] as const,
 
@@ -33,15 +37,30 @@ export const KEYS = {
   myCapabilities: (locator: ProjectLocator) =>
     [locator, "my-capabilities"] as const,
 
-  // Connections (scoped by project)
-  connections: (locator: ProjectLocator) => [locator, "connections"] as const,
-  connectionsByBinding: (locator: ProjectLocator, binding: string) =>
-    [locator, "connections", `binding:${binding}`] as const,
-  connection: (locator: ProjectLocator, id: string) =>
-    [locator, "connection", id] as const,
+  // Task board items (scoped by org)
+  taskBoardItems: (locator: ProjectLocator) =>
+    [locator, "task-board-items"] as const,
+
+  // A task's linked pull requests (live state fetched from GitHub)
+  taskBoardItemPrs: (locator: ProjectLocator, itemId: string) =>
+    [locator, "task-board-item-prs", itemId] as const,
+
+  homeGithubRecentPrs: (orgId: string, connectionId: string) =>
+    ["home-github-recent-prs", orgId, connectionId] as const,
+
+  homeGithubContributions: (orgId: string, connectionId: string) =>
+    ["home-github-contributions", orgId, connectionId] as const,
+
+  // Authenticated report deck for a scanned domain (/report/:domain).
+  report: (domain: string, key?: string) =>
+    ["report", domain, key ?? ""] as const,
 
   commerceDiscoveryConnection: (orgId: string, connectionId: string) =>
     ["commerce-discovery", "connection", orgId, connectionId] as const,
+  // Owner diagnostic (get_my_diagnostic) polled by the home report banner —
+  // keyed per org + connection so a credential rotation forces a fresh fetch.
+  commerceDiscoveryDiagnostic: (orgId: string, connectionId: string) =>
+    ["commerce-discovery", "diagnostic", orgId, connectionId] as const,
   commerceDiscoveryVirtualMcp: (orgId: string, virtualMcpId: string) =>
     ["commerce-discovery", "virtual-mcp", orgId, virtualMcpId] as const,
 
@@ -49,10 +68,68 @@ export const KEYS = {
   // candidate connections satisfying a binding, and the registry batch).
   commerceDiscoveryCompanionSchema: (orgId: string, connectionId: string) =>
     ["commerce-discovery", "companion-schema", orgId, connectionId] as const,
-  commerceDiscoveryCompanionConnections: (orgId: string) =>
+  commerceDiscoveryCompanionConnections: (orgId: string, key: string) =>
+    ["commerce-discovery", "companion-connections", orgId, key] as const,
+  // Prefix for every companion-connections query in an org, regardless of the
+  // requirements-signature `key`. Use with invalidateQueries to refetch all
+  // variants after a connection is created/linked/updated.
+  commerceDiscoveryCompanionConnectionsPrefix: (orgId: string) =>
     ["commerce-discovery", "companion-connections", orgId] as const,
   commerceDiscoveryCompanionRegistry: (orgId: string, key: string) =>
     ["commerce-discovery", "companion-registry", orgId, key] as const,
+  commerceDiscoveryCompanionOAuthStatus: (
+    orgId: string,
+    connectionId: string,
+  ) =>
+    [
+      "commerce-discovery",
+      "companion-oauth-status",
+      orgId,
+      connectionId,
+    ] as const,
+  commerceDiscoveryCompanionGaProperties: (
+    orgId: string,
+    connectionId: string,
+  ) =>
+    [
+      "commerce-discovery",
+      "companion-ga-properties",
+      orgId,
+      connectionId,
+    ] as const,
+  commerceDiscoveryCompanionGscSites: (orgId: string, connectionId: string) =>
+    ["commerce-discovery", "companion-gsc-sites", orgId, connectionId] as const,
+  // GitHub repo picker: repos matching a server-side search (empty = default
+  // page) for the companion connection. Keyed by query so each search term is
+  // cached independently.
+  commerceDiscoveryCompanionGithubRepos: (
+    orgId: string,
+    connectionId: string,
+    query: string,
+  ) =>
+    [
+      "commerce-discovery",
+      "companion-github-repos",
+      orgId,
+      connectionId,
+      query,
+    ] as const,
+  // The repo currently selected on the Commerce Discovery connection
+  // (github_repo), read once for prefill — independent of the search query.
+  commerceDiscoveryCompanionGithubSelected: (
+    orgId: string,
+    connectionId: string,
+  ) =>
+    [
+      "commerce-discovery",
+      "companion-github-selected",
+      orgId,
+      connectionId,
+    ] as const,
+  // Per-(org, siteUrl) connection status from commerce-discovery — the single
+  // source of truth for "Conectado" across both lanes (OAuth + shared-SA).
+  commerceDiscoveryConnectionStatus: (orgId: string, siteUrl: string) =>
+    ["commerce-discovery", "connection-status", orgId, siteUrl] as const,
 
   connectionActivity: (
     connectionId: string,
@@ -195,6 +272,8 @@ export const KEYS = {
   // Thread queries (scoped by locator)
   threadsInfinite: (locator: string, paramsKey: string) =>
     ["threads", "list-infinite", locator, paramsKey] as const,
+  overviewThreads: (locator: string) =>
+    ["threads", "overview", locator] as const,
   threadMessages: (locator: string, threadId: string) =>
     ["threads", "messages", locator, threadId] as const,
   threadModelLogs: (locator: string, dateKey: string) =>
@@ -352,13 +431,34 @@ export const KEYS = {
   // volume named like the segment can never collide; mutations invalidate it
   // explicitly alongside the volume prefix.
   orgFsRecent: (orgId: string) => ["org-fs-recent", orgId] as const,
+  // Cross-volume path search (Library search box). The root key is the
+  // prefix mutations invalidate; per-query keys nest under it.
+  orgFsSearchRoot: (orgId: string) => ["org-fs-search", orgId] as const,
+  orgFsSearch: (orgId: string, query: string) =>
+    ["org-fs-search", orgId, query] as const,
   // Skill folders (dirs with SKILL.md) across home + public sets — the
   // attachable-skill set for agent knowledge.
   orgFsSkills: (orgId: string) => ["org-fs-skills", orgId] as const,
 
+  // Full skill catalog for the chat "/" picker. Distinct from `orgFsSkills`
+  // (same endpoint, but that caches a stripped {volume,path} shape) — reusing
+  // its key would collide two writers with incompatible payloads.
+  slashSkills: (orgId: string) => ["slash-skills", orgId] as const,
+
   // File picker — objects listed from a configured bucket
-  filePickerObjects: (orgId: string, configId: string | null) =>
-    ["file-picker-objects", orgId, configId] as const,
+  filePickerObjects: (
+    orgId: string,
+    configId: string | null,
+    search?: string,
+    imageOnly?: boolean,
+  ) =>
+    [
+      "file-picker-objects",
+      orgId,
+      configId,
+      search ?? "",
+      imageOnly ?? false,
+    ] as const,
 
   // AI provider credits balance (scoped by org + keyId)
   aiProviderCredits: (orgId: string, keyId: string) =>
@@ -385,6 +485,15 @@ export const KEYS = {
   // Domain lookup (for onboarding — scoped by email domain)
   domainLookup: (domain: string) => ["domain-lookup", domain] as const,
 
+  // Deployment admin dashboard (instance-level, not org-scoped)
+  deploymentAdminMe: () => ["deployment-admin", "me"] as const,
+  deploymentAdminUsers: (search: string) =>
+    ["deployment-admin", "users", search] as const,
+  deploymentAdminOrgs: (search: string) =>
+    ["deployment-admin", "orgs", search] as const,
+  // Prefix key: invalidates every orgs query regardless of the search term.
+  deploymentAdminOrgsList: () => ["deployment-admin", "orgs"] as const,
+
   // Brand context (scoped by organization)
   brandContext: (organizationId: string) =>
     ["brand-context", organizationId] as const,
@@ -403,7 +512,9 @@ export const KEYS = {
 
   // Deco sections editor (sandbox preview)
   decofile: (previewUrl: string) => ["decofile", previewUrl] as const,
-  liveMeta: (previewUrl: string) => ["live-meta", previewUrl] as const,
+  // Variadic so an invalidation call can pass just the org/vmid/branch prefix
+  // and still partial-match the full org/vmid/branch/previewUrl query key.
+  liveMeta: (...parts: string[]) => ["live-meta", ...parts] as const,
   sandboxInvoke: (sandboxKey: string, loaderKey: string) =>
     ["sandbox-invoke", sandboxKey, loaderKey] as const,
   sandboxRepoDir: (orgSlug: string, virtualMcpId: string, branch: string) =>
@@ -447,6 +558,22 @@ export function invalidateVirtualMcpQueries(
         (!orgId || key[1] === orgId) &&
         key[3] === "collection" &&
         key[4] === "VIRTUAL_MCP"
+      );
+    },
+  });
+}
+
+export function invalidateConnectionQueries(
+  queryClient: import("@tanstack/react-query").QueryClient,
+  orgId?: string,
+) {
+  queryClient.invalidateQueries({
+    predicate: (query) => {
+      const key = query.queryKey;
+      return (
+        (!orgId || key[1] === orgId) &&
+        key[3] === "collection" &&
+        key[4] === "CONNECTIONS"
       );
     },
   });

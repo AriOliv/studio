@@ -54,7 +54,7 @@ export class OrgScopedThreadStorage {
   /**
    * Rebind this storage to a different org id.
    * Called by `resolveOrgFromPath` middleware after the org is resolved from
-   * the URL slug — meshContext is constructed eagerly, so when no `x-org-id`
+   * the URL slug — studioContext is constructed eagerly, so when no `x-org-id`
    * header is present the storage starts with `organizationId = undefined`
    * and must be updated in-place once the path-resolved org is known.
    */
@@ -290,6 +290,9 @@ export class SqlThreadStorage implements ThreadStoragePort {
       updated_at: now,
       created_by: data.created_by,
       updated_by: data.updated_by ?? null,
+      ...(data.message_storage_version !== undefined
+        ? { message_storage_version: data.message_storage_version }
+        : {}),
       ...(data.metadata !== undefined
         ? { metadata: JSON.stringify(data.metadata) }
         : {}),
@@ -371,11 +374,20 @@ export class SqlThreadStorage implements ThreadStoragePort {
     if (data.last_progress_at !== undefined) {
       updateData.last_progress_at = data.last_progress_at;
     }
+    if (data.failure_reason !== undefined) {
+      updateData.failure_reason = data.failure_reason;
+    }
+    if (data.failure_kind !== undefined) {
+      updateData.failure_kind = data.failure_kind;
+    }
     if (data.metadata !== undefined) {
       updateData.metadata = JSON.stringify(data.metadata);
     }
     if (data.branch !== undefined) {
       updateData.branch = data.branch;
+    }
+    if (data.virtual_mcp_id !== undefined) {
+      updateData.virtual_mcp_id = data.virtual_mcp_id;
     }
     if (data.sandbox_provider_kind !== undefined) {
       updateData.sandbox_provider_kind = data.sandbox_provider_kind;
@@ -989,6 +1001,7 @@ export class SqlThreadStorage implements ThreadStoragePort {
     run_owner_pod?: string | null;
     run_config?: Record<string, unknown> | null;
     run_started_at?: Date | string | null;
+    last_progress_at?: Date | string | null;
     virtual_mcp_id?: string | null;
     branch?: string | null;
     sandbox_provider_kind?: string | null;
@@ -1031,6 +1044,9 @@ export class SqlThreadStorage implements ThreadStoragePort {
       run_config: row.run_config ?? null,
       run_started_at: row.run_started_at
         ? toIsoString(row.run_started_at)
+        : null,
+      last_progress_at: row.last_progress_at
+        ? toIsoString(row.last_progress_at)
         : null,
       virtual_mcp_id: row.virtual_mcp_id ?? "",
       branch: row.branch ?? null,

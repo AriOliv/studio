@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { resolveSchema, type LiveMeta } from "./resolve-schema";
+import {
+  inferSchemaFromValue,
+  isFreeformPropsSchema,
+  resolveSchema,
+  type LiveMeta,
+} from "./resolve-schema";
 
 function metaWithSchema(blockSchema: Record<string, unknown>): LiveMeta {
   return {
@@ -747,5 +752,654 @@ describe("resolveSchema – @hide on block-ref fields", () => {
     expect(props?.tags?.hidden).toBe(true);
     // sanity: non-hidden field stays visible
     expect(props?.visibleField?.hidden).toBeUndefined();
+  });
+});
+
+describe("resolveSchema – cyclic Section-picker unions (memory blow-up guard)", () => {
+  /**
+   * Builds a `__SECTION_REF__`-style "pick any section" union where every
+   * section carries a `menuSection: Section` field pointing back at the same
+   * union. Before the cycle guard this recursed ~exponentially (depth 8 ×
+   * branching 110 × cyclic re-entry) and blew up the browser (multi-GB).
+   */
+  function cyclicSectionMeta(sectionCount: number): LiveMeta {
+    const definitions: Record<string, unknown> = {};
+    const anyOf: Array<{ $ref: string }> = [];
+
+    for (let i = 0; i < sectionCount; i++) {
+      const rt = `site/sections/S${i}.tsx`;
+      const wrapperKey = `W${i}`;
+      const propsKey = `P${i}`;
+      anyOf.push({ $ref: `#/definitions/${wrapperKey}` });
+      definitions[wrapperKey] = {
+        title: rt,
+        allOf: [{ $ref: `#/definitions/${propsKey}` }],
+        properties: { __resolveType: { type: "string", enum: [rt] } },
+      };
+      definitions[propsKey] = {
+        type: "object",
+        properties: {
+          title: { type: "string", title: "Title" },
+          // back-reference to the same union → cycle
+          menuSection: { $ref: "#/definitions/__SECTION_REF__", title: "Menu" },
+        },
+      };
+    }
+    definitions.__SECTION_REF__ = { title: "Section", anyOf };
+
+    return {
+      manifest: {
+        blocks: {
+          sections: { "site/sections/S0.tsx": { $ref: "#/definitions/W0" } },
+        },
+      },
+      schema: { definitions },
+    };
+  }
+
+  test("resolves a large cyclic section union without blowing up", () => {
+    const meta = cyclicSectionMeta(110);
+    const start = Date.now();
+    const resolved = resolveSchema("site/sections/S0.tsx", meta);
+    const elapsed = Date.now() - start;
+
+    const menu = resolved?.properties?.menuSection;
+    expect(menu?.type).toBe("block-ref");
+    // Option list is still emitted (selector works)…
+    expect(menu?.anyOfRefs?.length).toBe(110);
+    // …but oversized unions are lazy: no eager per-branch schema.
+    expect(menu?.anyOfRefs?.every((r) => r.schema === undefined)).toBe(true);
+    // And it completes basically instantly rather than hanging.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  test("large type-discriminated union keeps eager branch schemas", () => {
+    // Type-discriminated branches (distinguished by a `type` field, no module
+    // __resolveType) have no lazy resolver, so their schemas must stay eager
+    // even when the union exceeds the section-selector threshold.
+    const branchCount = 50;
+    const anyOf = Array.from({ length: branchCount }, (_, i) => ({
+      type: "object",
+      properties: {
+        type: { type: "string", const: `variant-${i}` },
+        label: { type: "string", title: "Label" },
+      },
+    }));
+    const meta = metaWithSchema({
+      type: "object",
+      properties: { card: { anyOf } },
+    });
+
+    const card = resolveSchema("site/sections/Test.tsx", meta)?.properties
+      ?.card;
+    expect(card?.type).toBe("block-ref");
+    expect(card?.discriminatorKey).toBe("type");
+    expect(card?.anyOfRefs?.length).toBe(branchCount);
+    // Every branch keeps its nested fields (no lazy fallback exists).
+    expect(
+      card?.anyOfRefs?.every((r) => r.schema?.properties?.label !== undefined),
+    ).toBe(true);
+  });
+
+  test("small cyclic union still terminates and cuts the cycle", () => {
+    const meta = cyclicSectionMeta(3);
+    const resolved = resolveSchema("site/sections/S0.tsx", meta);
+
+    const menu = resolved?.properties?.menuSection;
+    expect(menu?.type).toBe("block-ref");
+    expect(menu?.anyOfRefs?.length).toBe(3);
+    // Under the eager threshold, branch schemas are materialized one level…
+    const branch = menu?.anyOfRefs?.[0]?.schema;
+    expect(branch?.properties?.title?.type).toBe("string");
+    // …but the branch's own menuSection does NOT re-expand its options
+    // (cycle guard), so recursion stays bounded.
+    const nestedMenu = branch?.properties?.menuSection;
+    expect(nestedMenu?.type).toBe("block-ref");
+    expect(nestedMenu?.anyOfRefs?.every((r) => r.schema === undefined)).toBe(
+      true,
+    );
+  });
+});
+
+describe("resolveSchema – inline object unions (A | B) render as a choice", () => {
+  // Mirrors deco's real output for `(Location | Map)[]`: an anyOf of two
+  // inlined object branches with titles, no $ref / __resolveType / discriminator.
+  const locationMapItems = {
+    anyOf: [
+      {
+        type: "object",
+        title: "Location",
+        properties: {
+          city: { type: "string", title: "City" },
+          regionCode: { type: "string", title: "Region Code" },
+          country: { type: "string", title: "Country" },
+        },
+      },
+      {
+        type: "object",
+        title: "Map",
+        properties: {
+          coordinates: {
+            type: "string",
+            title: "Area selection",
+            format: "map",
+          },
+        },
+      },
+    ],
+  };
+
+  test("Location | Map array item resolves to an inline-union", () => {
+    const meta = metaWithSchema({
+      type: "object",
+      properties: {
+        includeLocations: {
+          type: "array",
+          title: "Include Locations",
+          items: locationMapItems,
+        },
+      },
+    });
+    const items = resolveSchema("site/sections/Test.tsx", meta)?.properties
+      ?.includeLocations?.items;
+    expect(items?.type).toBe("inline-union");
+    const branches = items?.inlineUnionBranches ?? [];
+    expect(branches.map((b) => b.title)).toEqual(["Location", "Map"]);
+    // Map branch keeps its property-level @format (deco drops object-level ones).
+    expect(branches[1]?.schema?.properties?.coordinates?.format).toBe("map");
+    // No const discriminators on either branch.
+    expect(branches[0]?.discriminators).toBeUndefined();
+  });
+
+  test("const-tagged union (name: max-age | stale-while-revalidate) keeps discriminators", () => {
+    const meta = metaWithSchema({
+      type: "object",
+      properties: {
+        directive: {
+          anyOf: [
+            {
+              type: "object",
+              title: "MaxAge",
+              properties: {
+                name: { type: "string", const: "max-age" },
+                value: { type: "number" },
+              },
+            },
+            {
+              type: "object",
+              title: "StaleWhileRevalidate",
+              properties: {
+                name: { type: "string", const: "stale-while-revalidate" },
+                value: { type: "number" },
+              },
+            },
+          ],
+        },
+      },
+    });
+    const directive = resolveSchema("site/sections/Test.tsx", meta)?.properties
+      ?.directive;
+    expect(directive?.type).toBe("inline-union");
+    const branches = directive?.inlineUnionBranches ?? [];
+    expect(branches[0]?.discriminators).toEqual({ name: "max-age" });
+    expect(branches[1]?.discriminators).toEqual({
+      name: "stale-while-revalidate",
+    });
+  });
+
+  test("type-discriminated unions still take the block-ref path (unchanged)", () => {
+    const meta = metaWithSchema({
+      type: "object",
+      properties: {
+        card: {
+          anyOf: [
+            {
+              type: "object",
+              title: "ImageCard",
+              properties: { type: { type: "string", const: "image" } },
+            },
+            {
+              type: "object",
+              title: "TextCard",
+              properties: { type: { type: "string", const: "text" } },
+            },
+          ],
+        },
+      },
+    });
+    const card = resolveSchema("site/sections/Test.tsx", meta)?.properties
+      ?.card;
+    expect(card?.type).toBe("block-ref");
+    expect(card?.discriminatorKey).toBe("type");
+  });
+});
+
+describe("resolveSchema – inline object unions behind $refs (real deco shape)", () => {
+  // deco emits data unions like `(Location | Map)[]` as an anyOf of *$refs* to
+  // bare object defs (no `__resolveType`, no saved-block title, no `type`
+  // discriminator) — NOT as inlined object branches. Before the fix these fell
+  // into the block-ref path, found no resolveType on either branch, dropped both,
+  // and returned an empty block-ref that rendered as `[object Object]`.
+  // deco base64-encodes def keys (they embed a jsdelivr URL), so real refs are
+  // slash-free single-segment keys. Mirror that with plain keys here.
+  function locationMatcherMeta(): LiveMeta {
+    return {
+      manifest: {
+        blocks: {
+          matchers: {
+            "website/matchers/location.ts": {
+              $ref: "#/definitions/LocationMatcher",
+              namespace: "website",
+            },
+          },
+        },
+      },
+      schema: {
+        definitions: {
+          LocationMatcher: {
+            title: "Location",
+            type: "object",
+            allOf: [{ $ref: "#/definitions/LocationProps" }],
+            required: ["__resolveType"],
+            properties: {
+              __resolveType: {
+                type: "string",
+                enum: ["website/matchers/location.ts"],
+                default: "website/matchers/location.ts",
+              },
+            },
+          },
+          LocationProps: {
+            type: "object",
+            properties: {
+              includeLocations: {
+                $ref: "#/definitions/LocationMapArray",
+                title: "Include Locations",
+              },
+            },
+          },
+          LocationMapArray: {
+            type: "array",
+            items: { $ref: "#/definitions/LocationMapUnion" },
+            title: "[Location|Map]",
+          },
+          LocationMapUnion: {
+            anyOf: [
+              { $ref: "#/definitions/LocationBranch" },
+              { $ref: "#/definitions/MapBranch" },
+            ],
+            title: "Location|Map",
+          },
+          LocationBranch: {
+            type: "object",
+            title: "Location",
+            properties: {
+              city: { type: ["string", "null"], title: "City" },
+              regionCode: { type: ["string", "null"], title: "Region Code" },
+              country: { type: ["string", "null"], title: "Country" },
+            },
+          },
+          MapBranch: {
+            type: "object",
+            title: "Map",
+            properties: {
+              coordinates: {
+                $ref: "#/definitions/MapWidget",
+                title: "Area selection",
+              },
+            },
+          },
+          MapWidget: { type: "string", format: "map", title: "MapWidget" },
+        },
+      },
+    };
+  }
+
+  test("(Location | Map)[] with $ref branches resolves to an inline-union", () => {
+    const items = resolveSchema(
+      "website/matchers/location.ts",
+      locationMatcherMeta(),
+    )?.properties?.includeLocations?.items;
+    expect(items?.type).toBe("inline-union");
+    const branches = items?.inlineUnionBranches ?? [];
+    expect(branches.map((b) => b.title)).toEqual(["Location", "Map"]);
+    // Location branch keeps its {city, regionCode, country} fields.
+    expect(Object.keys(branches[0]?.schema?.properties ?? {}).sort()).toEqual([
+      "city",
+      "country",
+      "regionCode",
+    ]);
+    // Map branch keeps its coordinates @format map (deref'd through MapWidget).
+    expect(branches[1]?.schema?.properties?.coordinates?.format).toBe("map");
+    // Plain data branches carry no const discriminators.
+    expect(branches[0]?.discriminators).toBeUndefined();
+    expect(branches[1]?.discriminators).toBeUndefined();
+  });
+});
+
+describe("resolveSchema – inline-union negative cases (paths left untouched)", () => {
+  test("mixed primitive|object union does NOT become inline-union", () => {
+    const meta = metaWithSchema({
+      type: "object",
+      properties: {
+        value: {
+          anyOf: [
+            { type: "string" },
+            {
+              type: "object",
+              title: "Obj",
+              properties: { x: { type: "number" } },
+            },
+          ],
+        },
+      },
+    });
+    const value = resolveSchema("site/sections/Test.tsx", meta)?.properties
+      ?.value;
+    expect(value?.type).not.toBe("inline-union");
+  });
+
+  test("single-element enum acts as a const discriminator", () => {
+    const meta = metaWithSchema({
+      type: "object",
+      properties: {
+        directive: {
+          anyOf: [
+            {
+              type: "object",
+              title: "MaxAge",
+              properties: {
+                name: { type: "string", enum: ["max-age"] },
+                value: { type: "number" },
+              },
+            },
+            {
+              type: "object",
+              title: "NoStore",
+              properties: { name: { type: "string", enum: ["no-store"] } },
+            },
+          ],
+        },
+      },
+    });
+    const directive = resolveSchema("site/sections/Test.tsx", meta)?.properties
+      ?.directive;
+    expect(directive?.type).toBe("inline-union");
+    expect(directive?.inlineUnionBranches?.[0]?.discriminators).toEqual({
+      name: "max-age",
+    });
+  });
+});
+
+describe("resolveSchema – allOf is an intersection, never an inline-union", () => {
+  test("allOf of inline objects merges (does NOT become a selector)", () => {
+    const meta = metaWithSchema({
+      type: "object",
+      properties: {
+        combined: {
+          allOf: [
+            { type: "object", properties: { a: { type: "string" } } },
+            { type: "object", properties: { b: { type: "string" } } },
+          ],
+        },
+      },
+    });
+    const combined = resolveSchema("site/sections/Test.tsx", meta)?.properties
+      ?.combined;
+    expect(combined?.type).not.toBe("inline-union");
+    // merged object exposes both branches' fields
+    expect(combined?.properties?.a).toBeDefined();
+    expect(combined?.properties?.b).toBeDefined();
+  });
+
+  test("boolean const works as a discriminator", () => {
+    const meta = metaWithSchema({
+      type: "object",
+      properties: {
+        toggle: {
+          anyOf: [
+            {
+              type: "object",
+              title: "On",
+              properties: {
+                enabled: { const: true },
+                value: { type: "string" },
+              },
+            },
+            {
+              type: "object",
+              title: "Off",
+              properties: { enabled: { const: false } },
+            },
+          ],
+        },
+      },
+    });
+    const toggle = resolveSchema("site/sections/Test.tsx", meta)?.properties
+      ?.toggle;
+    expect(toggle?.type).toBe("inline-union");
+    expect(toggle?.inlineUnionBranches?.[0]?.discriminators).toEqual({
+      enabled: true,
+    });
+  });
+});
+
+describe("resolveSchema – #/root block-registry refs (recursive matchers)", () => {
+  // Mirrors the /live/_meta shape for the Multi matcher: its `matchers: Matcher[]`
+  // field chains $ref → [Matcher] → Matcher → matchers → #/root/matchers, the
+  // union of every matcher implementation plus saved matcher blocks. Before the
+  // fix, resolveRef only understood #/definitions/… so #/root/matchers resolved
+  // to {} and each array item rendered as an empty object (blank "Item 1").
+  function matcherMeta(): LiveMeta {
+    return {
+      manifest: {
+        blocks: {
+          matchers: {
+            "website/matchers/multi.ts": { $ref: "#/definitions/MultiDef" },
+          },
+        },
+      },
+      schema: {
+        definitions: {
+          MultiDef: {
+            title: "Multi",
+            allOf: [{ $ref: "#/definitions/MultiProps" }],
+            properties: {
+              __resolveType: { enum: ["website/matchers/multi.ts"] },
+            },
+          },
+          MultiProps: {
+            type: "object",
+            required: ["op", "matchers"],
+            properties: {
+              op: { type: "string" },
+              matchers: { $ref: "#/definitions/MatcherArr", title: "Matchers" },
+            },
+          },
+          MatcherArr: {
+            type: "array",
+            items: { $ref: "#/definitions/MatcherRef" },
+            title: "[Matcher]",
+          },
+          MatcherRef: { $ref: "#/definitions/MatcherUnion", title: "Matcher" },
+          MatcherUnion: { $ref: "#/root/matchers", title: "matchers" },
+          Cookie: {
+            title: "Cookie",
+            properties: {
+              __resolveType: { enum: ["website/matchers/cookie.ts"] },
+              name: { type: "string", title: "Name" },
+            },
+          },
+          Resolvable: {},
+        },
+        root: {
+          matchers: {
+            title: "matchers",
+            anyOf: [
+              // fallback saved-block ref, carries no __resolveType — skipped
+              { $ref: "#/definitions/Resolvable" },
+              // built-in module matcher, referenced by $ref
+              { $ref: "#/definitions/Cookie" },
+              // recursion: Multi can nest itself — must not loop forever
+              { $ref: "#/definitions/MultiDef" },
+              // saved matcher block, inlined with a __resolveType enum
+              {
+                title: "#website/matchers/device.ts@Desktop",
+                properties: { __resolveType: { enum: ["Desktop"] } },
+              },
+            ],
+          },
+        },
+      },
+    };
+  }
+
+  test("resolves the nested Matcher array item into a block-ref picker", () => {
+    const items = resolveSchema("website/matchers/multi.ts", matcherMeta())
+      ?.properties?.matchers?.items;
+
+    expect(items?.type).toBe("block-ref");
+    const rts = items?.anyOfRefs?.map((r) => r.resolveType) ?? [];
+    // inline saved block + built-in module matcher + recursive self, in one union
+    expect(rts).toContain("Desktop");
+    expect(rts).toContain("website/matchers/cookie.ts");
+    expect(rts).toContain("website/matchers/multi.ts");
+    // the bare Resolvable fallback (no __resolveType) is not offered as an option
+    expect(rts).not.toContain("Resolvable");
+  });
+
+  test("Resolvable placeholder ($ref branch with no __resolveType enum) is excluded from the picker", () => {
+    // deco-start emits root.matchers as all-$ref branches: Resolvable first,
+    // then concrete matchers. Resolvable has no __resolveType.enum so its `rt`
+    // falls back to the bare ref key ("Resolvable", no "/") — it must be skipped.
+    const it = resolveSchema("website/matchers/multi.ts", matcherMeta())
+      ?.properties?.matchers?.items;
+    const rts = it?.anyOfRefs?.map((r) => r.resolveType) ?? [];
+    expect(rts).not.toContain("Resolvable");
+    expect(rts.length).toBeGreaterThan(0);
+  });
+
+  test("without #/root handling the item would resolve empty (regression guard)", () => {
+    // A #/root ref that does not exist must degrade to {} (empty object), never
+    // throw — matching the old missing-key behavior for unknown registries.
+    const meta = matcherMeta();
+    (meta.schema.root as Record<string, unknown>).matchers = {
+      $ref: "#/root/doesNotExist",
+      title: "matchers",
+    };
+    const items = resolveSchema("website/matchers/multi.ts", meta)?.properties
+      ?.matchers?.items;
+    expect(items?.type).toBe("object");
+    expect(items?.anyOfRefs ?? []).toHaveLength(0);
+  });
+});
+
+describe("isFreeformPropsSchema – tanstack commerce stub detection", () => {
+  const VTEX_PDP = "vtex/loaders/intelligentSearch/productDetailsPage.ts";
+  const meta: LiveMeta = {
+    manifest: {
+      blocks: {
+        loaders: {
+          [VTEX_PDP]: { $ref: "#/definitions/VtexStub" },
+          "vtex/loaders/openApi.ts": { $ref: "#/definitions/OpenStub" },
+          "site/loaders/CheckStock.ts": { $ref: "#/definitions/CheckStock" },
+          "site/loaders/denoNoProps.ts": { $ref: "#/definitions/DenoNoProps" },
+        },
+      },
+    },
+    schema: {
+      definitions: {
+        // The shape tanstack's composeMeta actually emits for commerce/vtex
+        // stubs: `additionalProperties` is dropped, only the self-referential
+        // __resolveType enum survives.
+        VtexStub: {
+          title: VTEX_PDP,
+          type: "object",
+          required: ["__resolveType"],
+          properties: {
+            __resolveType: {
+              type: "string",
+              enum: [VTEX_PDP],
+              default: VTEX_PDP,
+            },
+          },
+        },
+        // Future-proofing: a stub that keeps `additionalProperties: true`.
+        OpenStub: {
+          type: "object",
+          additionalProperties: true,
+          properties: { __resolveType: { type: "string" } },
+        },
+        CheckStock: {
+          type: "object",
+          properties: {
+            __resolveType: {
+              type: "string",
+              enum: ["site/loaders/CheckStock.ts"],
+            },
+            ids: { type: "array", items: { type: "string" } },
+          },
+        },
+        // Deno-style propless def: no __resolveType embedded in props.
+        DenoNoProps: { type: "object" },
+      },
+    },
+  };
+
+  test("flags the tanstack __resolveType-only registry stub", () => {
+    expect(isFreeformPropsSchema(VTEX_PDP, meta)).toBe(true);
+  });
+
+  test("flags additionalProperties stubs with no declared props", () => {
+    expect(isFreeformPropsSchema("vtex/loaders/openApi.ts", meta)).toBe(true);
+  });
+
+  test("a schema with real props is not freeform", () => {
+    expect(isFreeformPropsSchema("site/loaders/CheckStock.ts", meta)).toBe(
+      false,
+    );
+    // Sanity: the real schema resolves a form.
+    expect(
+      resolveSchema("site/loaders/CheckStock.ts", meta)?.properties?.ids?.type,
+    ).toBe("array");
+  });
+
+  test("a deno-style propless def is not freeform", () => {
+    expect(isFreeformPropsSchema("site/loaders/denoNoProps.ts", meta)).toBe(
+      false,
+    );
+  });
+});
+
+describe("inferSchemaFromValue – form from saved props", () => {
+  test("infers primitive, array, and nested object fields", () => {
+    const schema = inferSchemaFromValue({
+      __resolveType: "vtex/loaders/legacy/productListingPage.ts",
+      sort: "OrderByPriceDESC",
+      count: 16,
+      hideUnavailable: true,
+      ids: ["149524", "149525"],
+      nested: { term: "gel", deep: { n: 1 } },
+    });
+    expect(schema?.type).toBe("object");
+    const props = schema?.properties ?? {};
+    // __resolveType is plumbing, never a form field.
+    expect(props.__resolveType).toBeUndefined();
+    expect(props.sort?.type).toBe("string");
+    expect(props.count?.type).toBe("number");
+    expect(props.hideUnavailable?.type).toBe("boolean");
+    expect(props.ids?.type).toBe("array");
+    expect(props.ids?.items?.type).toBe("string");
+    expect(props.nested?.type).toBe("object");
+    expect(props.nested?.properties?.term?.type).toBe("string");
+    expect(props.nested?.properties?.deep?.properties?.n?.type).toBe("number");
+  });
+
+  test("null values degrade to string fields; empty value yields no schema", () => {
+    expect(inferSchemaFromValue({ fq: null })?.properties?.fq?.type).toBe(
+      "string",
+    );
+    expect(inferSchemaFromValue({})).toBeNull();
+    expect(inferSchemaFromValue({ __resolveType: "x" })).toBeNull();
   });
 });

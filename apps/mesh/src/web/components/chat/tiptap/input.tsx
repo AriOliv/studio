@@ -29,7 +29,7 @@ function buildExtensions(placeholderRef: React.RefObject<string | undefined>) {
     Placeholder.configure({
       placeholder: () =>
         placeholderRef.current ??
-        "Ask anything, / for prompts, @ for agents & resources...",
+        "Ask anything, / for prompts & skills, @ for agents & resources...",
       showOnlyWhenEditable: false,
     }),
     MentionNode,
@@ -199,9 +199,14 @@ export function TiptapInput({
         if (voiceText) {
           editor.commands.focus("end");
           const hasBaseline = editor.state.doc.textContent.trim().length > 0;
-          editor.commands.insertContent(
-            hasBaseline ? " " + voiceText : voiceText,
-          );
+          // Insert as a plain-text JSON node, not a string — insertContent
+          // parses string content as HTML, so a transcript containing
+          // tag-like substrings (e.g. "<b>", "<ul><li>") would silently be
+          // reformatted/restructured instead of kept as literal text.
+          editor.commands.insertContent({
+            type: "text",
+            text: hasBaseline ? " " + voiceText : voiceText,
+          });
         }
       },
       restoreContent: (baseline: Metadata["tiptapDoc"]) => {

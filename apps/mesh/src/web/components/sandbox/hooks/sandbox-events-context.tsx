@@ -1,7 +1,7 @@
 /**
- * Single SSE connection to mesh's `/api/:org/sandbox/:virtualMcpId/:branch/events`, fanned out via context.
+ * Single SSE connection to studio's `/api/:org/sandbox/:virtualMcpId/:branch/events`, fanned out via context.
  *
- * Keyed on `(virtualMcpId, branch)` — mesh derives the userId from the
+ * Keyed on `(virtualMcpId, branch)` — studio derives the userId from the
  * authenticated session and composes the same claim handle a racing
  * SANDBOX_START would. The stream emits in two phases on one connection:
  *
@@ -12,7 +12,7 @@
  *      passthrough from the in-pod daemon's `/_sandbox/events`. Types
  *      come from `@decocms/sandbox/shared`.
  *
- *   3. `event: gone` — synthetic. Mesh's upstream daemon fetch returned 404
+ *   3. `event: gone` — synthetic. Studio's upstream daemon fetch returned 404
  *      (sandbox handle missing → operator-evicted on idle TTL). Mapped to
  *      `notFound` which preview.tsx's self-heal flow turns into a SANDBOX_START.
  *
@@ -130,6 +130,21 @@ const DAEMON_EVENT_TYPES: readonly DaemonEventName[] = [
 // `log` is broadcast separately — same SSE stream, different shape.
 const LOG_EVENT = "log" as const;
 
+/** True when `queryKey` is a cached live-meta entry for this org/vmid/branch, regardless of its previewUrl suffix. */
+export function isLiveMetaKeyForScope(
+  queryKey: readonly unknown[],
+  orgSlug: string,
+  virtualMcpId: string,
+  branch: string,
+): boolean {
+  return (
+    queryKey[0] === "live-meta" &&
+    queryKey[1] === orgSlug &&
+    queryKey[2] === virtualMcpId &&
+    queryKey[3] === branch
+  );
+}
+
 export function buildDirectDaemonEventsUrl(
   previewUrl: string | null | undefined,
 ): string | null {
@@ -229,6 +244,7 @@ export function SandboxEventsProvider({
     let reconnectAttempt = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let liveMetaDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+    let decofileDebounceTimer: ReturnType<typeof setTimeout> | null = null;
     let studioEs: EventSource | null = null;
     let directEs: EventSource | null = null;
 
@@ -254,7 +270,7 @@ export function SandboxEventsProvider({
 
     const handleGone = () => {
       // The sandbox is gone (idle-evicted, SANDBOX_DELETE'd, or its pod terminated
-      // and mesh has stopped finding the handle). Everything we've cached is
+      // and studio has stopped finding the handle). Everything we've cached is
       // about to be stale, so reset.
       setNotFound(true);
       setPhase(null);
@@ -358,9 +374,21 @@ export function SandboxEventsProvider({
               payload as DaemonEventPayload<"file-changed">;
             const cacheKey = `${org.slug}/${virtualMcpId}/${branch}`;
             if (filePath.startsWith(".deco/")) {
-              void queryClient.invalidateQueries({
-                queryKey: KEYS.decofile(cacheKey),
-              });
+              // Debounce decofile invalidation for the same reason as liveMeta
+              // below: writing a `.deco/` block emits `file-changed`, but the
+              // dev server needs a moment to rebuild before `/.decofile`
+              // reflects the write. Refetching immediately re-reads the stale
+              // pre-rebuild config and clobbers the optimistic cache update from
+              // useSaveBlock — so a freshly added page variant briefly appears,
+              // then vanishes until a manual reload. Waiting lets the rebuild
+              // land first.
+              if (decofileDebounceTimer) clearTimeout(decofileDebounceTimer);
+              decofileDebounceTimer = setTimeout(() => {
+                decofileDebounceTimer = null;
+                void queryClient.invalidateQueries({
+                  queryKey: KEYS.decofile(cacheKey),
+                });
+              }, 1_000);
             } else {
               // Debounce liveMeta invalidation so the dev server has time to
               // rebuild before we hit /live/_meta. Rapid successive
@@ -369,14 +397,13 @@ export function SandboxEventsProvider({
               liveMetaDebounceTimer = setTimeout(() => {
                 liveMetaDebounceTimer = null;
                 void queryClient.invalidateQueries({
-                  predicate: (query) => {
-                    const key = query.queryKey;
-                    return (
-                      key[0] === "live-meta" &&
-                      typeof key[1] === "string" &&
-                      key[1].startsWith(`${cacheKey}/`)
-                    );
-                  },
+                  predicate: (query) =>
+                    isLiveMetaKeyForScope(
+                      query.queryKey,
+                      org.slug,
+                      virtualMcpId,
+                      branch,
+                    ),
                 });
               }, 1_000);
             }
@@ -501,6 +528,7 @@ export function SandboxEventsProvider({
       directEs?.close();
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (liveMetaDebounceTimer) clearTimeout(liveMetaDebounceTimer);
+      if (decofileDebounceTimer) clearTimeout(decofileDebounceTimer);
     };
   }, [
     virtualMcpId,

@@ -63,7 +63,7 @@ function parsePositiveInteger(raw: unknown): number | undefined {
  * malformed) so callers can branch on it safely.
  */
 export function getRepoScope(connection: {
-  metadata: Record<string, unknown> | null;
+  metadata?: Record<string, unknown> | null;
 }): RepoScopeRecipe | null {
   const raw = connection.metadata?.repoScope as
     | Partial<RepoScopeRecipe>
@@ -106,4 +106,16 @@ export function getOrgGithubConnections<
   T extends { metadata: Record<string, unknown> | null },
 >(connections: T[] | undefined | null): T[] {
   return (connections ?? []).filter((c) => getRepoScope(c) === null);
+}
+
+/**
+ * An org-shared repo connection ("Add repo" in the sidebar): a repo-scoped
+ * child that is deliberately NOT bound to a single agent — it's injected into
+ * every agent's toolset. Distinct from the per-agent import child, which also
+ * has `repoScope` but no `orgShared` flag and stays private to its agent.
+ */
+export function isOrgSharedConnection(connection: {
+  metadata: Record<string, unknown> | null;
+}): boolean {
+  return connection.metadata?.orgShared === true;
 }

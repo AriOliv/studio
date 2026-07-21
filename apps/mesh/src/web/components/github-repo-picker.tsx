@@ -4,7 +4,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@deco/ui/components/dialog.tsx";
-import { Checkbox } from "@deco/ui/components/checkbox.tsx";
 import { CollectionSearch } from "@/web/components/collections/collection-search.tsx";
 import { cn } from "@deco/ui/lib/utils.ts";
 import { Suspense, useDeferredValue, useState } from "react";
@@ -15,13 +14,19 @@ import {
   useQueryClient,
   useSuspenseQuery,
 } from "@tanstack/react-query";
-import { invalidateVirtualMcpQueries } from "@/web/lib/query-keys";
+import {
+  invalidateConnectionQueries,
+  invalidateVirtualMcpQueries,
+} from "@/web/lib/query-keys";
 import {
   useProjectContext,
   useMCPClient,
   useConnections,
+  useConnectionActions,
   SELF_MCP_ALIAS_ID,
 } from "@decocms/mesh-sdk";
+import { Button } from "@deco/ui/components/button.tsx";
+import { authenticateAndPersistOAuth } from "@/web/lib/authenticate-and-persist-oauth";
 import type { ConnectionEntity } from "@decocms/mesh-sdk";
 import { KEYS } from "@/web/lib/query-keys";
 import { toast } from "sonner";
@@ -34,10 +39,6 @@ import {
 import { useAutoInstallGitHub } from "@/web/hooks/use-auto-install-github";
 import { useNavigateToAgent } from "@/web/hooks/use-navigate-to-agent";
 import { GitHubIcon } from "@/web/components/icons/github-icon";
-import {
-  STOREFRONT_GITHUB_AUTOMATIONS,
-  setupStorefrontGithubAutomations,
-} from "@/tools/virtual/storefront-github-automations";
 import { fetchGithubInstallations } from "@/web/lib/github-installations";
 import { getOrgGithubConnections } from "@/shared/github-repo-scope";
 import { provisionRepoScopedGithubConnection } from "@/web/lib/provision-repo-scoped-github-connection";
@@ -68,16 +69,23 @@ export interface GitHubImportPayload {
 export function GitHubRepoPicker({
   open,
   onOpenChange,
-  title = "Import from GitHub",
-  hideAutoRespondCheckbox = false,
+  title,
   onImportComplete,
+  mode = "agent",
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   title?: string;
-  hideAutoRespondCheckbox?: boolean;
   onImportComplete?: (payload: GitHubImportPayload) => void;
+  /**
+   * "agent" (default): pick a repo → provision a repo-scoped connection + a new
+   * agent bound to it. "connection": provision an org-shared repo connection
+   * only (available to every agent), no agent.
+   */
+  mode?: "agent" | "connection";
 }) {
+  const resolvedTitle =
+    title ?? (mode === "connection" ? "Add repo" : "Import from GitHub");
   const [selectedInstallation, setSelectedInstallation] =
     useState<GitHubInstallation | null>(null);
 
@@ -85,7 +93,7 @@ export function GitHubRepoPicker({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[560px] h-[85svh] sm:h-[520px] p-0 gap-0 overflow-hidden flex flex-col">
         <DialogHeader className="sr-only">
-          <DialogTitle>{title}</DialogTitle>
+          <DialogTitle>{resolvedTitle}</DialogTitle>
         </DialogHeader>
         <div className="flex items-center h-12 border-b border-border px-4 gap-3 shrink-0">
           {selectedInstallation ? (
@@ -111,7 +119,7 @@ export function GitHubRepoPicker({
             <>
               <GitHubIcon className="size-4 text-foreground shrink-0" />
               <span className="text-sm font-medium text-foreground">
-                {title}
+                {resolvedTitle}
               </span>
             </>
           )}
@@ -132,8 +140,8 @@ export function GitHubRepoPicker({
               onComplete={() => onOpenChange(false)}
               selectedInstallation={selectedInstallation}
               onSelectInstallation={setSelectedInstallation}
-              hideAutoRespondCheckbox={hideAutoRespondCheckbox}
               onImportComplete={onImportComplete}
+              mode={mode}
             />
           </Suspense>
         </div>
@@ -147,40 +155,21 @@ function PickerContent({
   onComplete,
   selectedInstallation,
   onSelectInstallation,
-  hideAutoRespondCheckbox,
   onImportComplete,
+  mode = "agent",
 }: {
   open: boolean;
   onComplete: () => void;
   selectedInstallation: GitHubInstallation | null;
   onSelectInstallation: (inst: GitHubInstallation | null) => void;
-  hideAutoRespondCheckbox?: boolean;
   onImportComplete?: (payload: GitHubImportPayload) => void;
+  mode?: "agent" | "connection";
 }) {
   const { org } = useProjectContext();
   const queryClient = useQueryClient();
   const navigateToAgent = useNavigateToAgent();
   const [selectedConnection, setSelectedConnection] =
     useState<ConnectionEntity | null>(null);
-  const [autoRespondEnabled, setAutoRespondEnabled] = useState(true);
-  const [selectedAutomationKeys, setSelectedAutomationKeys] = useState<
-    Set<string>
-  >(
-    () =>
-      new Set(
-        STOREFRONT_GITHUB_AUTOMATIONS.filter((s) => s.defaultEnabled).map(
-          (s) => s.key,
-        ),
-      ),
-  );
-  const defaultEnabledKeys = STOREFRONT_GITHUB_AUTOMATIONS.filter(
-    (s) => s.defaultEnabled,
-  ).map((s) => s.key);
-  const effectiveSelectedKeys = hideAutoRespondCheckbox
-    ? new Set(defaultEnabledKeys)
-    : autoRespondEnabled
-      ? selectedAutomationKeys
-      : new Set<string>();
 
   const allGithubConnections = useConnections({ slug: "mcp-github" });
   const orgGithubConnections = getOrgGithubConnections(allGithubConnections);
@@ -262,32 +251,6 @@ function PickerContent({
       });
   };
 
-  const setupGithubAutomations = async ({
-    virtualMcpId,
-    repo,
-    connectionId,
-    selectedKeys,
-  }: {
-    virtualMcpId: string;
-    repo: Repo;
-    connectionId: string;
-    selectedKeys: Set<string>;
-  }) => {
-    const { total, failed } = await setupStorefrontGithubAutomations({
-      githubCallTool: (req) => githubClient.callTool(req),
-      selfCallTool: (req) => selfClient.callTool(req),
-      virtualMcpId,
-      repo,
-      connectionId,
-      selectedKeys,
-    });
-    if (failed > 0) {
-      toast.warning(
-        `Set up ${total - failed}/${total} GitHub automations. Add the rest from the automations view.`,
-      );
-    }
-  };
-
   const importMutation = useMutation({
     mutationFn: async (repo: Repo) => {
       if (!effectiveConnection || !selectedInstallation) {
@@ -295,6 +258,29 @@ function PickerContent({
       }
 
       const installationId = selectedInstallation.installationId;
+
+      // Connection-only ("Add repo"): provision an org-shared repo connection
+      // that every agent can use, then stop — no agent, no automations.
+      if (mode === "connection") {
+        const { childConnectionId } = await provisionRepoScopedGithubConnection(
+          {
+            orgSlug: org.slug,
+            sourceConnection: effectiveConnection,
+            installationId,
+            owner: repo.owner,
+            repo: repo.name,
+            githubCallTool: (req) => githubClient.callTool(req),
+            selfCallTool: (req) => selfClient.callTool(req),
+            orgShared: true,
+          },
+        );
+        return {
+          virtualMcpId: null,
+          repo,
+          connectionId: childConnectionId,
+          item: null,
+        };
+      }
 
       const { childConnectionId } = await provisionRepoScopedGithubConnection({
         orgSlug: org.slug,
@@ -353,21 +339,6 @@ function PickerContent({
         }
         createdAgentId = virtualMcpId;
 
-        // 5. Repoint automations at the per-agent child connection.
-        if (effectiveSelectedKeys.size > 0) {
-          await setupGithubAutomations({
-            virtualMcpId,
-            repo,
-            connectionId: childConnectionId,
-            selectedKeys: effectiveSelectedKeys,
-          }).catch((err) => {
-            console.error("Failed to set up GitHub automations:", err);
-            toast.warning(
-              "Imported repo, but failed to set up GitHub automations. You can add triggers manually from the automations view.",
-            );
-          });
-        }
-
         return {
           virtualMcpId,
           repo,
@@ -396,6 +367,13 @@ function PickerContent({
       }
     },
     onSuccess: ({ virtualMcpId, repo, connectionId, item }) => {
+      if (mode === "connection" || !virtualMcpId || !item) {
+        invalidateVirtualMcpQueries(queryClient, org.id);
+        invalidateConnectionQueries(queryClient, org.id);
+        toast.success(`Added ${repo.name}`);
+        onComplete();
+        return;
+      }
       queryClient.setQueryData(
         KEYS.collectionItem(
           selfClient,
@@ -517,11 +495,6 @@ function PickerContent({
       installation={selectedInstallation}
       onSelectRepo={(repo) => importMutation.mutate(repo)}
       isSaving={importMutation.isPending}
-      autoRespondEnabled={autoRespondEnabled}
-      onAutoRespondChange={setAutoRespondEnabled}
-      selectedAutomationKeys={selectedAutomationKeys}
-      onAutomationKeysChange={setSelectedAutomationKeys}
-      hideAutoRespondCheckbox={hideAutoRespondCheckbox}
     />
   );
 }
@@ -546,11 +519,51 @@ function InstallationPicker({
     orgId,
     orgSlug,
   });
+  const queryClient = useQueryClient();
+  const connectionActions = useConnectionActions();
 
   const installationsQuery = useQuery({
     queryKey: KEYS.githubUserOrgs(orgId, connectionId),
     queryFn: () =>
       fetchGithubInstallations((req) => selfClient.callTool(req), connectionId),
+  });
+
+  // The load failure is usually an expired/revoked GitHub token. Re-run OAuth
+  // for this connection (authenticateAndPersistOAuth no-ops when the token is
+  // still valid, so it doubles as a plain retry), then refetch.
+  const reconnect = useMutation({
+    mutationFn: async () => {
+      const auth = await authenticateAndPersistOAuth({
+        connectionId,
+        orgId,
+        orgSlug,
+        persistFallback: (token) =>
+          connectionActions.update
+            .mutateAsync({
+              id: connectionId,
+              data: { connection_token: token },
+            })
+            .then(() => undefined),
+      });
+      if (auth.ran && !auth.ok) {
+        throw new Error(auth.error ?? "no token received");
+      }
+      const mcpProxyUrl = new URL(
+        `/api/${orgSlug}/mcp/${connectionId}`,
+        window.location.origin,
+      );
+      await queryClient.invalidateQueries({
+        queryKey: KEYS.isMCPAuthenticated(mcpProxyUrl.href, null),
+      });
+      await queryClient.invalidateQueries({ queryKey: KEYS.mcpClientPrefix() });
+      await installationsQuery.refetch();
+    },
+    onError: (err) => {
+      toast.error(
+        "Failed to reconnect GitHub: " +
+          (err instanceof Error ? err.message : "Unknown error"),
+      );
+    },
   });
 
   if (installationsQuery.isLoading) {
@@ -563,10 +576,27 @@ function InstallationPicker({
 
   if (installationsQuery.isError) {
     return (
-      <div className="flex-1 flex items-center justify-center">
+      <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center">
         <p className="text-sm text-destructive">
           Failed to load GitHub accounts
         </p>
+        <p className="text-xs text-muted-foreground max-w-[280px] leading-relaxed">
+          Your GitHub connection may have expired. Reconnect to restore access.
+        </p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => reconnect.mutate()}
+          disabled={reconnect.isPending}
+        >
+          {reconnect.isPending ? (
+            <Loading01 size={14} className="animate-spin" />
+          ) : (
+            <GitHubIcon className="size-3.5" />
+          )}
+          Reconnect GitHub
+        </Button>
       </div>
     );
   }
@@ -647,11 +677,6 @@ function RepoBrowser({
   installation,
   onSelectRepo,
   isSaving,
-  autoRespondEnabled,
-  onAutoRespondChange,
-  selectedAutomationKeys,
-  onAutomationKeysChange,
-  hideAutoRespondCheckbox,
 }: {
   connectionId: string;
   orgId: string;
@@ -659,11 +684,6 @@ function RepoBrowser({
   installation: GitHubInstallation;
   onSelectRepo: (repo: Repo) => void;
   isSaving: boolean;
-  autoRespondEnabled: boolean;
-  onAutoRespondChange: (value: boolean) => void;
-  selectedAutomationKeys: Set<string>;
-  onAutomationKeysChange: (next: Set<string>) => void;
-  hideAutoRespondCheckbox?: boolean;
 }) {
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 300);
@@ -706,45 +726,6 @@ function RepoBrowser({
           />
         </Suspense>
       </div>
-
-      {!hideAutoRespondCheckbox && (
-        <div className="border-t border-border shrink-0">
-          <label className="flex items-center gap-2 px-4 py-3 cursor-pointer select-none">
-            <Checkbox
-              checked={autoRespondEnabled}
-              onCheckedChange={(checked) =>
-                onAutoRespondChange(checked === true)
-              }
-            />
-            <span className="text-xs text-foreground">
-              Set up GitHub automations for this repo
-            </span>
-          </label>
-          {autoRespondEnabled && (
-            <div className="px-4 pb-3 pl-9 flex flex-col gap-1.5">
-              {STOREFRONT_GITHUB_AUTOMATIONS.map((spec) => (
-                <label
-                  key={spec.key}
-                  className="flex items-center gap-2 cursor-pointer select-none"
-                >
-                  <Checkbox
-                    checked={selectedAutomationKeys.has(spec.key)}
-                    onCheckedChange={(checked) => {
-                      const next = new Set(selectedAutomationKeys);
-                      if (checked === true) next.add(spec.key);
-                      else next.delete(spec.key);
-                      onAutomationKeysChange(next);
-                    }}
-                  />
-                  <span className="text-xs text-muted-foreground">
-                    {spec.label}
-                  </span>
-                </label>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }

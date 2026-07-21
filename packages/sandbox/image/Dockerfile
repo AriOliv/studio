@@ -1,7 +1,11 @@
 # Build: docker build -t studio-sandbox:local -f packages/sandbox/image/Dockerfile packages/sandbox
+# Published multi-arch (linux/amd64 + linux/arm64) by
+# .github/workflows/release-studio-sandbox.yaml so sandboxes run natively on
+# arm64 nodes (Apple Silicon, arm64 cloud) as well as amd64.
 FROM oven/bun:1.3.14-debian
 
-ARG NODE_MAJOR=22
+ARG NODE_MAJOR=26
+ARG COREPACK_VERSION=0.35.0
 ARG DENO_VERSION=v1.46.3
 
 # `locales` + generated `en_US.UTF-8` is load-bearing: repos using
@@ -18,6 +22,9 @@ RUN apt-get update \
   && curl -fsSL https://deno.land/install.sh \
        | DENO_INSTALL=/opt/deno sh -s -- -y "${DENO_VERSION}" \
   && ln -s /opt/deno/bin/deno /usr/local/bin/deno \
+  # NodeSource's Node 26 packages no longer ship Corepack.
+  && (command -v corepack >/dev/null 2>&1 \
+       || npm install --global "corepack@${COREPACK_VERSION}") \
   && corepack enable \
   # Corepack fetches the tarballs from npm under the hood; if cloudflare
   # closes the TLS socket mid-stream (UND_ERR_SOCKET in undici) the build
@@ -86,6 +93,12 @@ RUN apt-get update \
   && bun add node-pty@^1.0.0 \
   && find /opt/sandbox-daemon/node_modules/node-pty -name "spawn-helper" -exec chmod +x {} \; \
   && chown -R sandbox:sandbox /opt/sandbox-daemon
+
+# Install the typegen build produced from this exact source revision. Installing
+# from npm here would race the post-merge package release and could bake the
+# previous CLI, which does not discover the materialized endpoint file.
+COPY --chown=sandbox:sandbox daemon/dist/typegen.tgz /opt/sandbox-daemon/typegen.tgz
+RUN npm install -g /opt/sandbox-daemon/typegen.tgz
 
 COPY --chown=sandbox:sandbox daemon/dist/daemon.js /opt/sandbox-daemon/daemon.js
 COPY --chown=sandbox:sandbox image/skills /mnt/skills/public

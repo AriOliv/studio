@@ -46,7 +46,7 @@ export { toServerClient, type MCPProxyClient } from "./mcp-proxy-factory";
 
 // Define Hono variables type
 type Variables = {
-  meshContext: StudioContext;
+  studioContext: StudioContext;
 };
 
 type ProxyEnv = { Variables: Variables };
@@ -108,7 +108,7 @@ export const createProxyRoutes = () => {
    * an iframe `srcDoc` (CSP already injected here).
    */
   app.get("/:connectionId/ui-resource", async (c) => {
-    const ctx = c.get("meshContext");
+    const ctx = c.get("studioContext");
     const connectionId = c.req.param("connectionId");
     const uri = c.req.query("uri");
     if (!uri) return c.json({ error: "uri query param is required" }, 400);
@@ -193,7 +193,7 @@ export const createProxyRoutes = () => {
    */
   app.all("/:connectionId", async (c) => {
     const connectionId = c.req.param("connectionId");
-    const ctx = c.get("meshContext");
+    const ctx = c.get("studioContext");
 
     // SELF MCP connections ({orgId}_self) route to the management MCP server
     // instead of creating an outbound client connection
@@ -489,7 +489,7 @@ export const createProxyRoutes = () => {
   app.all("/:connectionId/call-tool/:toolName", async (c) => {
     const connectionId = c.req.param("connectionId");
     const toolName = c.req.param("toolName");
-    const ctx = c.get("meshContext");
+    const ctx = c.get("studioContext");
 
     try {
       // Fetch connection and create client directly

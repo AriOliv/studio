@@ -2,7 +2,7 @@
  * Agent Icon System
  *
  * Renders agent avatars as colored background + icon, custom image, or
- * deterministic fallback (color + first letter).
+ * deterministic fallback (color + icon).
  *
  * Icon format stored in the `icon` string field:
  *   - "icon://IconName?color=emerald" → colored icon
@@ -257,38 +257,13 @@ function hashString(input: string): number {
 // ---------------------------------------------------------------------------
 
 const SIZES = {
-  "2xs": {
-    container: "w-5 h-5",
-    icon: 12,
-    text: "text-[9px]",
-    radius: "rounded-md",
-  },
-  xs: { container: "w-6 h-6", icon: 14, text: "text-xs", radius: "rounded-md" },
-  sm: { container: "w-8 h-8", icon: 16, text: "text-sm", radius: "rounded-lg" },
-  "sm+": {
-    container: "w-10 h-10",
-    icon: 20,
-    text: "text-base",
-    radius: "rounded-lg",
-  },
-  md: {
-    container: "w-12 h-12",
-    icon: 24,
-    text: "text-xl",
-    radius: "rounded-xl",
-  },
-  lg: {
-    container: "w-16 h-16",
-    icon: 32,
-    text: "text-3xl",
-    radius: "rounded-2xl",
-  },
-  xl: {
-    container: "w-20 h-20",
-    icon: 40,
-    text: "text-4xl",
-    radius: "rounded-2xl",
-  },
+  "2xs": { container: "w-5 h-5", icon: 12, radius: "rounded-md" },
+  xs: { container: "w-6 h-6", icon: 14, radius: "rounded-md" },
+  sm: { container: "w-8 h-8", icon: 16, radius: "rounded-lg" },
+  "sm+": { container: "w-10 h-10", icon: 20, radius: "rounded-lg" },
+  md: { container: "w-12 h-12", icon: 24, radius: "rounded-xl" },
+  lg: { container: "w-16 h-16", icon: 32, radius: "rounded-2xl" },
+  xl: { container: "w-20 h-20", icon: 40, radius: "rounded-2xl" },
 } as const;
 
 export type AgentAvatarSize = keyof typeof SIZES;
@@ -302,6 +277,43 @@ interface AgentAvatarProps {
   name: string;
   size?: AgentAvatarSize;
   className?: string;
+  "aria-label"?: string;
+  role?: string;
+}
+
+/** Colored background + centered icon — shared by all icon-rendering paths. */
+function IconAvatar({
+  Icon,
+  color,
+  size,
+  className,
+  "aria-label": ariaLabel,
+  role,
+}: {
+  Icon: IconComponent;
+  color: AgentIconColor;
+  size: AgentAvatarSize;
+  className?: string;
+  "aria-label"?: string;
+  role?: string;
+}) {
+  const sizeConfig = SIZES[size];
+  return (
+    <div
+      className={cn(
+        sizeConfig.container,
+        sizeConfig.radius,
+        color.bg,
+        color.text,
+        "flex items-center justify-center shrink-0 outline-none ring-0 shadow-none",
+        className,
+      )}
+      aria-label={ariaLabel}
+      role={role}
+    >
+      <Icon size={sizeConfig.icon} />
+    </div>
+  );
 }
 
 export function AgentAvatar({
@@ -309,34 +321,25 @@ export function AgentAvatar({
   name,
   size = "md",
   className,
+  "aria-label": ariaLabel,
+  role,
 }: AgentAvatarProps) {
   const parsed = parseIconString(icon);
-  const sizeConfig = SIZES[size];
 
   if (parsed.type === "icon") {
     const IconComp = getIconComponent(parsed.name);
     const color = getIconColor(parsed.color);
+    const Icon = IconComp ?? getDeterministicIcon(name).IconComp;
 
     return (
-      <div
-        className={cn(
-          sizeConfig.container,
-          sizeConfig.radius,
-          color.bg,
-          color.text,
-          "flex items-center justify-center shrink-0 outline-none ring-0 shadow-none",
-          className,
-        )}
-      >
-        {IconComp ? (
-          <IconComp size={sizeConfig.icon} />
-        ) : (
-          (() => {
-            const { IconComp: Fallback } = getDeterministicIcon(name);
-            return <Fallback size={sizeConfig.icon} />;
-          })()
-        )}
-      </div>
+      <IconAvatar
+        Icon={Icon}
+        color={color}
+        size={size}
+        className={className}
+        aria-label={ariaLabel}
+        role={role}
+      />
     );
   }
 
@@ -348,27 +351,24 @@ export function AgentAvatar({
         name={name}
         size={size}
         className={className}
+        aria-label={ariaLabel}
+        role={role}
       />
     );
   }
 
   // Fallback: deterministic color + icon
-  const { IconComp: FallbackIcon, color: fallbackColor } =
-    getDeterministicIcon(name);
+  const { IconComp, color } = getDeterministicIcon(name);
 
   return (
-    <div
-      className={cn(
-        sizeConfig.container,
-        sizeConfig.radius,
-        fallbackColor.bg,
-        fallbackColor.text,
-        "flex items-center justify-center shrink-0 outline-none ring-0 shadow-none",
-        className,
-      )}
-    >
-      <FallbackIcon size={sizeConfig.icon} />
-    </div>
+    <IconAvatar
+      Icon={IconComp}
+      color={color}
+      size={size}
+      className={className}
+      aria-label={ariaLabel}
+      role={role}
+    />
   );
 }
 
@@ -386,34 +386,32 @@ function AgentAvatarImage({
   name,
   size = "md",
   className,
+  "aria-label": ariaLabel,
+  role,
 }: {
   url: string;
   color?: string;
   name: string;
   size?: AgentAvatarSize;
   className?: string;
+  "aria-label"?: string;
+  role?: string;
 }) {
   const [errored, setErrored] = useState(false);
   const sizeConfig = SIZES[size];
   const bgClass = color ? (URL_COLOR_BG[color] ?? "") : "";
 
   if (errored) {
-    const { IconComp: FallbackIcon, color: fallbackColor } =
-      getDeterministicIcon(name);
-
+    const { IconComp, color } = getDeterministicIcon(name);
     return (
-      <div
-        className={cn(
-          sizeConfig.container,
-          sizeConfig.radius,
-          fallbackColor.bg,
-          fallbackColor.text,
-          "flex items-center justify-center shrink-0 outline-none ring-0 shadow-none",
-          className,
-        )}
-      >
-        <FallbackIcon size={sizeConfig.icon} />
-      </div>
+      <IconAvatar
+        Icon={IconComp}
+        color={color}
+        size={size}
+        className={className}
+        aria-label={ariaLabel}
+        role={role}
+      />
     );
   }
 
@@ -426,6 +424,8 @@ function AgentAvatarImage({
         "shrink-0 overflow-hidden outline-none ring-0 shadow-none",
         className,
       )}
+      aria-label={ariaLabel}
+      role={role}
     >
       <img
         src={url}

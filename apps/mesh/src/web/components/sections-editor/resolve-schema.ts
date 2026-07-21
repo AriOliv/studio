@@ -44,6 +44,18 @@ export interface SchemaProperty {
   }>;
   /** Property used to pick the active union branch (e.g. `type`). */
   discriminatorKey?: string;
+  /**
+   * Branches of an inline object union ("A or B" plain-data union, e.g.
+   * `Location | Map`), present when `type === "inline-union"`. Unlike block-ref
+   * unions these carry no `__resolveType`/`$ref` — the editor picks a branch and
+   * persists a plain object. `discriminators` holds any const-valued fields that
+   * identify the branch (e.g. `{ name: "max-age" }`).
+   */
+  inlineUnionBranches?: Array<{
+    title: string;
+    schema?: SchemaProperty;
+    discriminators?: Record<string, string | number | boolean>;
+  }>;
   /** When true, the field should not be rendered in the form. */
   hidden?: boolean;
   /**
@@ -75,6 +87,17 @@ const MAX_COLLECT_PROPS_DEPTH = 12;
 
 /** Max recursion while building nested field schemas. */
 const MAX_BUILD_PROPERTY_DEPTH = 8;
+
+/**
+ * Above this branch count, a block-ref union (e.g. the `__SECTION_REF__`
+ * "pick any section" selector, which lists every section in the site) is
+ * treated as lazy: we emit the option list but skip materializing each
+ * branch's nested `schema`. The selected branch is resolved on demand via
+ * `resolveSchema()` at selection time, so nothing is lost — and we avoid a
+ * combinatorial blow-up when many of those sections have their own `Section`
+ * field pointing back at the same union.
+ */
+const MAX_ANYOF_EAGER_SCHEMA_BRANCHES = 40;
 
 function isArraySchemaBranch(schema: RawSchema): boolean {
   const t = schema.type;
@@ -245,7 +268,19 @@ export function resolveSchema(
     unknown
   >;
 
+  // deco "block registry" unions live under `#/root/<blockType>` (matchers,
+  // sections, loaders, …) — the anyOf of every implementation plus saved
+  // blocks. These are siblings of `definitions`, so the last-segment lookup
+  // below misses them (`#/root/matchers` → `matchers`, absent from defs → {}).
+  // Recursive block-ref fields (e.g. Multi's `matchers: Matcher[]`) chain into
+  // one of these, so without this branch they resolve to an empty object and
+  // the field renders blank.
+  const root = (globalSchema.root ?? {}) as Record<string, unknown>;
   const resolveRef = (ref: string): RawSchema => {
+    if (ref.startsWith("#/root/")) {
+      const rootKey = ref.slice("#/root/".length);
+      return (root[rootKey] as RawSchema | undefined) ?? {};
+    }
     const key = ref.split("/").pop() ?? "";
     return (defs[key] as RawSchema | undefined) ?? {};
   };
@@ -357,16 +392,58 @@ export function resolveSchema(
    * Converts a raw schema entry into a typed SchemaProperty, resolving
    * nested properties for object types (up to depth 3).
    */
-  const buildProperty = (v: RawSchema, depth = 0): SchemaProperty => {
+  const buildProperty = (
+    v: RawSchema,
+    depth = 0,
+    seen: Set<string> = new Set(),
+  ): SchemaProperty => {
     let resolved = v;
+    let vRefKey: string | undefined;
     if (typeof v.$ref === "string") {
       resolved = resolveRef(v.$ref);
       const refKey = v.$ref.split("/").pop() ?? "";
+      vRefKey = refKey;
       if (refKey === VIDEO_WIDGET_REF_KEY && !resolved.format) {
         resolved = { ...resolved, format: "video-uri" };
       }
     }
     resolved = unwrapRefAliases(resolved);
+
+    // Cycle guard for recursive block-ref unions. The `__SECTION_REF__`
+    // "pick any section" selector lists every section, and 20+ of those
+    // sections themselves have a `Section` field pointing back at the same
+    // union. Without this guard, eagerly materializing each branch's nested
+    // `schema` recurses ~exponentially and blows up browser memory (multi-GB).
+    // When we re-enter a union already on the current path, we still emit the
+    // selector's option list but skip the per-branch nested schema — the UI
+    // resolves the selected branch lazily via resolveSchema().
+    const cyclicUnion = vRefKey !== undefined && seen.has(vRefKey);
+    const unionSeen =
+      vRefKey !== undefined ? new Set([...seen, vRefKey]) : seen;
+
+    /**
+     * Build a union branch's nested schema, unless doing so would recurse into
+     * a cycle or expand an oversized selector. Returns `undefined` in those
+     * cases so the branch is resolved lazily on selection.
+     *
+     * The oversized-union skip only applies when branches are `lazilyResolvable`
+     * — i.e. keyed by a module `__resolveType` that `resolveSchema()` can
+     * re-resolve on selection (section/loader selectors). Type-discriminated
+     * unions (keyed by a `type` discriminator, no module resolveType) have no
+     * lazy fallback, so their branch schemas must stay eager regardless of
+     * count; only the cycle/depth guards apply to them.
+     */
+    const eagerBranchSchema = (
+      branch: RawSchema,
+      branchDepth: number,
+      branchCount: number,
+      lazilyResolvable = true,
+    ): SchemaProperty | undefined =>
+      !cyclicUnion &&
+      (!lazilyResolvable || branchCount <= MAX_ANYOF_EAGER_SCHEMA_BRANCHES) &&
+      branchDepth < MAX_BUILD_PROPERTY_DEPTH
+        ? buildProperty(branch, branchDepth, unionSeen)
+        : undefined;
 
     // Extract enum values from anyOf/oneOf const/enum branches
     let enumFromConsts: unknown[] | undefined;
@@ -476,7 +553,7 @@ export function resolveSchema(
             resolveRef,
           );
           if (isConfigArray && nonNull.length > 1) {
-            const built = buildProperty(arrayBranch, depth + 1);
+            const built = buildProperty(arrayBranch, depth + 1, unionSeen);
             return {
               ...built,
               type: "array",
@@ -491,7 +568,7 @@ export function resolveSchema(
             };
           }
           if (hasPageMultivariateLoader) {
-            const built = buildProperty(arrayBranch, depth + 1);
+            const built = buildProperty(arrayBranch, depth + 1, unionSeen);
             return {
               ...built,
               type: "array",
@@ -508,7 +585,7 @@ export function resolveSchema(
         }
 
         if (loaderBranches.length > 0) {
-          const anyOfRefs = loaderBranches.map((branch) => {
+          const loaderRefs = loaderBranches.map((branch) => {
             const rtSchema = (branch.properties as RawSchema | undefined)
               ?.__resolveType as RawSchema | undefined;
             const rtEnum = (rtSchema?.enum ?? []) as unknown[];
@@ -523,12 +600,62 @@ export function resolveSchema(
                 typeof branch.description === "string"
                   ? branch.description
                   : undefined,
-              schema:
-                depth + 1 < MAX_BUILD_PROPERTY_DEPTH
-                  ? buildProperty(branch, depth + 1)
-                  : undefined,
+              schema: eagerBranchSchema(branch, depth + 1, nonNull.length),
             };
           });
+
+          // Block-registry unions (`#/root/matchers`, etc.) mix inline loader
+          // branches (saved blocks) with `$ref` branches (the built-in module
+          // types). Fold those `$ref` branches in too, otherwise selecting a
+          // Multi matcher only offers saved matchers, not `cookie`/`device`/…
+          // The `Resolvable` fallback ref (no `__resolveType`) is skipped.
+          const refBranchRefs: SchemaAnyOfRef[] = [];
+          for (const branch of nonNull) {
+            if (loaderBranches.includes(branch)) continue;
+            if (typeof branch.$ref !== "string") continue;
+            const def = resolveRef(branch.$ref);
+            let rt: string | undefined;
+            const rtProp = (def.properties as RawSchema | undefined)
+              ?.__resolveType as RawSchema | undefined;
+            if (
+              Array.isArray(rtProp?.enum) &&
+              typeof rtProp.enum[0] === "string"
+            ) {
+              rt = rtProp.enum[0];
+            }
+            if (!rt && Array.isArray(def.allOf)) {
+              for (const part of def.allOf as RawSchema[]) {
+                const e = (
+                  (part.properties as RawSchema | undefined)?.__resolveType as
+                    | RawSchema
+                    | undefined
+                )?.enum;
+                if (Array.isArray(e) && typeof e[0] === "string") {
+                  rt = e[0];
+                  break;
+                }
+              }
+            }
+            if (!rt) continue;
+            refBranchRefs.push({
+              resolveType: rt,
+              title:
+                typeof def.title === "string" && !def.title.startsWith("#")
+                  ? def.title
+                  : labelFromResolveType(rt),
+              description:
+                typeof def.description === "string"
+                  ? def.description
+                  : undefined,
+              schema: eagerBranchSchema(def, depth + 1, nonNull.length),
+            });
+          }
+
+          const seenRt = new Set(loaderRefs.map((r) => r.resolveType));
+          const anyOfRefs = [
+            ...loaderRefs,
+            ...refBranchRefs.filter((r) => !seenRt.has(r.resolveType)),
+          ];
 
           // Preserve the non-loader (plain data) branch so multivariate
           // field rendering can use it instead of the circular block-ref.
@@ -536,9 +663,12 @@ export function resolveSchema(
             (a) => !loaderBranches.includes(a),
           );
           const plainSchema =
-            nonLoaderBranches.length === 1 &&
-            depth + 1 < MAX_BUILD_PROPERTY_DEPTH
-              ? buildProperty(nonLoaderBranches[0]!, depth + 1)
+            nonLoaderBranches.length === 1
+              ? eagerBranchSchema(
+                  nonLoaderBranches[0]!,
+                  depth + 1,
+                  nonNull.length,
+                )
               : undefined;
 
           return {
@@ -576,10 +706,9 @@ export function resolveSchema(
                   ? def.description
                   : undefined,
               discriminatorValue,
-              schema:
-                depth + 1 < MAX_BUILD_PROPERTY_DEPTH
-                  ? buildProperty(def, depth + 1)
-                  : undefined,
+              // Type-discriminated branches have no module resolveType to
+              // re-resolve from, so keep them eager regardless of union size.
+              schema: eagerBranchSchema(def, depth + 1, nonNull.length, false),
             };
           });
           return {
@@ -603,9 +732,58 @@ export function resolveSchema(
           };
         }
 
+        // A union branch is a real module/block (loader, section, saved block)
+        // only when its resolved def carries a `__resolveType` or a saved-block
+        // title. Deco also emits plain *data* unions (e.g. `Location | Map`) as
+        // an anyOf of `$ref`s to bare object defs with none of those — those must
+        // render as an inline branch selector, NOT as a block picker (which would
+        // find no resolveType, drop every branch at the `continue` below, and
+        // return an empty block-ref that renders as `[object Object]`).
+        const branchHasModuleIdentity = (branch: RawSchema): boolean => {
+          const def = resolveBranchDef(branch);
+          if (
+            typeof def.title === "string" &&
+            parseSavedBlockSchemaTitle(def.title)
+          ) {
+            return true;
+          }
+          const rtEnum = (
+            (def.properties as RawSchema | undefined)?.__resolveType as
+              | RawSchema
+              | undefined
+          )?.enum;
+          if (Array.isArray(rtEnum) && typeof rtEnum[0] === "string") {
+            return true;
+          }
+          if (Array.isArray(def.allOf)) {
+            for (const part of def.allOf as RawSchema[]) {
+              const e = (
+                (part.properties as RawSchema | undefined)?.__resolveType as
+                  | RawSchema
+                  | undefined
+              )?.enum;
+              if (Array.isArray(e) && typeof e[0] === "string") return true;
+            }
+          }
+          return false;
+        };
+        // A plain-data union (Location | Map): every branch — inline or behind a
+        // `$ref` — resolves to a bare object with no module identity.
+        const branchIsPlainDataObject = (branch: RawSchema): boolean => {
+          if (branchHasModuleIdentity(branch)) return false;
+          const def = resolveBranchDef(branch);
+          return def.type === "object" || Boolean(def.properties);
+        };
+        const isChoiceUnion =
+          Array.isArray(resolved.anyOf) || Array.isArray(resolved.oneOf);
+        const isPlainDataUnion =
+          isChoiceUnion &&
+          depth < MAX_BUILD_PROPERTY_DEPTH &&
+          nonNull.every(branchIsPlainDataObject);
+
         // All branches are $refs to block/loader defs
         const allRefs = nonNull.every((a) => typeof a.$ref === "string");
-        if (allRefs) {
+        if (allRefs && !isPlainDataUnion) {
           const anyOfRefs: SchemaAnyOfRef[] = [];
           for (const branch of nonNull) {
             const def = resolveRef(branch.$ref as string);
@@ -645,6 +823,10 @@ export function resolveSchema(
               rt = (branch.$ref as string).split("/").pop() ?? "";
             }
             const discriminatorValue = typeDiscriminatorFromBranch(branch);
+            // Skip the `Resolvable` placeholder: it has no `__resolveType.enum`
+            // so `rt` degrades to the bare ref key (no `/`). All real module
+            // blocks (matchers, loaders, sections) contain `/` in their path.
+            if (!discriminatorValue && !rt.includes("/")) continue;
             anyOfRefs.push({
               resolveType: discriminatorValue ?? rt,
               title:
@@ -657,10 +839,7 @@ export function resolveSchema(
                   ? def.description
                   : undefined,
               discriminatorValue,
-              schema:
-                depth + 1 < MAX_BUILD_PROPERTY_DEPTH
-                  ? buildProperty(def, depth + 1)
-                  : undefined,
+              schema: eagerBranchSchema(def, depth + 1, nonNull.length),
             });
           }
           return {
@@ -672,6 +851,74 @@ export function resolveSchema(
                 ? resolved.description
                 : undefined,
             anyOfRefs,
+            hidden:
+              isSchemaHidden(resolved) || isSchemaHidden(v) ? true : undefined,
+          };
+        }
+
+        // Inline object union with no $ref / loader / `type` discriminator: a
+        // plain "A or B" data union (e.g. Location | Map, or a const-tagged
+        // union like StaleWhileRevalidate | MaxAge). Render as a branch selector
+        // instead of merging every branch's fields into a single form.
+        //
+        // Only `anyOf`/`oneOf` are choices — `allOf` is an intersection meant to
+        // MERGE all branches, so it must fall through to the object-merge path.
+        // `isPlainDataUnion` (computed above) already requires a choice union of
+        // bare object branches (inline or behind a `$ref`) with no module
+        // identity — exactly the `Location | Map` / const-tagged-union shape.
+        if (isPlainDataUnion) {
+          const constValue = (
+            p: RawSchema,
+          ): string | number | boolean | undefined => {
+            if (
+              typeof p.const === "string" ||
+              typeof p.const === "number" ||
+              typeof p.const === "boolean"
+            ) {
+              return p.const;
+            }
+            if (
+              Array.isArray(p.enum) &&
+              p.enum.length === 1 &&
+              (typeof p.enum[0] === "string" ||
+                typeof p.enum[0] === "number" ||
+                typeof p.enum[0] === "boolean")
+            ) {
+              return p.enum[0];
+            }
+            return undefined;
+          };
+          const inlineUnionBranches = nonNull.map((branch, index) => {
+            const branchProps =
+              (resolveBranchDef(branch).properties as RawSchema | undefined) ??
+              {};
+            const discriminators: Record<string, string | number | boolean> =
+              {};
+            for (const [key, prop] of Object.entries(branchProps)) {
+              const cv = constValue(prop as RawSchema);
+              if (cv !== undefined) discriminators[key] = cv;
+            }
+            return {
+              title: branchTitle(branch, `Option ${index + 1}`),
+              schema: buildProperty(branch, depth + 1),
+              discriminators: Object.keys(discriminators).length
+                ? discriminators
+                : undefined,
+            };
+          });
+          return {
+            type: "inline-union",
+            title:
+              typeof v.title === "string"
+                ? v.title
+                : typeof resolved.title === "string"
+                  ? resolved.title
+                  : undefined,
+            description:
+              typeof resolved.description === "string"
+                ? resolved.description
+                : undefined,
+            inlineUnionBranches,
             hidden:
               isSchemaHidden(resolved) || isSchemaHidden(v) ? true : undefined,
           };
@@ -697,7 +944,11 @@ export function resolveSchema(
       if (nestedEntries.length > 0) {
         nestedProperties = {};
         for (const [k, raw] of nestedEntries) {
-          nestedProperties[k] = buildProperty(raw as RawSchema, depth + 1);
+          nestedProperties[k] = buildProperty(
+            raw as RawSchema,
+            depth + 1,
+            unionSeen,
+          );
         }
       }
     }
@@ -713,7 +964,7 @@ export function resolveSchema(
         if (typeof rawItems.$ref === "string") {
           rawItems = resolveRef(rawItems.$ref);
         }
-        itemsSchema = buildProperty(rawItems, depth + 1);
+        itemsSchema = buildProperty(rawItems, depth + 1, unionSeen);
         if (
           typeof rawItems.title === "string" &&
           rawItems.title.includes("{{")
@@ -796,11 +1047,101 @@ export function resolveSchema(
   };
 }
 
+/**
+ * Whether a block's schema is a "freeform props" stub — the block DOES take
+ * props but doesn't publish their schema, so `resolveSchema()` returns null.
+ * Tanstack's `registerCommerceLoaders` registers every commerce/vtex loader
+ * and action with a `{ additionalProperties: true }` props schema, and its
+ * meta composer drops `additionalProperties` on the way out — the emitted def
+ * is just `{ properties: { __resolveType: { enum: [<key>] } } }`. Detect both
+ * shapes so the runnable editor can offer the raw JSON editor instead of
+ * claiming the block takes no input. Deno/fresh defs never embed a
+ * self-referential `__resolveType` in a block's props schema, so this is a
+ * no-op there.
+ */
+export function isFreeformPropsSchema(
+  resolveType: string,
+  meta: LiveMeta,
+): boolean {
+  const globalSchema = meta.schema ?? {};
+  const blockSchema = lookupManifestBlockSchema(resolveType, meta);
+  const defs = (globalSchema.$defs ?? globalSchema.definitions ?? {}) as Record<
+    string,
+    RawSchema
+  >;
+  const resolved =
+    typeof blockSchema.$ref === "string"
+      ? (defs[blockSchema.$ref.split("/").pop() ?? ""] ?? {})
+      : blockSchema;
+
+  const props = (resolved.properties as Record<string, RawSchema>) ?? {};
+  const hasVisibleProps = Object.keys(props).some(
+    (key) => !key.startsWith("__"),
+  );
+  if (hasVisibleProps) return false;
+
+  if (resolved.additionalProperties === true) return true;
+
+  // Tanstack registry-stub signature: the only property is the block's own
+  // `__resolveType` enum.
+  const resolveTypeProp = props.__resolveType;
+  return (
+    !!resolveTypeProp &&
+    Array.isArray(resolveTypeProp.enum) &&
+    resolveTypeProp.enum[0] === resolveType
+  );
+}
+
+/**
+ * Best-effort schema inferred from a concrete props value. Used by the
+ * runnable editor when a block doesn't publish its props schema (tanstack
+ * commerce/vtex registry stubs — see {@link isFreeformPropsSchema}) but a
+ * saved block carries values: a typed form built from those values beats a
+ * raw JSON dead-end. Only shapes present in the value are inferable; enums,
+ * formats, and optional fields the value doesn't carry are unknowable.
+ */
+export function inferSchemaFromValue(
+  value: Record<string, unknown>,
+): SchemaProperty | null {
+  const inferOne = (v: unknown): SchemaProperty => {
+    switch (typeof v) {
+      case "number":
+        return { type: "number" };
+      case "boolean":
+        return { type: "boolean" };
+      case "object": {
+        if (v === null) return { type: "string" };
+        if (Array.isArray(v)) {
+          return { type: "array", items: inferOne(v[0]) };
+        }
+        const nested: Record<string, SchemaProperty> = {};
+        for (const [key, item] of Object.entries(v)) {
+          if (key.startsWith("__")) continue;
+          nested[key] = inferOne(item);
+        }
+        return { type: "object", properties: nested };
+      }
+      default:
+        return { type: "string" };
+    }
+  };
+
+  const properties: Record<string, SchemaProperty> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key.startsWith("__")) continue;
+    properties[key] = inferOne(item);
+  }
+  if (Object.keys(properties).length === 0) return null;
+  return { type: "object", properties };
+}
+
 export interface BlockSchemaMetadata {
   title?: string;
   description?: string;
   icon?: string;
   logo?: string;
+  /** Block marked hidden from pickers (deco `@ignore` / `hide` convention). */
+  hidden?: boolean;
 }
 
 /**
@@ -827,6 +1168,14 @@ export function resolveBlockSchemaMetadata(
 
   const icon = (resolved as { icon?: string }).icon;
   const logo = (resolved as { logo?: string }).logo;
+  const flags = resolved as {
+    hide?: unknown;
+    ignore?: unknown;
+    unlisted?: unknown;
+  };
+  const truthy = (v: unknown) => v === true || v === "true";
+  const hidden =
+    truthy(flags.hide) || truthy(flags.ignore) || truthy(flags.unlisted);
 
   return {
     title: typeof resolved.title === "string" ? resolved.title : undefined,
@@ -836,5 +1185,6 @@ export function resolveBlockSchemaMetadata(
         : undefined,
     icon: typeof icon === "string" ? icon : undefined,
     logo: typeof logo === "string" ? logo : undefined,
+    hidden: hidden || undefined,
   };
 }

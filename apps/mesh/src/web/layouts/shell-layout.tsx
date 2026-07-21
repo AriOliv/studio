@@ -3,6 +3,7 @@ import { OrgAccessGate } from "@/web/components/org-access-gate";
 import { SplashScreen } from "@/web/components/splash-screen";
 import { FloatingReleaseCard } from "@/web/components/release-channel/floating-release-card";
 import { KeyboardShortcutsDialog } from "@/web/components/keyboard-shortcuts-dialog";
+import { VersionCheckDialog } from "@/web/components/version-check-dialog";
 import { isModKey } from "@/web/lib/keyboard-shortcuts";
 import RequiredAuthLayout from "@/web/layouts/required-auth-layout";
 import { authClient } from "@/web/lib/auth-client";
@@ -23,12 +24,17 @@ import {
   useMatch,
   useNavigate,
   useParams,
+  useRouter,
   useSearch,
 } from "@tanstack/react-router";
 import { KEYS } from "../lib/query-keys";
 import { readCachedTaskBranch } from "../lib/read-cached-task-branch";
 import { useOptionalThreadManager } from "@/web/components/chat/store/hooks";
-import { isPerThreadTab } from "@/web/layouts/main-panel-tabs/tab-id";
+import { resolveTaskSwitchSearch } from "@/web/layouts/resolve-task-switch-search";
+import {
+  readThreadLayout,
+  saveThreadLayout,
+} from "@/web/lib/thread-layout-memory";
 import { useOrganizationSettingsNonBlocking } from "../hooks/use-organization-settings";
 import { homeNextActionsQueryOptions } from "../hooks/use-home-next-actions";
 import { useOrgSsoStatus } from "../hooks/use-org-sso";
@@ -88,7 +94,11 @@ export function usePanelActions() {
     org?: string;
     taskId?: string;
   };
-  const search = useSearch({ strict: false }) as { virtualmcpid?: string };
+  const search = useSearch({ strict: false }) as {
+    virtualmcpid?: string;
+    main?: string | 0;
+    sidepanel?: "chat" | 0;
+  };
   const orgSlug = params.org ?? "";
   const currentTaskId = params.taskId ?? "";
 
@@ -109,42 +119,42 @@ export function usePanelActions() {
     replace = true,
   ) => navWith(currentTaskId, searchFn, replace);
 
-  const setChatOpen = (open: boolean) =>
-    nav((prev) => ({ ...prev, chat: open ? 1 : 0 }));
+  const openSidePanel = (sidePanel: "chat") =>
+    nav((prev) => ({ ...prev, sidepanel: sidePanel }));
 
   const setTaskId = (
     id: string,
     virtualMcpId?: string,
     opts?: { autosend?: boolean; main?: string },
-  ) =>
-    navWith(
+  ) => {
+    const isSameThread = !!currentTaskId && currentTaskId === id;
+    // Remember the layout of the thread we're leaving so returning to it
+    // restores the same tabs/side-panel instead of the agent default.
+    if (currentTaskId && !isSameThread) {
+      saveThreadLayout(currentTaskId, {
+        main: search.main,
+        sidepanel: search.sidepanel,
+      });
+    }
+    // Restore the target thread's own remembered layout (null when unseen this
+    // session, or when re-selecting the current thread — then keep its URL).
+    const savedLayout = isSameThread ? null : readThreadLayout(id);
+    const decopilotId = getWellKnownDecopilotVirtualMCP(org.id).id;
+
+    return navWith(
       id,
-      (prev) => {
-        const next: Record<string, unknown> = { chat: 1 };
-        if (virtualMcpId) next.virtualmcpid = virtualMcpId;
-        else if (prev.virtualmcpid) next.virtualmcpid = prev.virtualmcpid;
-        // Explicit main tab takes priority (e.g. home tile → pinned view).
-        if (opts?.main) {
-          next.main = opts.main;
-        } else {
-          // Preserve system-level panel tabs (git, preview, settings, …) across
-          // thread switches, but drop per-thread tabs (expanded tool views,
-          // web-page previews, automation details) that are specific to the
-          // previous task.
-          const prevMain = prev.main;
-          if (
-            prevMain &&
-            typeof prevMain === "string" &&
-            !isPerThreadTab(prevMain)
-          ) {
-            next.main = prevMain;
-          }
-        }
-        if (opts?.autosend) next.autosend = AUTOSEND_QUERY_VALUE;
-        return next;
-      },
+      (prev) =>
+        resolveTaskSwitchSearch({
+          prev: prev as { virtualmcpid?: unknown; main?: unknown },
+          virtualMcpId,
+          decopilotId,
+          savedLayout,
+          opts,
+          autosendValue: AUTOSEND_QUERY_VALUE,
+        }),
       false,
     );
+  };
 
   // Create a new task carrying the current task's branch (if any) so the
   // new thread lands on the same warm sandbox. Server picks from sandboxMap when
@@ -188,23 +198,11 @@ export function usePanelActions() {
       main: tabId,
     }));
 
-  const toggleMain = () =>
-    nav((prev) => {
-      const isOpen = prev.main !== undefined && prev.main !== "0";
-      if (isOpen) {
-        return { ...prev, main: "0" };
-      }
-      const next: Record<string, unknown> = { ...prev };
-      delete next.main;
-      return next;
-    });
-
   return {
-    setChatOpen,
+    openSidePanel,
     setTaskId,
     createNewTask,
     openTab,
-    toggleMain,
   };
 }
 
@@ -218,6 +216,7 @@ function ShellLayoutContent() {
   const org = orgMatch?.params.org;
   const { taskId } = useParams({ strict: false }) as { taskId?: string };
   const [shortcutsDialogOpen, setShortcutsDialogOpen] = useState(false);
+  const router = useRouter();
 
   useQuery({
     ...homeNextActionsQueryOptions(org ?? ""),
@@ -230,17 +229,29 @@ function ShellLayoutContent() {
   const userId = session?.user?.id;
   const cachedOrg = org && userId ? readCachedOrg(userId, org) : null;
 
-  // oxlint-disable-next-line ban-use-effect/ban-use-effect — subscribes to document keydown for ⌘K shortcuts dialog; DOM event listener has no React 19 alternative
+  // oxlint-disable-next-line ban-use-effect/ban-use-effect — subscribes to document keydown for ⌘K / ⌘[ shortcuts; DOM event listener has no React 19 alternative
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent) => {
       if (isModKey(e) && e.code === "KeyK") {
         e.preventDefault();
         setShortcutsDialogOpen(true);
+        return;
+      }
+      // ⌘[ / Ctrl+[ — back to the previous thread. Own the chord (preventDefault)
+      // so it uses SPA history instead of a full browser navigation; skip when
+      // there's nothing to go back to so cold entry doesn't leave the app.
+      if (
+        isModKey(e) &&
+        e.code === "BracketLeft" &&
+        router.history.canGoBack()
+      ) {
+        e.preventDefault();
+        router.history.back();
       }
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, []);
+  }, [router]);
 
   const { data: activeOrg } = useSuspenseQuery({
     queryKey: KEYS.activeOrganization(org),
@@ -361,6 +372,8 @@ function ShellLayoutContent() {
         open={shortcutsDialogOpen}
         onOpenChange={setShortcutsDialogOpen}
       />
+
+      <VersionCheckDialog />
     </ShellProjectProvider>
   );
 }

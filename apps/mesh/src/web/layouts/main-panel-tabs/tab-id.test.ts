@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  FIXED_SYSTEM_TABS,
+  formatCodeTabId,
   formatDeckTabId,
   formatFileTabId,
   formatLibraryFileTabId,
+  parseCodeTabId,
   isLegacySettingsTab,
   isPerThreadTab,
   parseAutomationTabId,
@@ -255,9 +258,10 @@ describe("resolveActiveTabAndOpen", () => {
   });
 
   test("?main=0 → closed, tab = default", () => {
-    expect(resolveActiveTabAndOpen({ mainParam: "0", metadata: meta })).toEqual(
-      { mainOpen: false, activeTab: "analytics" },
-    );
+    expect(resolveActiveTabAndOpen({ mainParam: 0, metadata: meta })).toEqual({
+      mainOpen: false,
+      activeTab: "analytics",
+    });
   });
 
   test("?main=settings → open, tab = 'settings'", () => {
@@ -301,14 +305,14 @@ describe("resolveActiveTabAndOpen", () => {
 });
 
 describe("resolveTabClickTarget", () => {
-  test("clicking active tab while panel open → close ('0')", () => {
+  test("clicking active tab while panel open → close (0)", () => {
     expect(
       resolveTabClickTarget({
         clickedId: "settings",
         activeTab: "settings",
         mainOpen: true,
       }),
-    ).toBe("0");
+    ).toBe(0);
   });
 
   test("clicking non-active tab while panel open → clicked id", () => {
@@ -405,13 +409,13 @@ describe("resolveAutomationsPillClickTarget", () => {
     ).toBe("automations");
   });
 
-  test("on list while panel open → close ('0')", () => {
+  test("on list while panel open → close (0)", () => {
     expect(
       resolveAutomationsPillClickTarget({
         activeTab: "automations",
         mainOpen: true,
       }),
-    ).toBe("0");
+    ).toBe(0);
   });
 
   test("on unrelated tab → open list", () => {
@@ -421,5 +425,35 @@ describe("resolveAutomationsPillClickTarget", () => {
         mainOpen: true,
       }),
     ).toBe("automations");
+  });
+});
+
+describe("code tab id", () => {
+  test("keeps Blocks out of the fixed system tabs", () => {
+    expect(FIXED_SYSTEM_TABS).not.toContain("blocks");
+    expect(FIXED_SYSTEM_TABS).toContain("code");
+  });
+
+  test("parses the bare code id as a null path", () => {
+    expect(parseCodeTabId("code")).toEqual({ path: null });
+  });
+
+  test("round-trips a code path with slashes", () => {
+    const id = formatCodeTabId(".deco/blocks/pages-Home.json");
+    expect(id).toBe("code:.deco%2Fblocks%2Fpages-Home.json");
+    expect(parseCodeTabId(id)).toEqual({
+      path: ".deco/blocks/pages-Home.json",
+    });
+  });
+
+  test("returns null for non-code ids", () => {
+    expect(parseCodeTabId("preview")).toBeNull();
+    expect(parseCodeTabId(undefined)).toBeNull();
+    expect(parseCodeTabId("codex")).toBeNull();
+  });
+
+  test("an open code path is per-thread (scoped to the task's sandbox/branch), but the bare tab is not", () => {
+    expect(isPerThreadTab(formatCodeTabId("src/index.ts"))).toBe(true);
+    expect(isPerThreadTab("code")).toBe(false);
   });
 });

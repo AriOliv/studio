@@ -99,6 +99,8 @@ export function useThreadActions() {
     hide: m.hide.bind(m),
     setStatus: m.setStatus.bind(m),
     setBranch: m.setBranch.bind(m),
+    setAgent: m.setAgent.bind(m),
+    setScope: m.setScope.bind(m),
     setActive: m.setActive.bind(m),
     closeActive: m.closeActive.bind(m),
   };

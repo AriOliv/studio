@@ -15,6 +15,18 @@
   body {
     @apply bg-background text-foreground;
   }
+  /* Prevent iOS from zooming on input focus */
+  input,
+  select,
+  textarea {
+    font-size: max(1rem, 16px);
+  }
+  /* Larger base text on mobile — text-sm (0.875rem) → ~16px instead of 14px */
+  @media (max-width: 768px) {
+    html {
+      font-size: 18.3px;
+    }
+  }
   svg {
     stroke-width: 1.75;
   }
@@ -40,6 +52,15 @@
     /* Match the OS title-bar strip height so close/min/max buttons line up
        vertically with the header's icon buttons. Overrides Tailwind's h-12
        (3rem) for the WCO case only. */
+    height: env(titlebar-area-height, 3rem);
+  }
+  /* On desktop the sidebar — not the toolbar — owns the top-left corner where
+     the OS window controls (macOS traffic lights) overlay sits, so its header
+     reserves the same left inset. Left-only: the sidebar isn't full width, so
+     the 100vw right inset .app-titlebar uses doesn't apply. max() keeps the
+     header's default px-2 gutter when there's no OS inset. */
+  .sidebar-titlebar {
+    padding-left: max(env(titlebar-area-x, 0), 0.5rem);
     height: env(titlebar-area-height, 3rem);
   }
   .wco-drag {

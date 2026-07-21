@@ -4,6 +4,7 @@ import path from "node:path";
 import { appendCoAuthorTrailer } from "../../git-co-author";
 import { gitSync as rawGitSync } from "./git-sync";
 import { parsePorcelainEntry } from "./porcelain";
+import { protectedBranches } from "./protect-branch";
 import { assertValidRemoteBranchName } from "./ref-name";
 import type { OperatorIdentity } from "../types";
 
@@ -327,6 +328,14 @@ function rebaseOntoBaseInner(
   if (!branch || branch === "HEAD") {
     throw new Error("Cannot rebase from a detached HEAD");
   }
+  // Same guard as publish() (protect-branch.ts): this ends in a force-push,
+  // which is even more destructive than a normal push, so a sandbox sitting
+  // on main/master/default must never reach it.
+  if (protectedBranches(repoDir).has(branch)) {
+    throw new Error(
+      `Refusing to rebase and force-push protected branch "${branch}" from a sandbox. Work on a feature branch; changes reach the default branch via PR.`,
+    );
+  }
 
   runGit(repoDir, ["fetch", "-p", "origin", base, branch]);
   const leaseSha = remoteBranchSha(repoDir, branch);
@@ -348,7 +357,13 @@ function rebaseOntoBaseInner(
   commitBeforeRebase(repoDir, operator);
 
   try {
-    runGit(repoDir, ["rebase", "-X", "theirs", upstream]);
+    // --autostash: the sandbox dev server keeps regenerating tracked files
+    // (e.g. src/server/cms/blocks.gen.json, .deco/blocks/*.json). It can dirty
+    // the working tree in the window between commitBeforeRebase and the rebase's
+    // internal checkout, which otherwise aborts with "Your local changes would
+    // be overwritten by checkout / could not detach HEAD". Autostash stashes
+    // that churn, runs the rebase, and restores it afterwards.
+    runGit(repoDir, ["rebase", "--autostash", "-X", "theirs", upstream]);
   } catch (err) {
     if (!isRebaseInProgress(repoDir)) {
       throw err;

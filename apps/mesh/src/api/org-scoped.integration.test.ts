@@ -139,7 +139,12 @@ describe("org-scoped API coexistence", () => {
     logSpy?.mockRestore();
     logSpy = undefined;
     vi.restoreAllMocks();
-    await closeTestPgDatabase(database);
+    if (app) {
+      await app.shutdown();
+    }
+    if (database) {
+      await closeTestPgDatabase(database);
+    }
   });
 
   it("new path serves the route AND does NOT log deprecation", async () => {
@@ -355,7 +360,7 @@ describe("org-scoped API coexistence", () => {
     // /.well-known/oauth-protected-resource/api/:org/mcp/:connectionId — this
     // path lives at the *root* (the well-known prefix is anchored there), not
     // under the /api/:org sub-app. Without a top-level mount the SDK gets a
-    // 404 here and falls back to treating the mesh root as the auth server,
+    // 404 here and falls back to treating the studio root as the auth server,
     // breaking every OAuth-gated MCP (GitHub import-from-repo, Cursor, etc.).
 
     // Mock the origin: well-known endpoints 404, but the initialize probe

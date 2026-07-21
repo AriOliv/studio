@@ -1,8 +1,11 @@
 import type { ComponentType, SVGProps } from "react";
 import {
+  Code02,
   Edit05,
+  Folder,
   GitBranch01,
   Globe01,
+  Home02,
   LayoutAlt04,
   Lightning01,
 } from "@untitledui/icons";
@@ -18,18 +21,24 @@ export type TabIcon =
   | { kind: "fallback" };
 
 export type SystemTabId =
+  | "overview"
   | "settings"
   | "automations"
   | "preview"
+  | "code"
   | "content"
-  | "git";
+  | "git"
+  | "files";
 
 export const SYSTEM_TAB_ICONS: Record<SystemTabId, IconComponent> = {
+  overview: Home02,
   settings: LayoutAlt04,
   automations: Lightning01,
   preview: Globe01,
+  code: Code02,
   content: Edit05,
   git: GitBranch01,
+  files: Folder,
 };
 
 type ConnectionLike = { id: string; icon: string | null };

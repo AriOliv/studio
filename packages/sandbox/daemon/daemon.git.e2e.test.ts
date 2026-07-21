@@ -5,6 +5,9 @@
  * against a local bare git repo (file:// — hermetic, no network) and waits for
  * the setup orchestrator to drain. Black-box throughout (see helpers).
  */
+import { execSync } from "node:child_process";
+import { chmodSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
 import {
@@ -144,6 +147,59 @@ describe("daemon e2e: git (cloned repo)", () => {
     expect(res.status).toBe(200);
     expect(((await res.json()) as { pushed: boolean }).pushed).toBe(true);
   });
+
+  it("POST /git/publish pushes past a failing pre-push hook", async () => {
+    // A repo's own pre-push hook must never block the sync: the shutdown
+    // publish shares this path and can't wait out a hanging/failing hook before
+    // the pod's grace period elapses and SIGKILL drops the unsynced work. The
+    // push runs --no-verify, so a hook that would abort the push is skipped.
+    const hook = join(d.appDir, "repo", ".git", "hooks", "pre-push");
+    writeFileSync(hook, "#!/bin/sh\nexit 1\n");
+    chmodSync(hook, 0o755);
+
+    await writeRepoFile(d, "past-hook.txt", "survived the hook\n");
+    const res = await fetch(url(d, "/_sandbox/git/publish"), {
+      method: "POST",
+      headers: jsonAuthHeaders(),
+      body: toBody({ message: "publish past a failing hook" }),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { pushed: boolean }).pushed).toBe(true);
+  });
+
+  // Windows Node can't deliver a catchable SIGTERM — kill("SIGTERM") tears the
+  // process down abruptly, so the shutdown handler never runs. Graceful
+  // termination is a POSIX/k8s concern (the daemon runs on Linux in prod).
+  it.skipIf(process.platform === "win32")(
+    "SIGTERM triggers a graceful publish to origin before exit",
+    async () => {
+      await writeRepoFile(d, "graceful.txt", "saved on shutdown\n");
+
+      // origin has no `sandbox-work` branch until the shutdown publish pushes.
+      const remoteRef = () =>
+        execSync(`git ls-remote ${repo.url} refs/heads/sandbox-work`, {
+          encoding: "utf8",
+        }).trim();
+      expect(remoteRef()).toBe("");
+
+      // Real OS signal — the same SIGTERM k8s delivers on a spot drain / node
+      // eviction (~120s grace). shutdown() must commit + push before exit(0),
+      // or the user's in-progress work dies with the pod.
+      const start = Date.now();
+      const exited = new Promise<void>((resolve) =>
+        d.proc.once("exit", () => resolve()),
+      );
+      d.proc.kill("SIGTERM");
+      await exited;
+      const elapsedMs = Date.now() - start;
+
+      // Well under the graceful-termination budget; a local push is ~instant.
+      expect(elapsedMs).toBeLessThan(30_000);
+      // The change reached origin — work survived the pod dying.
+      expect(remoteRef()).not.toBe("");
+    },
+    SETUP_TIMEOUT_MS,
+  );
 });
 
 // --- setup routes ------------------------------------------------------------

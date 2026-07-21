@@ -1,12 +1,12 @@
 /**
- * MCP Mesh Server Entry Point
+ * Studio Server Entry Point
  *
  * Bundled server entry point for production.
  * Start with: bun run index.js
  * Or: bun run src/index.ts
  */
 
-import { sleep } from "@decocms/std";
+import { retry, sleep } from "@decocms/std";
 // Side-effect-free queue names — safe to import before DBOS.setConfig (unlike
 // the workflow modules, which register workflows at import time).
 import {
@@ -17,6 +17,7 @@ import {
 } from "./dispatch-queue/queue-names";
 import { buildDbosConfig } from "./dbos/config";
 import { getSettings } from "./settings";
+import { resolveShutdownDrainMs } from "./settings/resolve-config";
 import { initObservability } from "./observability";
 import { startProfiling } from "./observability/profiling";
 
@@ -30,14 +31,14 @@ const settings = getSettings();
 // ensures every `meter.createX()` call hits the real MeterProvider.
 initObservability();
 
-// DBOS shares mesh's Postgres database and owns the `dbos` schema. Sharing
+// DBOS shares studio's Postgres database and owns the `dbos` schema. Sharing
 // the DB (vs. a sibling one) is what lets future workflow-ified CRUD
-// commit mesh writes and DBOS step-output records in a single transaction
+// commit studio writes and DBOS step-output records in a single transaction
 // via a DBOS data source. The `dbos` schema is auto-created on launch.
 // setConfig must run before any module registers workflows; launch happens
 // after the app graph is loaded so all DBOS.registerWorkflow calls are in.
-const { DBOS } = await import("@dbos-inc/dbos-sdk");
-// DBOS uses its own pg client (separate from mesh's pool), so the `sslmode`
+const { DBOS, DBOSClient } = await import("@dbos-inc/dbos-sdk");
+// DBOS uses its own pg client (separate from studio's pool), so the `sslmode`
 // must travel in the URL. RDS's pg_hba.conf rejects unencrypted connections
 // with `no pg_hba.conf entry for host ... no encryption` when this is missing.
 // Use `verify-full` explicitly: pg-connection-string v2 silently upgrades
@@ -140,7 +141,7 @@ function withSecurityHeaders(res: Response): Response {
 
 // Sandbox preview reverse-proxy (agent-sandbox only). The base domain is parsed at
 // boot from STUDIO_SANDBOX_PREVIEW_URL_PATTERN; null disables the proxy and
-// preview-host requests fall through to the normal mesh routing (which 404s
+// preview-host requests fall through to the normal studio routing (which 404s
 // because nothing matches). The Bun-level WS handler is registered
 // unconditionally — when previewBaseDomain is null, no upgrade path runs it.
 const {
@@ -167,7 +168,7 @@ const previewProxyDeps = {
 // Create the Hono app (any DBOS.registerWorkflow calls happen during this
 // import chain). Launch DBOS afterwards so the registry is sealed before
 // the executor starts dequeueing workflows.
-const app = await createApp();
+const app = await createApp({ clientDir });
 // Conductor opt-in via env (SDK defaults conductorURL to wss://cloud.dbos.dev/...).
 const conductorKey = process.env.DBOS_CONDUCTOR_KEY?.trim();
 const conductorURL = process.env.DBOS_CONDUCTOR_URL?.trim();
@@ -182,8 +183,34 @@ await DBOS.launch({
 console.log(`[dbos] application version: ${DBOS.applicationVersion}`);
 // Post-launch DBOS setup (queue registration, schedule reconciliation).
 // Must run after launch because registerQueue / listSchedules require an
-// initialized executor.
-await app.initDbos();
+// initialized executor. Retry: registerQueue + reconcile are idempotent, so a
+// transient boot-time DB connect timeout (shared RDS under connection pressure)
+// retries instead of exiting the process — otherwise one blip crash-loops every
+// pod at once.
+const initDbosMaxAttempts = 5;
+let initDbosAttempt = 0;
+await retry(
+  async () => {
+    initDbosAttempt++;
+    try {
+      return await app.initDbos();
+    } catch (error) {
+      const outcome =
+        initDbosAttempt >= initDbosMaxAttempts ? "giving up" : "retrying";
+      console.warn(
+        `[dbos] initDbos attempt ${initDbosAttempt}/${initDbosMaxAttempts} failed, ${outcome}`,
+        error,
+      );
+      throw error;
+    }
+  },
+  {
+    maxAttempts: initDbosMaxAttempts,
+    minTimeout: 1000,
+    maxTimeout: 10_000,
+    jitter: 0.5,
+  },
+);
 
 // When running via CLI, the calling script handles its own banner/config output
 if (!settings.isCli) {
@@ -202,7 +229,7 @@ const server = Bun.serve({
   fetch: async (request, server) => {
     // Sandbox preview proxy: matched by Host header. Runs *before* assets
     // and the Hono app so a `<handle>.preview.<base>` request never hits
-    // mesh's static-file handler (which would 404 on the dev server's
+    // studio's static-file handler (which would 404 on the dev server's
     // bundle paths). WS upgrades short-circuit Bun.serve's fetch by
     // returning undefined; HTTP returns a Response.
     if (previewBaseDomain) {
@@ -310,6 +337,90 @@ if (settings.localMode) {
 
 let shuttingDown = false;
 
+/**
+ * Hand off this executor's in-flight thread-gate gates so a live pod adopts
+ * them, instead of leaving them PENDING on this (dying) executor forever.
+ *
+ * WHY THIS EXISTS. The thread-gate queue is `concurrency=1` per thread
+ * partition; a `threadGateWorkflow` holds that slot the whole time it is
+ * PENDING. When a rolling deploy replaces this pod mid-run, `DBOS.shutdown()`
+ * just stops the executor and walks away — the in-flight gate is left PENDING
+ * on a now-dead `executor_id`. Nothing re-adopts it: self-recovery only covers
+ * an executor's OWN id (new pods have new ids), and the external Conductor is
+ * observed NOT to recover gracefully-deregistered executors (their orphans sit
+ * PENDING indefinitely). That stranded PENDING head blocks the partition, so
+ * every later message on the thread piles up ENQUEUED and never runs — the
+ * thread is bricked until someone cancels the head by hand.
+ *
+ * The fix: on the way out, flip our own in-flight gates PENDING → ENQUEUED
+ * (`resumeWorkflows`, which preserves the DBOS journal and the queue partition
+ * key). A live executor's queue poller then re-dispatches each gate and it
+ * REPLAYS from the journal: the already-recorded `trackMessageStarted` and
+ * `dispatchRunAndWait` steps return their cached outputs, so it resumes right
+ * at `consumeRunProjection` — no work redone, no double dispatch, for the
+ * overwhelming common case where dispatch had already completed. (Edge: if the
+ * pod died mid-`dispatchRunAndWait`, replay re-runs it; the work-item publish
+ * is idempotent on the persisted `runFenceToken`, so a redelivery collapses
+ * rather than opening a second daemon run.)
+ *
+ * Runs AFTER `DBOS.shutdown()` on purpose: once this executor's queue poller is
+ * stopped, a re-enqueued gate can only be claimed by a LIVE executor, so we
+ * can't re-grab (and re-orphan) our own gates in a shutdown race. Uses a
+ * standalone `DBOSClient` (its own sysdb connection) because studio's DBOS
+ * executor is already torn down at this point.
+ *
+ * Best-effort: any failure is logged and swallowed so shutdown still completes.
+ * Only covers GRACEFUL termination — a hard SIGKILL (OOM, node loss) skips this
+ * handler, and those orphans still need Conductor recovery or a sweep.
+ *
+ * `executorId` MUST be the real runtime executor id (`DBOS.executorID`),
+ * captured by the caller BEFORE `DBOS.shutdown()`. Two gotchas make this
+ * non-obvious: (1) when a Conductor is configured (as in prod/stg) DBOS
+ * IGNORES the `executorID` we pass to `setConfig` and substitutes a random
+ * UUID (`dbos.js` "Always use a generated executor ID in Conductor"), so
+ * `settings.podName` never matches the `executor_id` stored on our rows; and
+ * (2) `DBOS.shutdown()` resets `DBOS.executorID` back to `'local'`, so reading
+ * it after shutdown would filter on the wrong id. Filtering on the wrong id
+ * silently matches zero gates and the handoff no-ops (the original bug).
+ */
+async function handOffInFlightThreadGates(executorId: string) {
+  let client: Awaited<ReturnType<typeof DBOSClient.create>> | undefined;
+  try {
+    client = await DBOSClient.create({
+      systemDatabaseUrl: withSslmode(
+        settings.databaseUrl,
+        settings.databasePgSsl,
+      ),
+      systemDatabaseSchemaName: "dbos",
+    });
+    const orphaned = await client.listWorkflows({
+      status: "PENDING",
+      queueName: THREAD_GATE_QUEUE,
+      executorId,
+      loadInput: false,
+      loadOutput: false,
+    });
+    // Always log the count (even 0) so the handoff is observable — a silent
+    // early-return is exactly what hid the executor-id filter bug the first time.
+    if (orphaned.length === 0) {
+      console.log(
+        `[shutdown] no in-flight thread-gate gates to hand off (executor ${executorId})`,
+      );
+      return;
+    }
+    const ids = orphaned.map((w) => w.workflowID);
+    await client.resumeWorkflows(ids, { queueName: THREAD_GATE_QUEUE });
+    console.log(
+      `[shutdown] re-enqueued ${ids.length} in-flight thread-gate gate(s) for re-adoption by a live executor (from ${executorId}):`,
+      ids,
+    );
+  } catch (err) {
+    console.error("[shutdown] thread-gate handoff failed:", err);
+  } finally {
+    await client?.destroy().catch(() => {});
+  }
+}
+
 async function gracefulShutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -342,8 +453,10 @@ async function gracefulShutdown(signal: string) {
     //    connections to a dead socket -> CF 520 during rollout. Stay under the
     //    force-exit timer (derived from terminationGracePeriodSeconds above) so
     //    it never trips before drain completes.
-    const drainMs = Number(
-      process.env.SHUTDOWN_DRAIN_MS ?? Math.floor(forceExitMs * 0.6),
+    const drainMs = resolveShutdownDrainMs(
+      settings.dispatchRole,
+      forceExitMs,
+      process.env.SHUTDOWN_DRAIN_MS,
     );
     await sleep(drainMs);
 
@@ -351,8 +464,18 @@ async function gracefulShutdown(signal: string) {
     //    graceful drain indefinitely).
     await server.stop(true);
 
-    // Drain DBOS before app.shutdown closes mesh's pg pool — in-flight steps use it.
+    // Capture the REAL executor id before DBOS.shutdown() resets it to 'local'.
+    // With a Conductor configured this is a random UUID (NOT settings.podName),
+    // and it's what our workflow rows are stamped with. See
+    // handOffInFlightThreadGates for why this matters.
+    const executorId = DBOS.executorID;
+    // Drain DBOS before app.shutdown closes studio's pg pool — in-flight steps use it.
     await DBOS.shutdown();
+    // Re-enqueue our own in-flight thread-gate gates so a live pod adopts them
+    // instead of stranding them PENDING on this dead executor (which bricks the
+    // thread). Runs after DBOS.shutdown() so our stopped poller can't re-grab
+    // them. See handOffInFlightThreadGates for the full rationale.
+    await handOffInFlightThreadGates(executorId);
     await app.shutdown();
   } catch (err) {
     console.error("[shutdown] Error during shutdown:", err);

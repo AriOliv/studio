@@ -4,7 +4,7 @@
  *
  * Unlike Decopilot, this harness:
  *  - Does NOT register built-in tools (the CLI manages its own tools and
- *    reaches mesh's MCP endpoint directly).
+ *    reaches studio's MCP endpoint directly).
  *  - Does NOT build a Decopilot-style system prompt or tool catalog; it only
  *    appends CLI-safe workspace/instruction context through the SDK's
  *    `systemPrompt` preset.
@@ -37,7 +37,9 @@ import { effectiveCwd } from "../workspace-cwd";
 import { extractUserText, prepCliMessages } from "../cli-message-prep";
 import { createCliMessageMetadata } from "../cli-stream-metadata";
 import { buildCodingWorkspacePrompt } from "../coding-workspace-prompt";
+import { localWorkspaceIsDecoSite } from "../coding-workspace-deco";
 import { buildCurrentContextPrompt } from "../current-context-prompt";
+import { NO_BACKGROUND_TASKS_PROMPT } from "../no-background-tasks-prompt";
 import { mergeTitleResult, shouldGenerateTitle } from "../title-merge";
 import { genTitle } from "../title-generator";
 import { stringifyError } from "../stream-error";
@@ -82,10 +84,18 @@ export function buildClaudeCodeSystemPrompt(input: {
   now?: Date;
 }) {
   const parts = [
-    buildCodingWorkspacePrompt(input.workspace),
+    buildCodingWorkspacePrompt(
+      input.workspace
+        ? {
+            ...input.workspace,
+            isDecoSite: localWorkspaceIsDecoSite(input.workspace.cwd),
+          }
+        : input.workspace,
+    ),
     input.agentInstructions?.trim()
       ? `<agent-instructions>\n${input.agentInstructions.trim()}\n</agent-instructions>`
       : null,
+    NO_BACKGROUND_TASKS_PROMPT,
     buildCurrentContextPrompt(input.now ?? new Date()),
   ].filter((part): part is string => Boolean(part?.trim()));
 
@@ -159,14 +169,17 @@ export const claudeCodeHarnessFactory: HarnessFactory = {
         const titleHandle = needsTitle
           ? genTitle({
               abortSignal: input.signal,
-              model: createClaudeCodeModel(
-                resolveClaudeCodeModelId("claude-code:haiku"),
-                {
-                  toolApprovalLevel: "readonly",
-                  isPlanMode: true,
-                  cwd,
-                },
-              ),
+              models: [
+                () =>
+                  createClaudeCodeModel(
+                    resolveClaudeCodeModelId("claude-code:haiku"),
+                    {
+                      toolApprovalLevel: "readonly",
+                      isPlanMode: true,
+                      cwd,
+                    },
+                  ),
+              ],
               userMessage: extractUserText(messages),
             })
           : null;

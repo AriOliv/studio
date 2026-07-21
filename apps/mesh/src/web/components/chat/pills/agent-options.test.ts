@@ -7,6 +7,8 @@ import {
   type AgentPins,
   agentOptionFor,
   agentOptionIsAvailable,
+  preferredLocalAgentOption,
+  resolveOfflineAgentOption,
 } from "./agent-options";
 
 const ALL_AVAILABLE: AgentOptionAvailability = {
@@ -32,10 +34,11 @@ describe("agentOptionFor", () => {
     expect(agentOptionFor("decopilot", "cluster")).toBe("decopilot");
   });
 
-  test("maps decopilot harness with user-desktop sandbox to decopilot-desktop option", () => {
-    expect(agentOptionFor("decopilot", "user-desktop")).toBe(
-      "decopilot-desktop",
-    );
+  test("decopilot harness with user-desktop sandbox has no option (retired)", () => {
+    // "local decopilot" was removed — the cloud router is the only decopilot
+    // runtime. A legacy thread persisted with this pair maps to no known
+    // option and is treated as locked-unknown.
+    expect(agentOptionFor("decopilot", "user-desktop")).toBeNull();
   });
 
   test("maps legacy decopilot harness with null sandbox to decopilot option", () => {
@@ -85,12 +88,6 @@ describe("agentOptionIsAvailable", () => {
   });
 
   test("desktop options require the link to be online", () => {
-    expect(agentOptionIsAvailable("decopilot-desktop", ALL_AVAILABLE)).toBe(
-      true,
-    );
-    expect(agentOptionIsAvailable("decopilot-desktop", DESKTOP_OFFLINE)).toBe(
-      false,
-    );
     expect(agentOptionIsAvailable("claude-code-desktop", DESKTOP_OFFLINE)).toBe(
       false,
     );
@@ -115,5 +112,56 @@ describe("agentOptionIsAvailable", () => {
         codex: false,
       }),
     ).toBe(false);
+  });
+});
+
+describe("preferredLocalAgentOption", () => {
+  test("Claude Code wins when both CLIs are present", () => {
+    expect(preferredLocalAgentOption(ALL_AVAILABLE)).toBe(
+      "claude-code-desktop",
+    );
+  });
+
+  test("falls back to Codex when only Codex is present", () => {
+    expect(
+      preferredLocalAgentOption({ ...ALL_AVAILABLE, claudeCode: false }),
+    ).toBe("codex-desktop");
+  });
+
+  test("null when no local CLI is available", () => {
+    expect(
+      preferredLocalAgentOption({
+        ...ALL_AVAILABLE,
+        claudeCode: false,
+        codex: false,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("resolveOfflineAgentOption", () => {
+  test("auto-switches a desktop pick to cloud when the link is offline", () => {
+    expect(resolveOfflineAgentOption("claude-code-desktop", true)).toBe(
+      "decopilot",
+    );
+    expect(resolveOfflineAgentOption("codex-desktop", true)).toBe("decopilot");
+  });
+
+  test("keeps the desktop pick while the link is online (or unresolved)", () => {
+    // The old behavior: a desktop pick is preserved exactly. It must only be
+    // overridden on a *confirmed* offline probe, never the unresolved default.
+    expect(resolveOfflineAgentOption("claude-code-desktop", false)).toBe(
+      "claude-code-desktop",
+    );
+    expect(resolveOfflineAgentOption("codex-desktop", false)).toBe(
+      "codex-desktop",
+    );
+  });
+
+  test("leaves cloud and null picks untouched regardless of link state", () => {
+    expect(resolveOfflineAgentOption("decopilot", true)).toBe("decopilot");
+    expect(resolveOfflineAgentOption("decopilot", false)).toBe("decopilot");
+    expect(resolveOfflineAgentOption(null, true)).toBeNull();
+    expect(resolveOfflineAgentOption(null, false)).toBeNull();
   });
 });

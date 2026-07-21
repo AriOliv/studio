@@ -719,9 +719,7 @@ function ConnectionInspectorViewContent() {
         name: t.name,
         description: t.description,
         inputSchema: t.inputSchema as Record<string, unknown> | undefined,
-        outputSchema: (t as any).outputSchema as
-          | Record<string, unknown>
-          | undefined,
+        outputSchema: t.outputSchema as Record<string, unknown> | undefined,
         annotations: t.annotations,
         _meta: t._meta as Record<string, unknown> | undefined,
       }))
@@ -729,10 +727,8 @@ function ConnectionInspectorViewContent() {
         name: t.name,
         description: t.description,
         inputSchema: t.inputSchema as Record<string, unknown> | undefined,
-        outputSchema: (t as any).outputSchema as
-          | Record<string, unknown>
-          | undefined,
-        annotations: (t as any).annotations,
+        outputSchema: t.outputSchema as Record<string, unknown> | undefined,
+        annotations: t.annotations,
         _meta: t._meta as Record<string, unknown> | undefined,
       }));
 

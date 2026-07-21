@@ -4,6 +4,7 @@ import {
   breadcrumbPathForActiveField,
   breadcrumbsForHeaderClick,
   buildArrayDrillDownBreadcrumb,
+  consumedBreadcrumbPrefix,
   fieldDisplayLabel,
   findBreadcrumbLabelIndex,
   isArrayDrillDownField,
@@ -271,10 +272,52 @@ describe("isArrayDrillDownField", () => {
 });
 
 describe("buildArrayDrillDownBreadcrumb", () => {
-  test("includes array label before item label", () => {
+  test("omits the array label — drills straight from section to item", () => {
+    // The array is an implementation detail (its list is shown inline in the
+    // parent); the breadcrumb jumps straight to the item so there's no
+    // redundant "list only" crumb to click back through.
     expect(
       buildArrayDrillDownBreadcrumb([], "Flag Desconto", "Partiu ferias"),
-    ).toEqual(["Flag Desconto", "Partiu ferias"]);
+    ).toEqual(["Partiu ferias"]);
+  });
+
+  test("keeps the array label to disambiguate an item labelled like the array", () => {
+    // Item label == array label (e.g. label driven by `alt`): keep the array
+    // crumb so breadcrumbPathForActiveField can tell the two levels apart.
+    expect(buildArrayDrillDownBreadcrumb([], "Banner", "Banner")).toEqual([
+      "Banner",
+      "Banner",
+    ]);
+  });
+
+  test("keeps the array label to disambiguate an item labelled like the array KEY", () => {
+    // Item label == array's property key: breadcrumbPathForActiveField strips a
+    // head crumb matching the key too, so the array crumb must be kept.
+    expect(
+      buildArrayDrillDownBreadcrumb([], "Products", "items", {
+        arrayKey: "items",
+      }),
+    ).toEqual(["Products", "items"]);
+  });
+
+  test("keeps the array label when a sibling array/drill-down field exists", () => {
+    // A bare [itemLabel] trail can't say WHICH sibling array the item belongs to
+    // (two label-less arrays both fall back to "Item N"), so keep the array
+    // label as a disambiguator when siblings are present.
+    expect(
+      buildArrayDrillDownBreadcrumb([], "Logos", "Item 1", {
+        hasSiblingDrillDownFields: true,
+      }),
+    ).toEqual(["Logos", "Item 1"]);
+  });
+
+  test("omits the array label when it is the sole drill-down field in scope", () => {
+    expect(
+      buildArrayDrillDownBreadcrumb([], "Images", "Item 1", {
+        arrayKey: "images",
+        hasSiblingDrillDownFields: false,
+      }),
+    ).toEqual(["Item 1"]);
   });
 
   test("does not duplicate crumbs already in trail", () => {
@@ -285,6 +328,65 @@ describe("buildArrayDrillDownBreadcrumb", () => {
         "Partiu ferias",
       ),
     ).toEqual(["Flag Desconto", "Partiu ferias"]);
+  });
+
+  test("nested drill-down stays free of array labels (no doubled crumb)", () => {
+    // Opening an item inside an already-open item appends only the new item
+    // label — the intermediate array levels never enter the trail.
+    expect(
+      buildArrayDrillDownBreadcrumb(["Leve 3 pague 2"], "Images", "Detroit"),
+    ).toEqual(["Leve 3 pague 2", "Detroit"]);
+  });
+});
+
+describe("sibling array disambiguation (regression)", () => {
+  // Two sibling arrays of label-less objects: getArrayItemLabel falls back to
+  // "Item N" for both, so a bare ["Item 1"] trail is ambiguous. The array label
+  // must be kept, and the correct array must resolve — otherwise clicking one
+  // array's item opens the other (the wrong-array bug).
+  const itemSchema = {
+    type: "object",
+    properties: { src: { type: "string", title: "Src" } },
+  } as SchemaProperty;
+  const properties = {
+    images: { title: "Images", type: "array", items: itemSchema },
+    logos: { title: "Logos", type: "array", items: itemSchema },
+  } as Record<string, SchemaProperty>;
+  const objValue = { images: [{ src: "a" }], logos: [{ src: "b" }] };
+
+  test("keeps array label and resolves to the clicked array, not the first sibling", () => {
+    const trail = buildArrayDrillDownBreadcrumb([], "Logos", "Item 1", {
+      arrayKey: "logos",
+      hasSiblingDrillDownFields: true,
+    });
+    expect(trail).toEqual(["Logos", "Item 1"]);
+    expect(
+      resolveActiveFieldKey(
+        Object.keys(properties),
+        properties,
+        objValue,
+        trail,
+      ),
+    ).toBe("logos");
+  });
+
+  test("sole array resolves from a bare [itemLabel] trail", () => {
+    const soleProps = {
+      cards: { title: "Cards", type: "array", items: { type: "object" } },
+    } as Record<string, SchemaProperty>;
+    const trail = buildArrayDrillDownBreadcrumb([], "Cards", "Men's", {
+      arrayKey: "cards",
+      hasSiblingDrillDownFields: false,
+    });
+    expect(trail).toEqual(["Men's"]);
+    expect(
+      resolveActiveFieldKey(
+        ["cards"],
+        soleProps,
+        { cards: [{ title: "Men's" }] },
+        trail,
+      ),
+    ).toBe("cards");
   });
 });
 
@@ -308,6 +410,40 @@ describe("breadcrumbPathForActiveField", () => {
     expect(
       breadcrumbPathForActiveField("flags", schema, ["Partiu ferias"]),
     ).toEqual(["Partiu ferias"]);
+  });
+});
+
+describe("consumedBreadcrumbPrefix", () => {
+  test("returns the crumbs dropped from the front", () => {
+    expect(consumedBreadcrumbPrefix(["Banner", "Banner"], ["Banner"])).toEqual([
+      "Banner",
+    ]);
+  });
+
+  test("is empty when nothing was consumed", () => {
+    expect(consumedBreadcrumbPrefix(["Hello"], ["Hello"])).toEqual([]);
+    expect(consumedBreadcrumbPrefix([], [])).toEqual([]);
+  });
+
+  test("round-trips: prefix + relative trail reconstructs the full trail", () => {
+    const full = ["Banner", "Banner"];
+    const relative = breadcrumbPathForActiveField(
+      "banner",
+      {
+        title: "Banner",
+        type: "array",
+        items: { type: "object" },
+      } as SchemaProperty,
+      full,
+    );
+    // A child editing its own crumb reports the updated RELATIVE trail…
+    const childReported = ["Banner Sale"];
+    // …and re-prepending the consumed prefix must preserve the ancestor crumb,
+    // not collapse it (the array-label == item-label focus-loss bug).
+    expect([
+      ...consumedBreadcrumbPrefix(full, relative),
+      ...childReported,
+    ]).toEqual(["Banner", "Banner Sale"]);
   });
 });
 
@@ -344,6 +480,64 @@ describe("resolveArrayItemSelection", () => {
         itemSchema,
       ),
     ).toEqual({ index: 0, innerPath: ["Button"] });
+  });
+
+  test("selects item when its label equals the array label (alt-driven label)", () => {
+    // Array "Banner" whose single item is also labelled "Banner" (its label
+    // comes from `alt`). As long as the consumed prefix is preserved, the
+    // relative trail keeps the item crumb and resolution finds it.
+    const bannerItems = [{ alt: "Banner Sale" }];
+    const bannerSchema = {
+      type: "object",
+      properties: { alt: { type: "string", title: "Alt" } },
+    } as SchemaProperty;
+    expect(
+      resolveArrayItemSelection(
+        "Banner",
+        ["Banner Sale"],
+        bannerItems,
+        bannerSchema,
+        0,
+      ),
+    ).toEqual({ index: 0, innerPath: [] });
+  });
+
+  describe("duplicate labels (preferredIndex)", () => {
+    // Two items resolve to the same crumb — e.g. after Duplicate, or while
+    // editing a label field (alt/name/title) to a value a sibling already uses.
+    const dupItems = [{ title: "Hello" }, { title: "Hello" }];
+
+    test("without preferredIndex, first matching item wins", () => {
+      expect(
+        resolveArrayItemSelection("Cards", ["Hello"], dupItems, itemSchema),
+      ).toEqual({ index: 0, innerPath: [] });
+    });
+
+    test("keeps the opened item when its label collides with an earlier sibling", () => {
+      // Editing item 1 whose label just became equal to item 0's — selection
+      // must stay on 1, not snap back to 0 (the focus-loss bug).
+      expect(
+        resolveArrayItemSelection("Cards", ["Hello"], dupItems, itemSchema, 1),
+      ).toEqual({ index: 1, innerPath: [] });
+    });
+
+    test("ignores a preferredIndex whose label no longer matches the crumb", () => {
+      expect(
+        resolveArrayItemSelection(
+          "Cards",
+          ["Women's"],
+          items,
+          itemSchema,
+          0, // preferred item 0 is "Men's" — doesn't match, fall back to search
+        ),
+      ).toEqual({ index: 1, innerPath: [] });
+    });
+
+    test("ignores an out-of-range preferredIndex", () => {
+      expect(
+        resolveArrayItemSelection("Cards", ["Hello"], dupItems, itemSchema, 5),
+      ).toEqual({ index: 0, innerPath: [] });
+    });
   });
 });
 

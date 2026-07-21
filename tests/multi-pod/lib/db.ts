@@ -85,3 +85,52 @@ export async function getThreadRunOwnerPod(
   );
   return rows[0]?.run_owner_pod ?? null;
 }
+
+/** Single-quote escape for inlining ids into SQL (ids are uuid-ish, but
+ *  belt-and-suspenders — shared by scenarios that need it beyond the
+ *  string-literal ids `dbQuery`'s callers already build inline). */
+function sqlLit(v: string): string {
+  return v.replace(/'/g, "''");
+}
+
+/** The persisted `threads.status` for a thread, or null if absent. */
+export async function getThreadStatus(
+  threadId: string,
+): Promise<string | null> {
+  const rows = await dbQuery<{ status: string | null }>(
+    `SELECT status FROM threads WHERE id = '${sqlLit(threadId)}'`,
+  );
+  return rows[0]?.status ?? null;
+}
+
+/** Count of persisted `thread_message_parts` rows for a thread. `COUNT(*)`
+ *  is a stable scalar, safe for this module's naive (comma-splitting) CSV
+ *  parser. */
+export async function countThreadMessageParts(
+  threadId: string,
+): Promise<number> {
+  const rows = await dbQuery<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM thread_message_parts WHERE thread_id = '${sqlLit(threadId)}'`,
+  );
+  return Number(rows[0]?.n ?? "0");
+}
+
+/**
+ * Count assistant parts that would actually RENDER in the chat — i.e. every
+ * kind except the `finish` anchor (text/reasoning/tool_call/tool_result/
+ * file/error). Zero of these on a terminal thread is exactly the
+ * "No response was generated" condition: a message with a finish anchor
+ * (or nothing) but no visible content. This is the invariant the
+ * rollout-churn scenario asserts.
+ */
+export async function countRenderableAssistantParts(
+  threadId: string,
+): Promise<number> {
+  const rows = await dbQuery<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM thread_message_parts
+     WHERE thread_id = '${sqlLit(threadId)}'
+       AND role = 'assistant'
+       AND kind <> 'finish'`,
+  );
+  return Number(rows[0]?.n ?? "0");
+}

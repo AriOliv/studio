@@ -34,13 +34,22 @@ export interface ListObjectsResponse {
  */
 export function useFilePickerObjects(params: {
   configId: string | null;
+  search?: string;
+  imageOnly?: boolean;
   enabled?: boolean;
 }) {
   const { org } = useProjectContext();
   const studio = useStudioTools();
+  const search = params.search?.trim() || undefined;
+  const imageOnly = params.imageOnly ?? false;
 
   return useInfiniteQuery({
-    queryKey: KEYS.filePickerObjects(org.id, params.configId),
+    queryKey: KEYS.filePickerObjects(
+      org.id,
+      params.configId,
+      search,
+      imageOnly,
+    ),
     enabled: params.enabled !== false && !!params.configId,
     staleTime: 30_000,
     initialPageParam: null as string | null,
@@ -49,6 +58,10 @@ export function useFilePickerObjects(params: {
       return await studio.call("FILE_OBJECTS_LIST", {
         configId: params.configId as string,
         cursor: pageParam ?? undefined,
+        search,
+        // imageOnly only narrows the server-side search scan; it's a no-op on
+        // the normal (non-search) listing, which the client filters instead.
+        imageOnly: imageOnly || undefined,
       });
     },
     getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
@@ -63,10 +76,10 @@ export interface UploadResult {
 }
 
 /**
- * Upload a file to a configured bucket via the mesh proxy endpoint. We
+ * Upload a file to a configured bucket via the studio proxy endpoint. We
  * don't presign + PUT directly from the browser because that requires
  * per-bucket CORS configuration on every customer bucket (S3, GCS, R2),
- * which is too much friction for a CMS. The proxy streams through mesh
+ * which is too much friction for a CMS. The proxy streams through studio
  * once and avoids the cross-origin problem entirely.
  *
  * The file is sent as the raw POST body (NOT multipart) so the server

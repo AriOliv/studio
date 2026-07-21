@@ -40,7 +40,7 @@ import {
   makeConfigUpdateHandler,
 } from "./routes/config";
 import { handleCancelRequest, handleDispatchRequest } from "./routes/dispatch";
-// Import harness factories from their subpaths (rather than the mesh barrel).
+// Import harness factories from their subpaths (rather than the studio barrel).
 // The daemon runs desktop CLI harnesses only; Decopilot remains cluster-side.
 import { claudeCodeHarnessFactory } from "@decocms/harness/claude-code/index";
 import { codexHarnessFactory } from "@decocms/harness/codex/index";
@@ -56,6 +56,8 @@ import type {
 import { metrics, trace } from "@opentelemetry/api";
 import { makeEventsHandler } from "./routes/events-stream";
 import { makeExecHandler } from "./routes/exec";
+import { makeToolsSyncHandler } from "./routes/tools";
+import { makeCatalogSync } from "./tools-catalog";
 import {
   makeReadHandler,
   makeWriteHandler,
@@ -111,7 +113,7 @@ const bootConfig = {
   // whether http:// loopback is permitted for local dev. They come from the
   // daemon's boot env, NEVER from the request frame.
   //
-  // CONTRACT: mesh must populate these when spawning the daemon —
+  // CONTRACT: studio must populate these when spawning the daemon —
   //   OFFLOAD_ALLOWED_HOSTS      comma-separated hostnames (object-store host(s))
   //   OFFLOAD_ALLOW_SAME_HOST_DEV "1" to allow http:// loopback (dev only)
   // The default is an EMPTY allowlist, which fails CLOSED: with no env wired,
@@ -132,16 +134,20 @@ const TMP_DIR = join(APP_ROOT, "tmp");
 
 const broadcaster = new Broadcaster(REPLAY_BYTES);
 
-// `application.port` is what mesh told the dev script to use, but plenty of
+// `application.port` is what studio told the dev script to use, but plenty of
 // frameworks (vite included) ignore PORT env and pick their own — and on the
 // host runner two sandboxes can race for the same default port, leaving the
 // loser on a fallback. Sniff the actual bind announcement from starter
 // stdout and feed THAT to the probe; the configured port stays as a
 // fallback for tools that do honor PORT.
 const portSniffer = createPortSniffer();
+// Assigned once the probe is started below; the moment the sniffer locks a
+// port (dev server announced its bind URL = ready) we kick the probe so it
+// confirms and flips to `running` immediately instead of on its next tick.
+let kickProbe = (): void => {};
 const broadcastChunkRaw = broadcaster.broadcastChunk.bind(broadcaster);
 broadcaster.broadcastChunk = (source, data, opts) => {
-  portSniffer.observe(source, data);
+  if (portSniffer.observe(source, data)) kickProbe();
   broadcastChunkRaw(source, data, opts);
 };
 
@@ -246,7 +252,7 @@ let baselineTimer: ReturnType<typeof setTimeout> | null = null;
 // sibling sandbox on the same host) so we hold at `crashed` and require
 // an explicit restart.
 let lastRunningPort: number | null = null;
-const lastProbe = startUpstreamProbe({
+const { state: lastProbe, checkNow: probeCheckNow } = startUpstreamProbe({
   getPort: () =>
     // oxlint-disable-next-line ban-ref-current-assignment/ban-ref-current-assignment -- TODO: refactor render-time .current access
     portSniffer.current() ?? store.read()?.application?.port ?? null,
@@ -277,6 +283,11 @@ const lastProbe = startUpstreamProbe({
         htmlSupport: s.htmlSupport,
       });
       if (wasDown) broadcaster.emit("reload", {});
+      // Dev server is confirmed healthy — safe to publish this boot's fresh
+      // install as the golden node_modules (no-op unless one is pending). Only
+      // publishing from a boot that actually came up keeps a broken install
+      // from becoming a sticky, reused golden. Best-effort, fire-and-forget.
+      if (wasDown) void orchestrator.publishPendingGolden();
       if (!baselineTimer) {
         baselineTimer = setTimeout(() => {
           baselineTimer = null;
@@ -305,9 +316,10 @@ resetProbeState = () => {
   lastProbe.port = null;
   lastProbe.htmlSupport = false;
 };
+kickProbe = probeCheckNow;
 
 // HTTP/WS proxy forwards to the same port the probe is HEAD-checking.
-// `application.port` is what mesh configured, but vite/etc. routinely
+// `application.port` is what studio configured, but vite/etc. routinely
 // pick a fallback when the configured one is busy — using the sniffed
 // announce-port keeps the proxy aligned with what the dev script
 // actually bound to. Falls back to the configured value when nothing has
@@ -354,6 +366,10 @@ const fsDeps = {
   },
 };
 const readH = makeReadHandler(fsDeps);
+const toolsSyncH = makeToolsSyncHandler(fsDeps);
+// Coalesced, min-interval catalog sync for the fire-and-forget dispatch hook —
+// re-syncing on every run would be wasted work + a write race.
+const catalogSync = makeCatalogSync({ appRoot, repoDir });
 const writeH = makeWriteHandler(fsDeps);
 const unlinkH = makeUnlinkHandler(fsDeps);
 const mkdirH = makeMkdirHandler(fsDeps);
@@ -383,6 +399,9 @@ const execH = makeExecHandler({
   repoDir,
   store,
   taskManager,
+  lifecycle,
+  getStatus: () => currentStatus,
+  setStatus,
 });
 
 const tasksListH = makeTasksListHandler({ taskManager });
@@ -616,6 +635,7 @@ const fsH: Record<string, (req: Request) => Response | Promise<Response>> = {
   "/write_from_url": writeFromUrlH,
   "/upload_to_url": uploadToUrlH,
   "/bash": bashH,
+  "/tools/sync": toolsSyncH,
 };
 
 const gitH: Record<string, (req: Request) => Response | Promise<Response>> = {
@@ -659,6 +679,7 @@ async function vmRouteH(
       lookupHarness: lookupDispatchHarness,
       allowedHosts: bootConfig.offloadAllowedHosts,
       allowSameHostDev: bootConfig.offloadAllowSameHostDev,
+      onDispatchMcp: catalogSync,
     });
   }
   if (method === "DELETE" && vmPath.startsWith("/runs/")) {
@@ -760,11 +781,11 @@ Bun.serve<WsProxyData, never>({
 });
 
 // --- Org-filesystem mounts ---------------------------------------------------
-// Desktop links: the mesh sets ORGFS_CONFIG (a JSON OrgFsMountConfig) +
+// Desktop links: the studio sets ORGFS_CONFIG (a JSON OrgFsMountConfig) +
 // ORGFS_RCLONE_PATH at spawn — as boot env, like OFFLOAD_ALLOWED_HOSTS, so the
 // daemon itself mounts here at boot.
 // Cluster pods: this container can't mount (locked-down securityContext); a
-// privileged sidecar does (org-fs/sidecar.ts). The mesh runner POSTs the
+// privileged sidecar does (org-fs/sidecar.ts). The studio runner POSTs the
 // config to /_sandbox/orgfs-config post-bind (warm-pool claims reject
 // spec.env) and the handler relays it onto the shared control volume the
 // sidecar watches. Both paths are inert unless their env is set; every step
@@ -877,7 +898,7 @@ async function repointOutputLinkForRun(threadId: string): Promise<boolean> {
   await ensureRepoOrgLink(bootConfig.repoDir, orgFsLog);
   // Uploads link is best-effort: sandboxes provisioned before the uploads
   // volume existed have no .uploads mount, and inbound attachments flow
-  // through the mesh regardless — never fail the run over it.
+  // through the studio regardless — never fail the run over it.
   const uploadsMountPath = join(bootConfig.appRoot, "org", ".uploads");
   if (mounts.some((m) => m.mountPath === uploadsMountPath)) {
     await repointUploadLink(bootConfig.appRoot, threadId, orgFsLog);
@@ -900,13 +921,10 @@ async function shutdown(): Promise<void> {
   shuttingDown = true;
   taskManager.shutdown();
   branchStatus.stop();
-  // Best-effort unmount before exit (rclone --daemon detaches, so it would
-  // otherwise outlive us). A truly abrupt SIGKILL skips this — the sync `exit`
-  // handler below and the next boot's reclaim are the backstops.
-  if (mountManager) {
-    await mountManager.stop().catch(() => {});
-  }
-  // Reuse the same publish() path as POST /_sandbox/git/publish so the
+  // Publish BEFORE unmount: syncing the user's work is the only irrecoverable
+  // step. A stale mount is backstopped (sync `exit` handler + next-boot
+  // reclaim), so a hanging unmount must never eat the push's slice of the grace
+  // period. Reuse the same publish() path as POST /_sandbox/git/publish so the
   // shutdown sync inherits credentialed-remote setup, hook-skipping, and
   // non-interactive push — the blind add/commit/push it replaced silently
   // failed on GitHub repos whose origin URL lacked embedded credentials and
@@ -921,6 +939,11 @@ async function shutdown(): Promise<void> {
     } catch (err) {
       console.warn("[daemon] shutdown publish failed", err);
     }
+  }
+  // rclone --daemon detaches, so an unmount here stops it from outliving us.
+  // Best-effort: a truly abrupt SIGKILL skips it and the backstops above cover.
+  if (mountManager) {
+    await mountManager.stop().catch(() => {});
   }
   process.exit(0);
 }

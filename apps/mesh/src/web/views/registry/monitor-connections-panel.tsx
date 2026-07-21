@@ -40,11 +40,11 @@ type SourceFilter = "all" | "store" | "request";
 function authBadgeStyle(status: MonitorConnectionAuthStatus) {
   switch (status) {
     case "authenticated":
-      return "bg-emerald-500/10 text-emerald-600 border-emerald-500/20";
+      return "bg-success/10 text-success border-success/20";
     case "needs_auth":
-      return "bg-amber-500/10 text-amber-600 border-amber-500/20";
+      return "bg-warning/10 text-warning border-warning/20";
     default:
-      return "bg-zinc-500/10 text-zinc-500 border-zinc-500/20";
+      return "bg-muted text-muted-foreground border-border";
   }
 }
 
@@ -121,7 +121,13 @@ function ConnectionRow({
   const markAuthenticated = () => {
     updateAuth.mutate(
       { connectionId, authStatus: "authenticated" },
-      { onSuccess: () => onAuthChanged() },
+      {
+        onSuccess: () => onAuthChanged(),
+        onError: (err) =>
+          toast.error(
+            `Failed to save auth status for "${title}": ${err instanceof Error ? err.message : String(err)}`,
+          ),
+      },
     );
   };
 
@@ -195,6 +201,9 @@ function ConnectionRow({
           // Fallback: save as plain token
           if (authResult.token) {
             await saveTokenInternal(authResult.token);
+          } else {
+            toast.error(`Failed to save OAuth tokens for "${title}".`);
+            return;
           }
         }
       } else if (authResult.token) {
@@ -250,8 +259,14 @@ function ConnectionRow({
   };
 
   const showMaskedToken =
+    !isProbeLoading &&
     authStatus === "authenticated" &&
     !hasOAuthToken &&
+    !isReplacingToken &&
+    tokenValue.length === 0;
+  const isCheckingTokenField =
+    isProbeLoading &&
+    authStatus === "authenticated" &&
     !isReplacingToken &&
     tokenValue.length === 0;
   const applyVisibility = async (patch: {
@@ -326,11 +341,11 @@ function ConnectionRow({
                   authFlavor === "server_error"
                     ? "border-destructive/40 text-destructive"
                     : authFlavor === "oauth_connected"
-                      ? "border-emerald-500/30 text-emerald-600"
+                      ? "border-success/30 text-success"
                       : authFlavor === "oauth_available"
                         ? "border-sky-500/30 text-sky-600"
                         : authFlavor === "token_required"
-                          ? "border-amber-500/30 text-amber-600"
+                          ? "border-warning/30 text-warning"
                           : "text-muted-foreground",
                 )}
               >
@@ -358,7 +373,12 @@ function ConnectionRow({
         <div className="flex items-center gap-1.5 shrink-0">
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="sm" className="h-8 w-8 p-0">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 w-8 p-0"
+                aria-label={`Actions for ${title}`}
+              >
                 <DotsVertical size={16} />
               </Button>
             </DropdownMenuTrigger>
@@ -413,7 +433,11 @@ function ConnectionRow({
         <p className="text-[10px] text-muted-foreground">
           Token/API key (for MCPs that require manual auth)
         </p>
-        {showMaskedToken ? (
+        {isCheckingTokenField ? (
+          <div className="h-8 px-3 flex items-center rounded-md border border-border bg-muted/30 text-muted-foreground text-xs">
+            Checking auth...
+          </div>
+        ) : showMaskedToken ? (
           <div className="relative group">
             <div className="h-8 px-3 flex items-center rounded-md border border-border bg-muted/50 text-muted-foreground font-mono text-xs">
               ••••••••••••••••

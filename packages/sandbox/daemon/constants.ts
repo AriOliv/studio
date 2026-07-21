@@ -22,6 +22,14 @@ export const DECO_GID = 1000;
 export const PROBE_FAST_MS = 1000;
 export const PROBE_SLOW_MS = 30_000;
 export const PROBE_HEAD_TIMEOUT_MS = 5_000;
+// Consecutive HEAD misses required to flip an *online* server to offline
+// ("crashed"). A single slow probe is expected: a busy dev server (e.g. Vite
+// re-transforming a large edited file, or a heavy SSR of `/`) can block past
+// PROBE_HEAD_TIMEOUT_MS while still very much alive. Without this debounce one
+// slow response marks the sandbox crashed, which the UI surfaces as "the dev
+// server died". After the first miss the probe polls at PROBE_FAST_MS, so a
+// genuine crash is still caught within ~PROBE_FAILURE_THRESHOLD seconds.
+export const PROBE_FAILURE_THRESHOLD = 3;
 
 /**
  * Synthetic branches are sandbox isolation keys, not real git refs.
@@ -47,25 +55,29 @@ export const BOOTSTRAP_SCRIPT = IFRAME_BOOTSTRAP_SCRIPT;
 // different things across Deno 1.x vs 2.x — both wrong here).
 export const PACKAGE_MANAGER_DAEMON_CONFIG: Record<
   string,
-  { install?: string; runPrefix: string; manifests: readonly string[] }
+  {
+    installArgv?: readonly string[];
+    runPrefix: string;
+    manifests: readonly string[];
+  }
 > = {
   npm: {
-    install: "npm install",
+    installArgv: ["npm", "install"],
     runPrefix: "npm run",
     manifests: ["package.json"],
   },
   pnpm: {
-    install: "pnpm install",
+    installArgv: ["pnpm", "install"],
     runPrefix: "pnpm run",
     manifests: ["package.json"],
   },
   yarn: {
-    install: "yarn install",
+    installArgv: ["yarn", "install"],
     runPrefix: "yarn run",
     manifests: ["package.json"],
   },
   bun: {
-    install: "bun install",
+    installArgv: ["bun", "install"],
     runPrefix: "bun run",
     manifests: ["package.json"],
   },
@@ -90,14 +102,10 @@ export function buildDevEnv(
 }
 
 export function pmRunCommand(
-  runtimePrefix: string,
   cwd: string,
   runPrefix: string,
   script: string,
-): { cmd: string; label: string } {
-  const cmd = `${runtimePrefix}cd ${cwd} && ${runPrefix} ${script}`;
-  return {
-    cmd,
-    label: `$ ${cmd}`,
-  };
+): { cmd: string; cwd: string; label: string } {
+  const cmd = `${runPrefix} ${script}`;
+  return { cmd, cwd, label: `$ ${cmd}` };
 }

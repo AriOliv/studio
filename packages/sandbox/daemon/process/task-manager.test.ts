@@ -1,3 +1,4 @@
+import { sleep } from "@decocms/std";
 import { describe, expect, it } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -39,6 +40,149 @@ describe("TaskManager intentional flag", () => {
     await finished;
     const summary = tm.get(t.id)!;
     expect(summary.intentional).toBeFalsy();
+  });
+});
+
+describe("TaskManager pipe-mode output decoding", () => {
+  it("does not corrupt a multi-byte UTF-8 character split across separate stdout chunks", async () => {
+    const tm = makeManager();
+    const t = await tm.spawn({
+      // Two separate writes with a gap: the ✓ (0xE2 0x9C 0x93) arrives as
+      // one stdout 'data' event with a dangling lead byte, then the rest.
+      command: "printf '\\xe2\\x9c'; sleep 0.05; printf '\\x93 ok\\n'",
+      cwd: "/tmp",
+      mode: "pipe",
+    });
+    await tm.finished(t.id);
+    expect(tm.output(t.id)?.stdout).toBe("✓ ok\n");
+  });
+
+  it("flushes a dangling multi-byte sequence still buffered when the stream closes", async () => {
+    const tm = makeManager();
+    const t = await tm.spawn({
+      // Writes only the first 2 of 3 bytes of ✓ (0xE2 0x9C 0x93), then exits
+      // with no further output — the decoder never sees a completing byte.
+      command: "printf '\\xe2\\x9c'",
+      cwd: "/tmp",
+      mode: "pipe",
+    });
+    await tm.finished(t.id);
+    expect(tm.output(t.id)?.stdout.length).toBeGreaterThan(0);
+  });
+});
+
+describe("TaskManager kill status", () => {
+  it("reports status 'killed' (not 'exited') for a pipe-mode task killed via kill()", async () => {
+    const tm = makeManager();
+    const t = await tm.spawn({
+      command: "sleep 30",
+      cwd: "/tmp",
+      mode: "pipe",
+    });
+    const finished = tm.finished(t.id)!;
+    tm.kill(t.id, "SIGTERM");
+    const result = await finished;
+    expect(result.status).toBe("killed");
+    expect(tm.get(t.id)?.status).toBe("killed");
+  });
+
+  it("flags intentional=true for a single-task kill() (the Stop-by-id route) — a dev-script task stopped this way must not be misread as a crash", async () => {
+    const tm = makeManager();
+    const t = await tm.spawn({
+      command: "sleep 30",
+      cwd: "/tmp",
+      mode: "pipe",
+      logName: "dev",
+    });
+    const finished = tm.finished(t.id)!;
+    tm.kill(t.id, "SIGTERM");
+    await finished;
+    expect(tm.get(t.id)?.intentional).toBe(true);
+  });
+
+  it("flags intentional=true on every task stopped via killAll()", async () => {
+    const tm = makeManager();
+    const t = await tm.spawn({
+      command: "sleep 30",
+      cwd: "/tmp",
+      mode: "pipe",
+    });
+    const finished = tm.finished(t.id)!;
+    tm.killAll();
+    await finished;
+    expect(tm.get(t.id)?.intentional).toBe(true);
+  });
+});
+
+describe("TaskManager killAll", () => {
+  it("escalates to SIGKILL when a task ignores SIGTERM", async () => {
+    const tm = makeManager();
+    const t = await tm.spawn({
+      // A busy-loop builtin (no subprocess) that traps and ignores SIGTERM —
+      // only SIGKILL can end it, unlike `sleep`, which dies on TERM by default
+      // regardless of a shell trap around it.
+      command: "trap '' TERM; while true; do :; done",
+      cwd: "/tmp",
+      mode: "pipe",
+    });
+    const finished = tm.finished(t.id)!;
+    // Give the shell time to install the trap before signaling it — otherwise
+    // SIGTERM can race the trap and land while TERM is still fatal.
+    await sleep(300);
+    const count = tm.killAll();
+    expect(count).toBe(1);
+    const result = await finished;
+    expect(result.status).toBe("killed");
+  });
+});
+
+describe("TaskManager kill escalation timer", () => {
+  it("unrefs the SIGKILL escalation timer so a clean kill doesn't keep the process alive for 3s", async () => {
+    const tm = makeManager();
+    const t = await tm.spawn({
+      command: "sleep 30",
+      cwd: "/tmp",
+      mode: "pipe",
+    });
+    const finished = tm.finished(t.id)!;
+
+    const originalSetTimeout = globalThis.setTimeout;
+    let escalationTimer: ReturnType<typeof setTimeout> | undefined;
+    // @ts-expect-error test-only monkeypatch to capture the escalation timer
+    globalThis.setTimeout = (
+      fn: TimerHandler,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      const timer = originalSetTimeout(fn as never, ms, ...args);
+      if (ms === 3000) escalationTimer = timer;
+      return timer;
+    };
+    try {
+      tm.kill(t.id, "SIGTERM");
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+
+    await finished;
+    expect(escalationTimer).toBeDefined();
+    expect(escalationTimer?.hasRef()).toBe(false);
+  });
+});
+
+describe("TaskManager summary truncation", () => {
+  it("flags summary.truncated when output exceeds the ring buffer but not the tee cap", async () => {
+    const tm = makeManager();
+    // Ring buffer caps at 256KB per stream; the on-disk tee caps at 10MB.
+    // 300KB of output overflows the former but not the latter, so
+    // summarize() must reflect the ring buffer's drop, not just the tee's.
+    const t = await tm.spawn({
+      command: "yes | head -c 300000",
+      cwd: "/tmp",
+      mode: "pipe",
+    });
+    await tm.finished(t.id);
+    expect(tm.get(t.id)?.truncated).toBe(true);
   });
 });
 
