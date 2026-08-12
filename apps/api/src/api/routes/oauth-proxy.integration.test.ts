@@ -376,14 +376,59 @@ describe("MCP OAuth Proxy E2E", () => {
         }),
       });
 
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body).toEqual({
         client_name: "probe",
         redirect_uris: ["https://studio.example/oauth/callback"],
         client_id: "static-client-id",
-        client_secret: "static-client-secret",
-        client_secret_expires_at: 0,
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
       });
+      // The secret is injected on the token leg, server-side. Handing it to
+      // the MCP client would put it in the browser of every member who
+      // connects.
+      expect(body).not.toHaveProperty("client_secret");
+      expect(JSON.stringify(body)).not.toContain("static-client-secret");
+    });
+
+    test("ignores a client_credentials oauth_config (no browser flow to serve)", async () => {
+      const connectionId = "conn_client_credentials_oauth";
+      await database.db
+        .insertInto("connections")
+        .values({
+          id: connectionId,
+          organization_id: "org_test",
+          created_by: "test_user",
+          title: "Client credentials",
+          connection_type: "HTTP",
+          connection_url: "https://mcp.invalid.example/mcp",
+          oauth_config: JSON.stringify({
+            authorizationEndpoint: "https://auth.example/authorize",
+            tokenEndpoint: "https://auth.example/token",
+            clientId: "machine-client-id",
+            clientSecret: "machine-client-secret",
+            scopes: [],
+            grantType: "client_credentials",
+          }),
+          status: "active",
+          pinned: false,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .execute();
+
+      const res = await app.request(`/oauth-proxy/${connectionId}/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ redirect_uris: ["https://x.example/cb"] }),
+      });
+
+      // Not answered from oauth_config: it falls through to discovery,
+      // which fails for the unreachable resource.
+      expect(res.status).not.toBe(201);
+      expect(await res.text()).not.toContain("machine-client-secret");
     });
   });
 

@@ -442,22 +442,35 @@ const oauthProxyHandler: MiddlewareHandler<Env> = async (c) => {
     return c.json({ error: "Connection not found" }, 404);
   }
 
-  // Some providers advertise a `registration_endpoint` and then 403 it (Figma):
-  // answer DCR from the connection's hand-registered client so the authorize
-  // and token legs below need no special case.
-  if (endpoint === "register" && connection.oauth_config?.clientId) {
+  // Pre-registered OAuth client, kept in `connection.oauth_config`. Covers
+  // providers with no DCR at all (accounts.google.com) and ones that
+  // advertise a `registration_endpoint` and then 403 it (Figma). The proxy
+  // answers DCR itself, pins the authorize client_id, and injects the client
+  // secret on the token leg — the secret never reaches the browser.
+  const preRegisteredClient =
+    connection.oauth_config?.clientId &&
+    connection.oauth_config.grantType !== "client_credentials"
+      ? connection.oauth_config
+      : undefined;
+
+  if (endpoint === "register" && preRegisteredClient) {
     // The client metadata is echoed back because RFC 7591 §3.2.1 says the
     // response is the request plus the credentials, and clients validate it.
+    // `token_endpoint_auth_method: "none"` keeps the MCP client from trying to
+    // authenticate itself with a secret it was never given.
     const requested = await c.req.json().catch(() => ({}));
-    return c.json({
-      ...(typeof requested === "object" && requested !== null ? requested : {}),
-      client_id: connection.oauth_config.clientId,
-      ...(connection.oauth_config.clientSecret
-        ? { client_secret: connection.oauth_config.clientSecret }
-        : {}),
-      // 0 = never expires; an expiry would send the client back through /register.
-      client_secret_expires_at: 0,
-    });
+    return c.json(
+      {
+        ...(typeof requested === "object" && requested !== null
+          ? requested
+          : {}),
+        client_id: preRegisteredClient.clientId,
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+      },
+      201,
+    );
   }
 
   // Get origin auth server - tries Protected Resource Metadata first, then falls back to origin root
@@ -482,9 +495,24 @@ const oauthProxyHandler: MiddlewareHandler<Env> = async (c) => {
       : undefined;
   const resourceIndicator = resourceOverride ?? connection.connection_url;
 
+  // Scopes advertised by the downstream resource (RFC 9728). Used as the
+  // authorize-leg scope fallback for pre-registered-client providers (e.g.
+  // Google) that reject authorization requests without an explicit scope.
+  let resourceScopes: string[] | undefined;
   if (resourceRes.ok) {
     // Origin has Protected Resource Metadata - use authorization_servers from it
-    originAuthServer = firstAuthorizationServer(await resourceRes.json());
+    const resourceData: unknown = await resourceRes.json();
+    // firstAuthorizationServer validates the entry before we trust it.
+    originAuthServer = firstAuthorizationServer(resourceData);
+    const scopesSupported =
+      typeof resourceData === "object" && resourceData !== null
+        ? (resourceData as { scopes_supported?: unknown }).scopes_supported
+        : undefined;
+    if (Array.isArray(scopesSupported)) {
+      resourceScopes = scopesSupported.filter(
+        (s): s is string => typeof s === "string",
+      );
+    }
   }
 
   // Fall back to origin root if:
@@ -571,6 +599,34 @@ const oauthProxyHandler: MiddlewareHandler<Env> = async (c) => {
       targetUrl.searchParams.set("resource", resourceIndicator);
     }
 
+    // Pre-registered client (no-DCR providers): pin the client_id and make
+    // sure a scope is present — Google rejects authorization requests with
+    // no scope. Prefer the operator's `oauth_config.scopes`, falling back to
+    // the resource's advertised `scopes_supported`.
+    if (preRegisteredClient) {
+      targetUrl.searchParams.set("client_id", preRegisteredClient.clientId);
+      if (!targetUrl.searchParams.get("scope")) {
+        const scopes = preRegisteredClient.scopes?.length
+          ? preRegisteredClient.scopes
+          : (resourceScopes ?? []);
+        if (scopes.length) {
+          targetUrl.searchParams.set("scope", scopes.join(" "));
+        }
+      }
+      // Google only issues a refresh_token with explicit offline consent.
+      // Harmless no-ops for other providers, so gate on the Google AS.
+      if (targetUrl.hostname.endsWith("google.com")) {
+        if (!targetUrl.searchParams.has("access_type")) {
+          targetUrl.searchParams.set("access_type", "offline");
+        }
+        if (!targetUrl.searchParams.has("prompt")) {
+          targetUrl.searchParams.set("prompt", "consent");
+        }
+      }
+    }
+
+    // Add smart OAuth params for deco-hosted MCPs to skip org/project selection
+    // Wrapped in try-catch to ensure OAuth redirect proceeds even if smart params fail
     if (isDecoHostedMcp(connection.connection_url)) {
       targetUrl.searchParams.set("auto_personal", "true");
       targetUrl.searchParams.set("force_new", "true");
@@ -627,6 +683,22 @@ const oauthProxyHandler: MiddlewareHandler<Env> = async (c) => {
       const formData = await c.req.formData();
       if (formData.has("resource")) {
         formData.set("resource", resourceIndicator);
+      }
+      // Pre-registered client (no-DCR providers): the browser flow runs with
+      // `token_endpoint_auth_method: "none"`, so the exchange arrives without
+      // credentials. Inject them here — server-side only — so providers that
+      // require a confidential client (Google) accept the exchange.
+      if (preRegisteredClient) {
+        if (!formData.get("client_id")) {
+          formData.set("client_id", preRegisteredClient.clientId);
+        }
+        if (
+          preRegisteredClient.clientSecret &&
+          !formData.get("client_secret") &&
+          formData.get("client_id") === preRegisteredClient.clientId
+        ) {
+          formData.set("client_secret", preRegisteredClient.clientSecret);
+        }
       }
       const cidRaw = formData.get("client_id");
       const csRaw = formData.get("client_secret");
