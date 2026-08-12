@@ -162,6 +162,15 @@ export const ConnectionEntitySchema = z.object({
 
   oauth_config: OAuthConfigSchema.nullable().describe("OAuth configuration"),
 
+  auth_mode: z
+    .enum(["shared", "per_user"])
+    .default("shared")
+    .describe(
+      "Whether the downstream OAuth token is shared across the org (`shared`) " +
+        "or scoped per member (`per_user`). When `per_user`, each member must " +
+        "authorize with their own account before they can call tools.",
+    ),
+
   // New configuration fields (snake_case)
   configuration_state: boundedJsonRecord("configuration_state").describe(
     "Configuration state (decrypted)",
@@ -201,6 +210,7 @@ export const ConnectionCreateDataSchema = ConnectionEntitySchema.omit({
   tools: true,
   bindings: true,
   status: true,
+  auth_mode: true,
 })
   .partial({
     id: true,

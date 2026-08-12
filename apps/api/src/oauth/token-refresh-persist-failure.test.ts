@@ -17,6 +17,7 @@ const { refreshAndStore, clearRefreshBackoff } = await import(
 const baseToken: DownstreamToken = {
   id: "dtok_1",
   connectionId: "conn_persist_fail",
+  userId: null,
   accessToken: "old-access",
   refreshToken: "refresh-1",
   scope: null,

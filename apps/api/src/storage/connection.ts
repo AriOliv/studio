@@ -84,6 +84,7 @@ type RawConnectionRow = {
   connection_token: string | null;
   connection_headers: string | null; // JSON, envVars encrypted for STDIO
   oauth_config: string | OAuthConfig | null;
+  auth_mode: "shared" | "per_user";
   configuration_state: string | null; // Encrypted
   configuration_scopes: string | string[] | null;
   metadata: string | Record<string, unknown> | null;
@@ -108,6 +109,7 @@ const TOP_LEVEL_COLUMNS = new Set([
   "connection_type",
   "connection_url",
   // connection_token is intentionally excluded — sensitive
+  "auth_mode",
   "status",
   "created_at",
   "updated_at",
@@ -860,6 +862,7 @@ export class ConnectionStorage implements ConnectionStoragePort {
       connection_token: decryptedToken,
       connection_headers: connectionParameters,
       oauth_config: decryptedOAuthConfig,
+      auth_mode: row.auth_mode ?? "shared",
       configuration_state: decryptedConfigState,
       configuration_scopes: parseJson<string[]>(row.configuration_scopes),
       metadata:

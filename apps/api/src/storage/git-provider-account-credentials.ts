@@ -130,6 +130,8 @@ export async function decryptGitProviderAccountCredentialRow(
     return {
       id: row.account_id,
       connectionId: row.account_id,
+      // A git-provider grant belongs to the account, never to one member.
+      userId: null,
       accessToken,
       refreshToken,
       scope: row.scope,

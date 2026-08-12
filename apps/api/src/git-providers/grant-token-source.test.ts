@@ -13,6 +13,7 @@ function grant(overrides: Partial<DownstreamToken>): DownstreamToken {
   return {
     id: "tok",
     connectionId: "acc_1",
+    userId: null,
     accessToken: "secret",
     refreshToken: null,
     scope: null,

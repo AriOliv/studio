@@ -76,6 +76,20 @@ export function needsTokenEndpointReresolution(
   }
 }
 
+/**
+ * Single-flight and backoff key for one stored grant. A per-user token shares
+ * its connectionId with every other member's token on that connection, so the
+ * key must carry the user too: keyed by connectionId alone, a member's refresh
+ * would resolve another member's in-flight promise and hand back THEIR access
+ * token. Shared tokens keep the bare connectionId, which is what the exported
+ * hooks below take.
+ */
+function grantKey(token: Pick<DownstreamToken, "connectionId" | "userId">) {
+  return token.userId
+    ? `${token.connectionId}\u0000${token.userId}`
+    : token.connectionId;
+}
+
 const inflightRefreshes = new Map<string, Promise<string | null>>();
 
 /**
@@ -98,8 +112,16 @@ const refreshBackoff = new Map<
 
 /** Drop the suppression window for a connection (or all). Test/reconnect hook. */
 export function clearRefreshBackoff(connectionId?: string): void {
-  if (connectionId) refreshBackoff.delete(connectionId);
-  else refreshBackoff.clear();
+  if (!connectionId) {
+    refreshBackoff.clear();
+    return;
+  }
+  // Includes every member's per-user window on this connection (see grantKey).
+  for (const key of refreshBackoff.keys()) {
+    if (key === connectionId || key.startsWith(`${connectionId}\u0000`)) {
+      refreshBackoff.delete(key);
+    }
+  }
 }
 
 /**
@@ -148,18 +170,21 @@ async function refreshAndStoreOnce(
     // OAuth server into a forced manual reconnect.
     if (result.permanent === true) {
       // Don't let a storage blip surface as an uncaught rejection to callers.
-      await tokenStorage.delete(token.connectionId).catch((error) => {
-        console.warn("[TokenRefresh] failed to delete dead token row", {
-          connectionId: token.connectionId,
-          message: error instanceof Error ? error.message : String(error),
+      await tokenStorage
+        .delete(token.connectionId, token.userId ?? null)
+        .catch((error) => {
+          console.warn("[TokenRefresh] failed to delete dead token row", {
+            connectionId: token.connectionId,
+            message: error instanceof Error ? error.message : String(error),
+          });
         });
-      });
     }
     return { accessToken: null, permanent: result.permanent === true };
   }
   try {
     await tokenStorage.upsert({
       connectionId: token.connectionId,
+      userId: token.userId ?? null,
       accessToken: result.accessToken,
       refreshToken: result.refreshToken ?? token.refreshToken,
       scope: result.scope ?? token.scope,
@@ -189,10 +214,11 @@ export function refreshAndStore(
   token: DownstreamToken,
   tokenStorage: OAuthGrantStore,
 ): Promise<string | null> {
-  const existing = inflightRefreshes.get(token.connectionId);
+  const key = grantKey(token);
+  const existing = inflightRefreshes.get(key);
   if (existing) return existing;
 
-  const backoff = refreshBackoff.get(token.connectionId);
+  const backoff = refreshBackoff.get(key);
   if (backoff && Date.now() < backoff.nextAttemptAt) {
     // Still inside the suppression window from a recent failure — skip the
     // network call (and its log) and report failure to the caller as usual.
@@ -203,9 +229,9 @@ export function refreshAndStore(
     .then(({ accessToken, permanent }) => {
       if (accessToken || permanent) {
         // Permanent failure already deleted the token row — no backoff to arm.
-        refreshBackoff.delete(token.connectionId);
+        refreshBackoff.delete(key);
       } else {
-        const attempt = refreshBackoff.get(token.connectionId)?.attempt ?? 0;
+        const attempt = refreshBackoff.get(key)?.attempt ?? 0;
         const delay = exponentialBackoffWithJitter(
           REFRESH_BACKOFF_CAP_MS,
           REFRESH_BACKOFF_BASE_MS,
@@ -213,7 +239,7 @@ export function refreshAndStore(
           2,
           0.5,
         );
-        refreshBackoff.set(token.connectionId, {
+        refreshBackoff.set(key, {
           attempt: attempt + 1,
           nextAttemptAt: Date.now() + delay,
         });
@@ -221,9 +247,9 @@ export function refreshAndStore(
       return accessToken;
     })
     .finally(() => {
-      inflightRefreshes.delete(token.connectionId);
+      inflightRefreshes.delete(key);
     });
-  inflightRefreshes.set(token.connectionId, refresh);
+  inflightRefreshes.set(key, refresh);
   return refresh;
 }
 
@@ -247,9 +273,20 @@ export async function getValidDownstreamAccessToken(params: {
   tokenStorage: OAuthGrantStore;
   bufferMs?: number;
   force?: boolean;
+  /**
+   * Identity of the token to fetch. `null` (default) selects the shared
+   * connection-scoped token; a user id selects that member's per-user token.
+   */
+  userId?: string | null;
 }): Promise<ValidDownstreamAccessTokenResult> {
-  const { connectionId, connectionUrl, tokenStorage, force } = params;
-  const token = await tokenStorage.get(connectionId);
+  const {
+    connectionId,
+    connectionUrl,
+    tokenStorage,
+    force,
+    userId = null,
+  } = params;
+  const token = await tokenStorage.get(connectionId, userId);
   if (!token) return { state: "missing", accessToken: null };
 
   const refreshable = canRefresh(token);
@@ -268,7 +305,7 @@ export async function getValidDownstreamAccessToken(params: {
 
   if (!refreshable) {
     // A forced call on a live token must not delete the user's credential.
-    if (expired) await tokenStorage.delete(connectionId);
+    if (expired) await tokenStorage.delete(connectionId, userId);
     return { state: "expired_without_refresh", accessToken: null };
   }
 
@@ -289,7 +326,9 @@ export async function getValidDownstreamAccessToken(params: {
   if (!accessToken) return { state: "refresh_failed", accessToken: null };
   // The refresh stored the new expiry; a store that failed keeps the old
   // one, which only understates the new token's life.
-  const stored = await tokenStorage.get(connectionId).catch(() => null);
+  const stored = await tokenStorage
+    .get(connectionId, userId)
+    .catch(() => null);
   return {
     state: "refreshed",
     accessToken,

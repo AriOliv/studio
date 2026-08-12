@@ -9,6 +9,7 @@ function row(overrides: Partial<RawDownstreamTokenRow>): RawDownstreamTokenRow {
   return {
     id: "dtok_1",
     connectionId: "conn_1",
+    userId: null,
     accessToken: "not-ciphertext",
     refreshToken: null,
     scope: null,
