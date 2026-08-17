@@ -1371,19 +1371,19 @@ function convertRoleToFormData(
       key === CONNECTION_SCOPE_KEY
     )
       continue;
+    // Keep the RAW grant, including a ["*"] "all tools" sentinel. The
+    // connection LIST endpoint omits `tools`, so expanding "*" here yields []
+    // — which renders the connection as unchecked AND destroys the grant on the
+    // next save. ToolSetSelector understands "*" directly, so preserve it.
     if (key === "*") {
+      // Grant applies to every connection.
       for (const conn of connections) {
-        toolSet[conn.id] = tools.includes("*")
-          ? (conn.tools?.map((t) => t.name) ?? [])
-          : tools;
+        toolSet[conn.id] = tools;
       }
     } else {
-      const conn = connections.find((c) => c.id === key);
-      if (conn) {
-        toolSet[key] = tools.includes("*")
-          ? (conn.tools?.map((t) => t.name) ?? [])
-          : tools;
-      }
+      // Preserve unconditionally — even if the connection isn't in the current
+      // (possibly paginated) list, so a re-save round-trips instead of dropping.
+      toolSet[key] = tools;
     }
   }
 
@@ -1768,8 +1768,12 @@ function RoleDetailPageInner({
         ? target.role.label
         : "";
 
+  // Built-in roles (owner/admin/user) are code-defined: only member assignment
+  // persists (the save path syncs members but drops permission changes). Hide
+  // the MCP + Models tabs for them so the editor doesn't imply per-connection /
+  // per-model grants can be saved. Grant specific tools via a CUSTOM role.
   const tabs = [
-    ...(!isOwnerBuiltin
+    ...(!isBuiltin
       ? [
           {
             id: "mcp" as const,
@@ -1985,11 +1989,11 @@ function RoleDetailPageInner({
                 onPermissionsChange={(v) =>
                   form.setValue("staticPermissions", v, { shouldDirty: true })
                 }
-                readOnly={isOwnerBuiltin}
+                readOnly={isBuiltin}
                 searchQuery={searchQuery}
               />
             )}
-            {activeTab === "models" && (
+            {activeTab === "models" && !isBuiltin && (
               <ModelsPermissionsTab
                 allowAllModels={form.watch("allowAllModels")}
                 modelSet={form.watch("modelSet")}
