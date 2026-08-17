@@ -1452,12 +1452,8 @@ function RoleDetailPageInner({
         ? target.role.label
         : "";
 
-  // Built-in roles (owner/admin/user) are code-defined: only member assignment
-  // persists (the save path syncs members but drops permission changes). Hide
-  // the MCP + Models tabs for them so the editor doesn't imply per-connection /
-  // per-model grants can be saved. Grant specific tools via a CUSTOM role.
   const tabs = [
-    ...(!isBuiltin
+    ...(!isOwnerBuiltin
       ? [
           {
             id: "mcp" as const,
@@ -1469,9 +1465,7 @@ function RoleDetailPageInner({
       id: "org" as const,
       label: t("settings.orgRoleDetail.organizationPermissions"),
     },
-    ...(!isBuiltin
-      ? [{ id: "models" as const, label: t("settings.orgRoleDetail.models") }]
-      : []),
+    { id: "models" as const, label: t("settings.orgRoleDetail.models") },
     { id: "members" as const, label: t("settings.orgRoleDetail.members") },
   ];
 
@@ -1608,7 +1602,7 @@ function RoleDetailPageInner({
                 "border border-border rounded-xl bg-card",
             )}
           >
-            {activeTab === "mcp" && !isBuiltin && (
+            {activeTab === "mcp" && !isOwnerBuiltin && (
               <ToolSetSelector
                 toolSet={form.watch("toolSet")}
                 onToolSetChange={(newToolSet) =>
@@ -1631,11 +1625,11 @@ function RoleDetailPageInner({
                 onPermissionsChange={(v) =>
                   form.setValue("staticPermissions", v, { shouldDirty: true })
                 }
-                readOnly={isBuiltin}
+                readOnly={isOwnerBuiltin}
                 searchQuery={searchQuery}
               />
             )}
-            {activeTab === "models" && !isBuiltin && (
+            {activeTab === "models" && (
               <ModelsPermissionsTab
                 allowAllModels={form.watch("allowAllModels")}
                 modelSet={form.watch("modelSet")}
