@@ -1768,12 +1768,8 @@ function RoleDetailPageInner({
         ? target.role.label
         : "";
 
-  // Built-in roles (owner/admin/user) are code-defined: only member assignment
-  // persists (the save path syncs members but drops permission changes). Hide
-  // the MCP + Models tabs for them so the editor doesn't imply per-connection /
-  // per-model grants can be saved. Grant specific tools via a CUSTOM role.
   const tabs = [
-    ...(!isBuiltin
+    ...(!isOwnerBuiltin
       ? [
           {
             id: "mcp" as const,
@@ -1989,11 +1985,11 @@ function RoleDetailPageInner({
                 onPermissionsChange={(v) =>
                   form.setValue("staticPermissions", v, { shouldDirty: true })
                 }
-                readOnly={isBuiltin}
+                readOnly={isOwnerBuiltin}
                 searchQuery={searchQuery}
               />
             )}
-            {activeTab === "models" && !isBuiltin && (
+            {activeTab === "models" && (
               <ModelsPermissionsTab
                 allowAllModels={form.watch("allowAllModels")}
                 modelSet={form.watch("modelSet")}
