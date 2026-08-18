@@ -1249,9 +1249,14 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       //   SETTINGS_GET → sidebar / plugins / model tiers loaded at shell boot
       //   USER_GET     → resolve member display ("created by" on agents, etc.);
       //                  handler scopes to shared-org members, no secrets
+      //   USER_MODEL_PREFERENCES_GET/UPDATE → the chat reads the caller's own
+      //                  model-tier overrides on load and lets them change it;
+      //                  both are self-scoped to the calling user, no secrets
       //   BRAND_CONTEXT_LIST → org branding for the chat empty state
       "ORGANIZATION_SETTINGS_GET",
       "USER_GET",
+      "USER_MODEL_PREFERENCES_GET",
+      "USER_MODEL_PREFERENCES_UPDATE",
       "BRAND_CONTEXT_LIST",
       // Chat threads — talking to an agent is the most basic usage of the
       // product, so every member can CRUD their OWN threads. Per-thread access
