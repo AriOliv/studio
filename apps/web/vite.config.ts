@@ -7,6 +7,7 @@ import pkg from "../api/package.json" with { type: "json" };
 import nativePkg from "../native/package.json" with { type: "json" };
 import { fileURLToPath } from "node:url";
 import { existsSync, renameSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { shouldServeNativeEntryInDev } from "./src/lib/vite-native-entry-rules";
 
@@ -23,6 +24,26 @@ const bunServerTarget = `http://localhost:${process.env.PORT || "3000"}`;
 // apps/web/src/index.native.tsx for the entry itself and
 // apps/web/src/lib/desktop/transport.ts for what it wires up.
 const isNativeBuild = process.env.VITE_TAURI_APP === "1";
+
+// Cache-buster for the persisted bootstrap query cache (query-persist.ts). It
+// MUST change on every deploy so a stale localStorage snapshot — e.g. a
+// connections list captured before a schema change like the per-user auth_mode
+// field — can never survive a new bundle. `pkg.version` is bumped only on
+// upstream releases, so deploys built per git sha (same version) would share one
+// buster and never invalidate. Prefer an explicit build id, else the git sha at
+// build time, else the build timestamp.
+const buildId: string = (() => {
+  if (process.env.STUDIO_BUILD_ID) return process.env.STUDIO_BUILD_ID;
+  try {
+    return execSync("git rev-parse --short HEAD", {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+  } catch {
+    return String(Date.now());
+  }
+})();
 // Leaf minted by the desktop app into its app-data dir. Read at config time
 // so `vite dev` serves the same certificate the Rust listeners do.
 const nativeTlsFiles = (() => {
@@ -186,6 +207,11 @@ export default defineConfig({
     __STUDIO_VERSION__: JSON.stringify(
       isNativeBuild ? nativePkg.version : pkg.version,
     ),
+    // Per-build cache-buster (see `buildId` above). Distinct from
+    // __STUDIO_VERSION__ (which stays the human release number for the version
+    // popover and server drift check) so the persisted cache invalidates on
+    // every deploy without changing what the UI shows as the version.
+    __STUDIO_BUILD_ID__: JSON.stringify(buildId),
     // Build-time constant so e2e-only hooks (window.__forceTabError) survive
     // the e2e production build but stay dead-stripped from real prod builds.
     __E2E_TEST_HOOKS__: JSON.stringify(process.env.E2E_TEST_HOOKS === "1"),
