@@ -8,10 +8,31 @@ import { createRequire } from "node:module";
 import { existsSync, readdirSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
 import { MONACO_VS_PATH } from "./src/lib/monaco-vs-path";
+import { execSync } from "node:child_process";
 
 const bunServerTarget =
   process.env.STUDIO_LOCAL_API_TARGET ||
   `http://localhost:${process.env.PORT || "3000"}`;
+
+// Cache-buster for the persisted bootstrap query cache (query-persist.ts). It
+// MUST change on every deploy so a stale localStorage snapshot — e.g. a
+// connections list captured before a schema change like the per-user auth_mode
+// field — can never survive a new bundle. `pkg.version` is bumped only on
+// upstream releases, so deploys built per git sha (same version) would share one
+// buster and never invalidate. Prefer an explicit build id, else the git sha at
+// build time, else the build timestamp.
+const buildId: string = (() => {
+  if (process.env.STUDIO_BUILD_ID) return process.env.STUDIO_BUILD_ID;
+  try {
+    return execSync("git rev-parse --short HEAD", {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+  } catch {
+    return String(Date.now());
+  }
+})();
 
 /**
  * Point the dev server's `/api` proxy at a REMOTE Studio instead of the local
@@ -379,6 +400,11 @@ export default defineConfig({
     // footer) and what busts the persisted query cache: the version of the
     // apps/api deploy behind the page.
     __STUDIO_VERSION__: JSON.stringify(pkg.version),
+    // Per-build cache-buster (see `buildId` above). Distinct from
+    // __STUDIO_VERSION__ (which stays the human release number for the version
+    // popover and server drift check) so the persisted cache invalidates on
+    // every deploy without changing what the UI shows as the version.
+    __STUDIO_BUILD_ID__: JSON.stringify(buildId),
     // Build-time constant so e2e-only hooks (window.__forceTabError) survive
     // the e2e production build but stay dead-stripped from real prod builds.
     __E2E_TEST_HOOKS__: JSON.stringify(process.env.E2E_TEST_HOOKS === "1"),

@@ -100,7 +100,11 @@ export function hydrateQueryClient(queryClient: QueryClient): void {
 
     const stale =
       !parsed.timestamp || Date.now() - parsed.timestamp > MAX_AGE_MS;
-    if (parsed.buster !== __STUDIO_VERSION__ || stale || !parsed.state) {
+    // Bust on every deploy: __STUDIO_BUILD_ID__ changes per bundle (git sha),
+    // unlike __STUDIO_VERSION__ which only moves on upstream releases. Without
+    // this, a snapshot taken before a schema change (e.g. the per-user
+    // `auth_mode` field) would hydrate stale across our per-sha deploys.
+    if (parsed.buster !== __STUDIO_BUILD_ID__ || stale || !parsed.state) {
       window.localStorage.removeItem(STORAGE_KEY);
       return;
     }
@@ -148,7 +152,7 @@ export function persistQueryClient(queryClient: QueryClient): () => void {
       window.localStorage.setItem(
         STORAGE_KEY,
         JSON.stringify({
-          buster: __STUDIO_VERSION__,
+          buster: __STUDIO_BUILD_ID__,
           timestamp: Date.now(),
           state,
         }),
