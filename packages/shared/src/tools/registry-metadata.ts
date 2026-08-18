@@ -1842,8 +1842,13 @@ const PERMISSION_CAPABILITIES: PermissionCapability[] = [
       //   SETTINGS_GET → sidebar / plugins / model tiers loaded at shell boot
       //   USER_GET     → resolve member display ("created by" on agents, etc.);
       //                  handler scopes to shared-org members, no secrets
+      //   USER_MODEL_PREFERENCES_GET/UPDATE → the chat reads the caller's own
+      //                  model-tier overrides on load and lets them change it;
+      //                  both are self-scoped to the calling user, no secrets
       "ORGANIZATION_SETTINGS_GET",
       "USER_GET",
+      "USER_MODEL_PREFERENCES_GET",
+      "USER_MODEL_PREFERENCES_UPDATE",
       // Boolean "org owns a legacy site" (no slugs) — gates the home's CMS-training card.
       "ORGANIZATION_HAS_SITE",
       // Any member picks the org's blocks editor; writes only that one flag.
