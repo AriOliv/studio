@@ -120,12 +120,12 @@ export function isAuthServerMetadata(data: Record<string, unknown>): boolean {
  * standard OAuth error hints for servers that don't implement RFC 9728.
  */
 export function looksLikeOAuthWwwAuthenticate(wwwAuth: string): boolean {
-  const lower = wwwAuth.toLowerCase();
-  return (
-    lower.includes("resource_metadata=") ||
-    lower.includes("invalid_token") ||
-    lower.includes("oauth")
-  );
+  // Only RFC 9728 `resource_metadata=` reliably signals an OAuth-protected MCP
+  // resource. A bare RFC 6750 error="invalid_token" (returned by any
+  // static-bearer API, e.g. ComfyUI's gateway) must NOT be treated as OAuth, or
+  // the AS-discovery proxy 502s and blocks the connection in the UI. The
+  // checkHasOAuthMetadata fallback still catches metadata-serving OAuth servers.
+  return wwwAuth.toLowerCase().includes("resource_metadata=");
 }
 
 /** Classify a downstream connection error as a 401-style auth error. */
