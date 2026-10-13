@@ -277,6 +277,12 @@ export const OrgFlagsSchema = z.object({
     .describe(
       "Use the redesigned blocks editor for every member of the organization. Off by default — the classic editor stays until an admin opts the org in.",
     ),
+  blog_ai_enabled: z
+    .boolean()
+    .optional()
+    .describe(
+      "The blog's brand context tab and its agentic generation — campaigns, post drafting and link suggestions. Off by default; with it off the blog is written by hand and every BLOG_* tool refuses, over MCP and in the app alike, so an agent cannot spend the organization's credits on a feature it turned off.",
+    ),
   hide_default_blog_blocks: z
     .boolean()
     .optional()
