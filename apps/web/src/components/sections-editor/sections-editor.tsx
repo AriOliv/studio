@@ -37,6 +37,14 @@ import { extractPages, findPageForPath, globalSectionLabel } from "./page-list";
 import { AddSectionButton, SectionList, parseSections } from "./section-list";
 import { isLazyResolveType } from "./section-lazy";
 import { savedBlockKey, unwrapSection } from "./unwrap-section";
+import {
+  formSourceMovedOn,
+  sectionFormSource,
+  trackFormChange,
+  type FormBase,
+} from "./form-base";
+import { BlockConflictError } from "./decofile-api";
+import { mergeBlockJson } from "@decocms/shared/decofile";
 import { arrayMove } from "@dnd-kit/sortable";
 import type { ParsedSection } from "./section-list";
 import { resolveSchema } from "./resolve-schema";
@@ -387,6 +395,8 @@ export function SectionsEditor({
   );
   // Accumulates pending page header field changes to avoid losing edits
   const pendingPageFieldsRef = useRef<Record<string, string>>({});
+  // What the open section form's edits are relative to (see trackFormChange).
+  const formBaseRef = useRef<FormBase | null>(null);
 
   // Keep a ref to the latest render-scope values so debounced callbacks
   // always read fresh data instead of a stale closure.
@@ -409,6 +419,10 @@ export function SectionsEditor({
     sectionVariantIndex: 0,
     selectedSectionIndex: null,
   });
+
+  // A request to re-seed the open form from the stored section (see reloadStaleForm).
+  const [formReloadRequest, setFormReloadRequest] = useState(0);
+  const [formReloadHandled, setFormReloadHandled] = useState(0);
 
   // Declared above the early returns below: a hook after a conditional return
   // is skipped on the loading render, so the next render calls one more hook
@@ -719,6 +733,32 @@ export function SectionsEditor({
     }
   }
 
+  if (formReloadRequest !== formReloadHandled) {
+    setFormReloadHandled(formReloadRequest);
+    const rawSection =
+      selectedSectionIndex !== null ? rawSections[selectedSectionIndex] : null;
+    const parsed =
+      selectedSectionIndex !== null
+        ? parsedSections[selectedSectionIndex]
+        : null;
+    if (rawSection && parsed && selectedSectionIndex !== null) {
+      setFieldBreadcrumbs([]);
+      setFormResetKey((key) => key + 1);
+      if (parsed.isMultivariate) {
+        applySectionVariant(
+          rawSection,
+          parsed,
+          activeSectionVariantIndex,
+          selectedSectionIndex,
+        );
+      } else {
+        const unwrapped = unwrapSection(rawSection, parsed, decofile ?? {});
+        setFormValue(unwrapped?.data ?? null);
+        setActiveResolveType(unwrapped?.resolveType ?? null);
+      }
+    }
+  }
+
   const sandbox = {
     orgSlug,
     virtualMcpId,
@@ -793,11 +833,34 @@ export function SectionsEditor({
     setFormResetKey((key) => key + 1);
   };
 
+  /**
+   * Last resort when a save keeps colliding with newer stored content: drop
+   * the pending edit and re-seed the form from the stored section, rather
+   * than write the form's older copy over it.
+   */
+  const reloadStaleForm = () => {
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    pendingSectionSaveRef.current = null;
+    toast.error(t("sectionsEditor.sectionsEditor.blockChangedElsewhere"));
+    setFormReloadRequest((n) => n + 1);
+  };
+
   const scheduleAutoSave = (
     nextValue: Record<string, unknown>,
     sectionIndex: number,
+    /** Saves already refused for building on an outdated copy. */
+    conflicts = 0,
   ) => {
     const targetSectionVariantIndex = latestRef.current.sectionVariantIndex;
+    const tracked = formBaseRef.current;
+    const formBase =
+      tracked?.sectionIndex === sectionIndex &&
+      tracked.variantIndex === targetSectionVariantIndex
+        ? tracked
+        : null;
     const pending = pendingSectionSaveRef.current;
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
@@ -826,21 +889,84 @@ export function SectionsEditor({
       const parsed = latestParsedSections[sectionIndex];
       if (!parsed) return;
 
+      const startedFrom = formBase?.base;
+      const stored = sectionFormSource(
+        rawSection,
+        parsed,
+        targetSectionVariantIndex,
+        latestDecofile,
+      );
+      // Someone else changed the section since the form last saved it (a
+      // publish, a sync): apply the form's own edits on top of what is
+      // stored, instead of writing the form's older copy over it.
+      const rebased =
+        startedFrom && stored && formSourceMovedOn(startedFrom, stored)
+          ? (mergeBlockJson(startedFrom, nextValue, stored) as Record<
+              string,
+              unknown
+            >)
+          : null;
+      const value = rebased ?? nextValue;
+      // Show the merged section only while the form is still on it and has
+      // not moved past `nextValue`; otherwise its baseline stays `nextValue`.
+      const showRebased =
+        !!rebased &&
+        formBaseRef.current === formBase &&
+        formBase?.emitted === nextValue;
+      if (rebased) {
+        toast.info(t("sectionsEditor.sectionsEditor.blockMergedWithOthers"));
+      }
+      if (showRebased && formBase) {
+        formBase.emitted = rebased;
+        setFormValue(rebased);
+      }
+      // The stored copy becomes this value; a failed write puts it back.
+      const savedBase = showRebased || !rebased ? value : nextValue;
+      if (formBase) formBase.base = savedBase;
+      const saveCallbacks = {
+        onSuccess: () => onSaved?.(),
+        onError: (err: Error) => {
+          if (formBase?.base === savedBase && startedFrom) {
+            formBase.base = startedFrom;
+          }
+          if (err instanceof BlockConflictError) {
+            // The save re-read the branch; build on that copy once more.
+            if (conflicts === 0) {
+              const latest = formBase?.emitted;
+              scheduleAutoSave(
+                latest && typeof latest === "object"
+                  ? (latest as Record<string, unknown>)
+                  : nextValue,
+                sectionIndex,
+                conflicts + 1,
+              );
+            } else {
+              reloadStaleForm();
+            }
+            return;
+          }
+          toast.error(
+            t("sectionsEditor.sectionsEditor.saveFailed", {
+              error: err.message,
+            }),
+          );
+        },
+      };
+
       // Saved block: write the block entry directly (savedBlockKey unwraps hidden wrappers).
       if (parsed.isSavedBlock) {
         const blockKey = savedBlockKey(rawSection, parsed);
         if (!blockKey) return;
         saveBlock.mutate(
-          { blockKey, data: nextValue },
           {
-            onSuccess: () => onSaved?.(),
-            onError: (err) =>
-              toast.error(
-                t("sectionsEditor.sectionsEditor.saveFailed", {
-                  error: err.message,
-                }),
-              ),
+            blockKey,
+            data: value,
+            // The version this write builds on, for the server's stale check.
+            ...(startedFrom
+              ? { base: { value: rebased ? stored : startedFrom } }
+              : {}),
           },
+          saveCallbacks,
         );
         return;
       }
@@ -859,7 +985,7 @@ export function SectionsEditor({
         const updatedMvObj = updateMultivariateSectionVariantValue(
           mvObj,
           targetSectionVariantIndex,
-          nextValue,
+          value,
         );
         updatedSections[sectionIndex] = rebuildSectionWithMultivariate(
           rawSection,
@@ -876,7 +1002,7 @@ export function SectionsEditor({
           ? [...(mvObj.variants as Array<Record<string, unknown>>)]
           : [];
         if (variants[0]) {
-          variants[0] = { ...variants[0], value: nextValue };
+          variants[0] = { ...variants[0], value: value };
         }
         mvObj.variants = variants;
         if (isLazy) {
@@ -891,10 +1017,10 @@ export function SectionsEditor({
         // Re-wrap into lazy structure
         updatedSections[sectionIndex] = {
           ...rawSection,
-          section: nextValue,
+          section: value,
         } as RawSection;
       } else {
-        updatedSections[sectionIndex] = nextValue as RawSection;
+        updatedSections[sectionIndex] = value as RawSection;
       }
 
       // Write back into the correct variant or directly
@@ -920,15 +1046,7 @@ export function SectionsEditor({
       }
       saveBlock.mutate(
         { blockKey: latestPageKey, data: fullPageData },
-        {
-          onSuccess: () => onSaved?.(),
-          onError: (err) =>
-            toast.error(
-              t("sectionsEditor.sectionsEditor.saveFailed", {
-                error: err.message,
-              }),
-            ),
-        },
+        saveCallbacks,
       );
     };
     pendingSectionSaveRef.current = {
@@ -979,6 +1097,14 @@ export function SectionsEditor({
 
   const handleFormChange = (val: unknown) => {
     const next = val as Record<string, unknown>;
+    if (selectedSectionIndex !== null) {
+      formBaseRef.current = trackFormChange(formBaseRef.current, {
+        sectionIndex: selectedSectionIndex,
+        variantIndex: latestRef.current.sectionVariantIndex,
+        shown: formValue,
+        next,
+      });
+    }
     setFormValue(next);
     if (selectedSectionIndex !== null) {
       scheduleAutoSave(next, selectedSectionIndex);

@@ -277,6 +277,10 @@ export const sectionsEditor = {
     "Nenhum campo editável para esta variante.",
   "sectionsEditor.sectionsEditor.noPageFound":
     "Nenhuma página encontrada para {currentPath}",
+  "sectionsEditor.sectionsEditor.blockChangedElsewhere":
+    "Este bloco mudou enquanto você editava e não foi possível salvar. A versão mais recente foi carregada.",
+  "sectionsEditor.sectionsEditor.blockMergedWithOthers":
+    "Este bloco foi atualizado enquanto você editava. Suas alterações foram aplicadas sobre a versão mais recente.",
   "sectionsEditor.sectionsEditor.saveFailed": "Falha ao salvar: {error}",
   "sectionsEditor.sectionsEditor.savedGlobalBlock":
     'Bloco global salvo "{blockId}"',
