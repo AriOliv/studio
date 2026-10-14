@@ -45,6 +45,8 @@ export interface FormBase {
   base: Record<string, unknown>;
   /** The last value the form itself produced. */
   emitted: unknown;
+  /** How many sections the page had when the form started. */
+  sectionCount: number;
 }
 
 /**
@@ -61,9 +63,10 @@ export function trackFormChange(
     variantIndex: number;
     shown: Record<string, unknown> | null;
     next: unknown;
+    sectionCount: number;
   },
 ): FormBase | null {
-  const { sectionIndex, variantIndex, shown, next } = change;
+  const { sectionIndex, variantIndex, shown, next, sectionCount } = change;
   if (
     tracked &&
     tracked.sectionIndex === sectionIndex &&
@@ -74,7 +77,7 @@ export function trackFormChange(
     return tracked;
   }
   return shown
-    ? { sectionIndex, variantIndex, base: shown, emitted: next }
+    ? { sectionIndex, variantIndex, base: shown, emitted: next, sectionCount }
     : null;
 }
 
@@ -86,4 +89,42 @@ export function formSourceMovedOn(
   return (
     current !== null && canonicalBlockJson(base) !== canonicalBlockJson(current)
   );
+}
+
+/**
+ * True when the stored value at the form's position is a different kind of
+ * section than the one the form opened. Its edits can't be applied there.
+ */
+export function sectionTypeChanged(
+  base: Record<string, unknown>,
+  stored: Record<string, unknown>,
+): boolean {
+  return base.__resolveType !== stored.__resolveType;
+}
+
+/**
+ * Where the section the form opened sits now, when sections were inserted or
+ * removed since it started: the one position whose stored value is exactly
+ * what the form started from. `"here"` when the page has as many sections as
+ * before, so the section at the form's position is the form's own, edited in
+ * place (a page can hold identical twins, and following one would write to
+ * the wrong section). `"unknown"` when the count changed but the form's
+ * section can't be told apart: none or several positions match.
+ */
+export function findSectionMovedTo(
+  base: Record<string, unknown>,
+  sections: Array<Record<string, unknown> | null>,
+  formIndex: number,
+  sectionCountAtStart: number,
+): number | "here" | "unknown" {
+  if (sections.length === sectionCountAtStart) return "here";
+  const started = canonicalBlockJson(base);
+  const matches = sections.flatMap((section, i) =>
+    i !== formIndex &&
+    section !== null &&
+    canonicalBlockJson(section) === started
+      ? [i]
+      : [],
+  );
+  return matches.length === 1 ? (matches[0] as number) : "unknown";
 }

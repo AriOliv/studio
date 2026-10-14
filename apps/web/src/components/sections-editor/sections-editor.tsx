@@ -38,11 +38,14 @@ import { AddSectionButton, SectionList, parseSections } from "./section-list";
 import { isLazyResolveType } from "./section-lazy";
 import { savedBlockKey, unwrapSection } from "./unwrap-section";
 import {
+  findSectionMovedTo,
   formSourceMovedOn,
   sectionFormSource,
+  sectionTypeChanged,
   trackFormChange,
   type FormBase,
 } from "./form-base";
+import { describeConflictFields } from "./conflict-fields";
 import { BlockConflictError } from "./decofile-api";
 import { mergeBlockJson } from "@decocms/shared/decofile";
 import { arrayMove } from "@dnd-kit/sortable";
@@ -838,13 +841,15 @@ export function SectionsEditor({
    * the pending edit and re-seed the form from the stored section, rather
    * than write the form's older copy over it.
    */
-  const reloadStaleForm = () => {
+  const reloadStaleForm = (
+    message: string = t("sectionsEditor.sectionsEditor.blockChangedElsewhere"),
+  ) => {
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
       debounceRef.current = null;
     }
     pendingSectionSaveRef.current = null;
-    toast.error(t("sectionsEditor.sectionsEditor.blockChangedElsewhere"));
+    toast.error(message);
     setFormReloadRequest((n) => n + 1);
   };
 
@@ -896,15 +901,58 @@ export function SectionsEditor({
         targetSectionVariantIndex,
         latestDecofile,
       );
-      // Someone else changed the section since the form last saved it (a
-      // publish, a sync): apply the form's own edits on top of what is
-      // stored, instead of writing the form's older copy over it.
+      const movedOn =
+        !!startedFrom && !!stored && formSourceMovedOn(startedFrom, stored);
+      if (movedOn && startedFrom && stored) {
+        // A different kind of section now sits where the form points: its
+        // edits can't be applied there, so start over from what is stored.
+        if (sectionTypeChanged(startedFrom, stored)) {
+          reloadStaleForm(
+            t("sectionsEditor.sectionsEditor.sectionReplacedElsewhere"),
+          );
+          return;
+        }
+        // Sections were inserted or removed: follow the form's section to its
+        // new position and save there, or start over when it can't be found.
+        const movedTo = parsed.isSavedBlock
+          ? "here"
+          : findSectionMovedTo(
+              startedFrom,
+              latestRawSections.map((raw, j) =>
+                sectionFormSource(
+                  raw,
+                  latestParsedSections[j],
+                  targetSectionVariantIndex,
+                  latestDecofile,
+                ),
+              ),
+              sectionIndex,
+              formBase?.sectionCount ?? latestRawSections.length,
+            );
+        if (movedTo === "unknown") {
+          reloadStaleForm(
+            t("sectionsEditor.sectionsEditor.sectionReplacedElsewhere"),
+          );
+          return;
+        }
+        if (typeof movedTo === "number" && formBase) {
+          formBase.sectionCount = latestRawSections.length;
+          formBase.sectionIndex = movedTo;
+          setSelectedSectionIndex(movedTo);
+          scheduleAutoSave(nextValue, movedTo, conflicts);
+          return;
+        }
+      }
+      // The section changed since the form last saved it (a publish, a sync):
+      // apply the form's own edits on top of what is stored. Where both
+      // changed the same value, the stored one stays and the user is told.
+      const overwritten: string[] = [];
       const rebased =
-        startedFrom && stored && formSourceMovedOn(startedFrom, stored)
-          ? (mergeBlockJson(startedFrom, nextValue, stored) as Record<
-              string,
-              unknown
-            >)
+        movedOn && startedFrom && stored
+          ? (mergeBlockJson(startedFrom, nextValue, stored, {
+              prefer: "theirs",
+              conflicts: overwritten,
+            }) as Record<string, unknown>)
           : null;
       const value = rebased ?? nextValue;
       // Show the merged section only while the form is still on it and has
@@ -913,7 +961,13 @@ export function SectionsEditor({
         !!rebased &&
         formBaseRef.current === formBase &&
         formBase?.emitted === nextValue;
-      if (rebased) {
+      if (overwritten.length > 0) {
+        toast.warning(
+          t("sectionsEditor.sectionsEditor.formFieldsKeptFromStored", {
+            fields: describeConflictFields(overwritten),
+          }),
+        );
+      } else if (rebased) {
         toast.info(t("sectionsEditor.sectionsEditor.blockMergedWithOthers"));
       }
       if (showRebased && formBase) {
@@ -922,7 +976,10 @@ export function SectionsEditor({
       }
       // The stored copy becomes this value; a failed write puts it back.
       const savedBase = showRebased || !rebased ? value : nextValue;
-      if (formBase) formBase.base = savedBase;
+      if (formBase) {
+        formBase.base = savedBase;
+        formBase.sectionCount = latestRawSections.length;
+      }
       const saveCallbacks = {
         onSuccess: () => onSaved?.(),
         onError: (err: Error) => {
@@ -965,6 +1022,8 @@ export function SectionsEditor({
             ...(startedFrom
               ? { base: { value: rebased ? stored : startedFrom } }
               : {}),
+            // A refused save comes back here and goes through the checks above.
+            rebaseOnConflict: false,
           },
           saveCallbacks,
         );
@@ -1045,7 +1104,11 @@ export function SectionsEditor({
         fullPageData.sections = updatedSections;
       }
       saveBlock.mutate(
-        { blockKey: latestPageKey, data: fullPageData },
+        {
+          blockKey: latestPageKey,
+          data: fullPageData,
+          rebaseOnConflict: false,
+        },
         saveCallbacks,
       );
     };
@@ -1103,6 +1166,7 @@ export function SectionsEditor({
         variantIndex: latestRef.current.sectionVariantIndex,
         shown: formValue,
         next,
+        sectionCount: latestRef.current.rawSections.length,
       });
     }
     setFormValue(next);
