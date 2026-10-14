@@ -1009,6 +1009,7 @@ export interface StudioToolIO {
       org?: string | undefined;
       from?: string | undefined;
       to?: string | undefined;
+      project?: string | undefined;
     };
     output: {
       range: { from: string; to: string };
@@ -1021,6 +1022,10 @@ export interface StudioToolIO {
               label: string;
               value: number | null;
               unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
             }[];
           }
         | {
@@ -1034,6 +1039,548 @@ export interface StudioToolIO {
             title: string;
             columns: string[];
             rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
+          }
+      )[];
+    };
+  };
+  TASK_BOARD_OPERATION: {
+    input: {
+      org?: string | undefined;
+      from?: string | undefined;
+      to?: string | undefined;
+      project?: string | undefined;
+    };
+    output: {
+      range: { from: string; to: string };
+      org: string;
+      sections: (
+        | {
+            kind: "stat";
+            title: string;
+            values: {
+              label: string;
+              value: number | null;
+              unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "series";
+            title: string;
+            points: Record<string, string | number | null>[];
+            unit?: string | undefined;
+          }
+        | {
+            kind: "table";
+            title: string;
+            columns: string[];
+            rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
+          }
+      )[];
+    };
+  };
+  TASK_BOARD_OPERATION_TASKS: {
+    input: {
+      drill: string;
+      org?: string | undefined;
+      from?: string | undefined;
+      to?: string | undefined;
+      project?: string | undefined;
+    };
+    output: {
+      range: { from: string; to: string };
+      org: string;
+      sections: (
+        | {
+            kind: "stat";
+            title: string;
+            values: {
+              label: string;
+              value: number | null;
+              unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "series";
+            title: string;
+            points: Record<string, string | number | null>[];
+            unit?: string | undefined;
+          }
+        | {
+            kind: "table";
+            title: string;
+            columns: string[];
+            rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
+          }
+      )[];
+    };
+  };
+  TASK_BOARD_REWORK: {
+    input: {
+      org?: string | undefined;
+      from?: string | undefined;
+      to?: string | undefined;
+      project?: string | undefined;
+    };
+    output: {
+      range: { from: string; to: string };
+      org: string;
+      sections: (
+        | {
+            kind: "stat";
+            title: string;
+            values: {
+              label: string;
+              value: number | null;
+              unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "series";
+            title: string;
+            points: Record<string, string | number | null>[];
+            unit?: string | undefined;
+          }
+        | {
+            kind: "table";
+            title: string;
+            columns: string[];
+            rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
+          }
+      )[];
+    };
+  };
+  TASK_BOARD_SPRINTS: {
+    input: {
+      org?: string | undefined;
+      from?: string | undefined;
+      to?: string | undefined;
+      project?: string | undefined;
+    };
+    output: {
+      range: { from: string; to: string };
+      org: string;
+      sections: (
+        | {
+            kind: "stat";
+            title: string;
+            values: {
+              label: string;
+              value: number | null;
+              unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "series";
+            title: string;
+            points: Record<string, string | number | null>[];
+            unit?: string | undefined;
+          }
+        | {
+            kind: "table";
+            title: string;
+            columns: string[];
+            rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
           }
       )[];
     };
@@ -1043,6 +1590,7 @@ export interface StudioToolIO {
       org?: string | undefined;
       from?: string | undefined;
       to?: string | undefined;
+      project?: string | undefined;
     };
     output: {
       range: { from: string; to: string };
@@ -1055,6 +1603,10 @@ export interface StudioToolIO {
               label: string;
               value: number | null;
               unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
             }[];
           }
         | {
@@ -1068,6 +1620,83 @@ export interface StudioToolIO {
             title: string;
             columns: string[];
             rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
           }
       )[];
     };
@@ -1077,6 +1706,7 @@ export interface StudioToolIO {
       org?: string | undefined;
       from?: string | undefined;
       to?: string | undefined;
+      project?: string | undefined;
     };
     output: {
       range: { from: string; to: string };
@@ -1089,6 +1719,10 @@ export interface StudioToolIO {
               label: string;
               value: number | null;
               unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
             }[];
           }
         | {
@@ -1102,6 +1736,83 @@ export interface StudioToolIO {
             title: string;
             columns: string[];
             rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
           }
       )[];
     };
@@ -1111,6 +1822,7 @@ export interface StudioToolIO {
       org?: string | undefined;
       from?: string | undefined;
       to?: string | undefined;
+      project?: string | undefined;
     };
     output: {
       range: { from: string; to: string };
@@ -1123,6 +1835,10 @@ export interface StudioToolIO {
               label: string;
               value: number | null;
               unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
             }[];
           }
         | {
@@ -1136,6 +1852,83 @@ export interface StudioToolIO {
             title: string;
             columns: string[];
             rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
           }
       )[];
     };
@@ -1145,6 +1938,7 @@ export interface StudioToolIO {
       org?: string | undefined;
       from?: string | undefined;
       to?: string | undefined;
+      project?: string | undefined;
     };
     output: {
       range: { from: string; to: string };
@@ -1157,6 +1951,10 @@ export interface StudioToolIO {
               label: string;
               value: number | null;
               unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
             }[];
           }
         | {
@@ -1170,6 +1968,83 @@ export interface StudioToolIO {
             title: string;
             columns: string[];
             rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
           }
       )[];
     };
@@ -1179,6 +2054,7 @@ export interface StudioToolIO {
       org?: string | undefined;
       from?: string | undefined;
       to?: string | undefined;
+      project?: string | undefined;
     };
     output: {
       range: { from: string; to: string };
@@ -1191,6 +2067,10 @@ export interface StudioToolIO {
               label: string;
               value: number | null;
               unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
             }[];
           }
         | {
@@ -1204,6 +2084,83 @@ export interface StudioToolIO {
             title: string;
             columns: string[];
             rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
           }
       )[];
     };
@@ -4903,6 +5860,7 @@ export interface StudioToolIO {
       org?: string | undefined;
       from?: string | undefined;
       to?: string | undefined;
+      project?: string | undefined;
     };
     output: {
       range: { from: string; to: string };
@@ -4915,6 +5873,10 @@ export interface StudioToolIO {
               label: string;
               value: number | null;
               unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
             }[];
           }
         | {
@@ -4928,6 +5890,83 @@ export interface StudioToolIO {
             title: string;
             columns: string[];
             rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
           }
       )[];
     };
@@ -4937,6 +5976,7 @@ export interface StudioToolIO {
       org?: string | undefined;
       from?: string | undefined;
       to?: string | undefined;
+      project?: string | undefined;
     };
     output: {
       range: { from: string; to: string };
@@ -4949,6 +5989,10 @@ export interface StudioToolIO {
               label: string;
               value: number | null;
               unit?: string | undefined;
+              previous?: number | null | undefined;
+              better?: "up" | "down" | undefined;
+              detail?: string | undefined;
+              drill?: string | undefined;
             }[];
           }
         | {
@@ -4962,6 +6006,83 @@ export interface StudioToolIO {
             title: string;
             columns: string[];
             rows: (string | number | null)[][];
+            units?: Record<string, string> | undefined;
+            drills?: (string | null)[] | undefined;
+          }
+        | {
+            kind: "funnel";
+            title: string;
+            stages: {
+              label: string;
+              value: number;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "bars";
+            title: string;
+            bars: {
+              label: string;
+              value: number;
+              detail?: string | undefined;
+              note?: string | undefined;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            total?: { value: number; label: string } | undefined;
+          }
+        | {
+            kind: "breakdown";
+            title: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            dimensions: {
+              label: string;
+              rows: {
+                label: string;
+                count: number;
+                values: Record<string, number | null>;
+                drill?: string | undefined;
+              }[];
+            }[];
+          }
+        | {
+            kind: "matrix";
+            title: string;
+            rowLabel: string;
+            colLabel: string;
+            metrics: {
+              key: string;
+              label: string;
+              unit?: string | undefined;
+              better?: "up" | "down" | undefined;
+            }[];
+            rows: string[];
+            cols: string[];
+            cells: {
+              row: string;
+              col: string;
+              count: number;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+          }
+        | {
+            kind: "categories";
+            title: string;
+            layout: "stacked" | "grouped";
+            keys: string[];
+            categories: {
+              label: string;
+              values: Record<string, number | null>;
+              drill?: string | undefined;
+            }[];
+            unit?: string | undefined;
+            baseline?: string | undefined;
           }
       )[];
     };
