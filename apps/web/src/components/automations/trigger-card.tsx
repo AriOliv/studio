@@ -45,10 +45,13 @@ export function TriggerCard({
   trigger,
   automationId,
   connectionName,
+  readOnly = false,
 }: {
   trigger: AutomationTrigger;
   automationId: string;
   connectionName?: string;
+  /** A built-in's starter: shown, never changed. */
+  readOnly?: boolean;
 }) {
   const t = useT();
   const {
@@ -219,9 +222,7 @@ export function TriggerCard({
                     ? t("automations.triggerCard.webhookPostToFire")
                     : `${trigger.event_type}${connectionName ? ` · ${connectionName}` : ""}`}
             </span>
-            {isColumnTransition && trigger.from && (
-              <ColumnOrigin from={trigger.from} />
-            )}
+            {isColumnTransition && <ColumnOrigin from={trigger.from} />}
             {!isCron &&
               !isWebhook &&
               !isColumnTransition &&
@@ -264,14 +265,16 @@ export function TriggerCard({
               <RefreshCw01 size={13} className="text-muted-foreground" />
             </Button>
           )}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 w-7 p-0 opacity-0 group-hover:opacity-100 transition-opacity"
-            onClick={() => setConfirmDelete(true)}
-          >
-            <XClose size={13} className="text-muted-foreground" />
-          </Button>
+          {!readOnly && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0 opacity-0 group-hover:opacity-100 transition-opacity"
+              onClick={() => setConfirmDelete(true)}
+            >
+              <XClose size={13} className="text-muted-foreground" />
+            </Button>
+          )}
         </div>
       </div>
 
@@ -334,26 +337,28 @@ export function TriggerCard({
   );
 }
 
-/** Which moves into the column count; nothing for any column. */
-function ColumnOrigin({
-  from,
-}: {
-  from: NonNullable<AutomationTrigger["from"]>;
-}) {
+/** Which cards the starter runs on: where they came from, and only ones
+ *  nobody owns. */
+function ColumnOrigin({ from }: { from: AutomationTrigger["from"] }) {
   const t = useT();
-  const text =
-    from.kind === "earlier"
-      ? t("automations.triggerCard.fromEarlier")
-      : from.kind === "later"
-        ? t("automations.triggerCard.fromLater")
-        : from.kind === "statuses"
-          ? t("automations.triggerCard.fromColumns", {
-              columns: from.statuses
-                .map((key) => laneHeader(key, t).label)
-                .join(", "),
-            })
-          : null;
-  if (!text) return null;
+  const origin =
+    !from || from.kind === "any"
+      ? null
+      : from.kind === "earlier"
+        ? t("automations.triggerCard.fromEarlier")
+        : from.kind === "later"
+          ? t("automations.triggerCard.fromLater")
+          : from.kind === "statuses"
+            ? t("automations.triggerCard.fromColumns", {
+                columns: from.statuses
+                  .map((key) => laneHeader(key, t).label)
+                  .join(", "),
+              })
+            : null;
+  // A person's card is never taken over, whatever the origin.
+  const text = [origin, t("automations.triggerCard.unownedOnly")]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <span className="text-xs text-muted-foreground/60 truncate">{text}</span>
   );

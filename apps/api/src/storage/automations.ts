@@ -10,7 +10,7 @@
  * DB-side acquire/release.
  */
 
-import { type Kysely } from "kysely";
+import { type Kysely, sql } from "kysely";
 import { generatePrefixedId } from "@decocms/shared/utils/generate-id";
 import type {
   Automation,
@@ -72,6 +72,8 @@ export interface AutomationWithTriggerCount extends Automation {
 
 export interface AutomationWithTriggerInfo extends AutomationWithTriggerCount {
   nearest_next_run_at: string | null;
+  /** The board columns its `board_column_transition` starters watch. */
+  board_columns: string[];
 }
 
 export interface AutomationsStorage {
@@ -178,6 +180,7 @@ function automationFromDbRow(row: {
   temperature: number;
   max_agent_steps: number | null;
   virtual_mcp_id: string;
+  system_key: string | null;
   created_at: Date | string;
   updated_at: Date | string;
 }): Automation {
@@ -193,6 +196,7 @@ function automationFromDbRow(row: {
     temperature: row.temperature,
     max_agent_steps: row.max_agent_steps ?? null,
     virtual_mcp_id: row.virtual_mcp_id,
+    system_key: row.system_key ?? null,
     created_at: toIsoString(row.created_at),
     updated_at: toIsoString(row.updated_at),
   };
@@ -248,6 +252,7 @@ const TRIGGER_JOIN_AUTOMATION_COLUMNS = [
   "a.temperature as a_temperature",
   "a.max_agent_steps as a_max_agent_steps",
   "a.virtual_mcp_id as a_virtual_mcp_id",
+  "a.system_key as a_system_key",
   "a.created_at as a_created_at",
   "a.updated_at as a_updated_at",
 ] as const;
@@ -264,6 +269,7 @@ function automationFromAliasedRow(row: {
   a_temperature: number;
   a_max_agent_steps: number | null;
   a_virtual_mcp_id: string;
+  a_system_key: string | null;
   a_created_at: Date | string;
   a_updated_at: Date | string;
 }): Automation {
@@ -279,6 +285,7 @@ function automationFromAliasedRow(row: {
     temperature: row.a_temperature,
     max_agent_steps: row.a_max_agent_steps,
     virtual_mcp_id: row.a_virtual_mcp_id,
+    system_key: row.a_system_key,
     created_at: row.a_created_at,
     updated_at: row.a_updated_at,
   });
@@ -364,11 +371,19 @@ class KyselyAutomationsStorage implements AutomationsStorage {
         "a.temperature",
         "a.max_agent_steps",
         "a.virtual_mcp_id",
+        "a.system_key",
         "a.created_at",
         "a.updated_at",
       ])
       .select((eb) => eb.fn.count("t.id").as("trigger_count"))
       .select((eb) => eb.fn.min("t.next_run_at").as("nearest_next_run_at"))
+      .select(
+        sql<
+          string[]
+        >`coalesce(array_agg(distinct t.column_key) filter (where t.type = 'board_column_transition'), '{}')`.as(
+          "board_columns",
+        ),
+      )
       .where("a.organization_id", "=", organizationId);
 
     if (virtualMcpId) {
@@ -388,6 +403,7 @@ class KyselyAutomationsStorage implements AutomationsStorage {
         "a.temperature",
         "a.max_agent_steps",
         "a.virtual_mcp_id",
+        "a.system_key",
         "a.created_at",
         "a.updated_at",
       ])
@@ -397,6 +413,7 @@ class KyselyAutomationsStorage implements AutomationsStorage {
     return rows.map((row) => ({
       ...automationFromDbRow(row),
       trigger_count: Number(row.trigger_count),
+      board_columns: row.board_columns,
       nearest_next_run_at: row.nearest_next_run_at
         ? toIsoString(row.nearest_next_run_at as unknown as string)
         : null,

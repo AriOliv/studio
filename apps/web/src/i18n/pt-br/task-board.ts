@@ -91,15 +91,12 @@ export const taskBoard = {
     "Não foi possível iniciar o chat de configuração do quadro",
   "taskBoard.columnRules.add": "Adicionar instruções",
   "taskBoard.columnRules.editAriaLabel": "Editar regras de {lane}",
-  "taskBoard.columnRules.defaultRun": "Executa o agente",
   "taskBoard.columnRules.skillsOnly": "{count} skills",
-  "taskBoard.columnRules.runLabel": "Executar o agente",
-  "taskBoard.columnRules.runHint":
-    "Inicia uma execução em cada card que chega aqui, a menos que alguém já seja o responsável.",
-  "taskBoard.columnRules.automationLabel":
-    "O que fazer com um card que chega aqui",
-  "taskBoard.columnRules.automationPlaceholder":
-    "O que o agente deve fazer com um card que chega aqui? Deixe vazio para o comportamento padrão.",
+  "taskBoard.columnRules.automationsLabel": "Automações",
+  "taskBoard.columnRules.toggleAutomation":
+    "Rodar {name} nos cards que chegam aqui",
+  "taskBoard.columnRules.noAutomations": "Nada roda nos cards que chegam aqui.",
+  "taskBoard.columnRules.addAutomation": "Adicionar uma automação",
   "taskBoard.columnRules.promptLabel": "Instruções",
   "taskBoard.columnRules.promptPlaceholder":
     "Convenções, ferramentas preferidas, o que nunca tocar",

@@ -15,6 +15,7 @@ import {
   automationInstruction,
   cardFireFence,
 } from "./board-column-transition";
+import { IMPLEMENTER_SYSTEM_KEY } from "./builtin";
 
 /** A card a fire runs on: the card, the column the run is for, and the event
  *  that picked it (it keys the run, so a retried fire starts it once). */
@@ -23,6 +24,8 @@ export interface CardTarget {
   itemId: string;
   columnKey: string;
   eventKey: string;
+  /** Who moved the card there; null for a machine move. */
+  movedBy: string | null;
 }
 
 export type CardRunSkip =
@@ -30,6 +33,7 @@ export type CardRunSkip =
   | "moved_on"
   | "busy"
   | "owned"
+  | "delegated"
   | "lost_claim"
   | "rejected";
 
@@ -66,15 +70,28 @@ export async function runAutomationOnCard(
   if (item.assigneeId && item.assigneeId !== SUPER_AGENT_ASSIGNEE_ID) {
     return { skipped: "owned" };
   }
+  // Delegating a card moves it to In Progress and starts its run right away;
+  // the implementer is for the cards nobody handed over.
+  if (
+    automation.system_key === IMPLEMENTER_SYSTEM_KEY &&
+    item.assigneeId === SUPER_AGENT_ASSIGNEE_ID
+  ) {
+    return { skipped: "delegated" };
+  }
 
+  // The claim makes the run its owner's. A built-in's run belongs to whoever
+  // moved the card, as delegating it would; the member standing in as its
+  // creator is only the fallback.
+  const owner =
+    (automation.system_key && target.movedBy) || automation.created_by;
   let card = item;
   let claimed = false;
   if (!item.assigneeId) {
     const won = await ctx.storage.taskBoard.claimUnassignedForSuperAgent(
       item.id,
       item.organizationId,
-      automation.created_by,
-      automation.created_by,
+      owner,
+      owner,
       target.columnKey,
     );
     if (!won) return { skipped: "lost_claim" };
@@ -112,7 +129,7 @@ export async function runAutomationOnCard(
       const released = await ctx.storage.taskBoard.unassignSuperAgent(
         item.id,
         item.organizationId,
-        automation.created_by,
+        owner,
       );
       if (released) emitTaskBoardUpdated(item.organizationId, released);
     }

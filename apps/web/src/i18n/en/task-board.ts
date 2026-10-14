@@ -87,15 +87,13 @@ export const taskBoard = {
   "taskBoard.agenticSetup.failed": "Couldn't start the board setup chat",
   "taskBoard.columnRules.add": "Add instructions",
   "taskBoard.columnRules.editAriaLabel": "Edit rules for {lane}",
-  "taskBoard.columnRules.defaultRun": "Runs the agent",
   "taskBoard.columnRules.skillsOnly": "{count} skills",
-  "taskBoard.columnRules.runLabel": "Run the agent",
-  "taskBoard.columnRules.runHint":
-    "Start a run on every card that lands here, unless someone already owns it.",
-  "taskBoard.columnRules.automationLabel":
-    "What to do with a card landing here",
-  "taskBoard.columnRules.automationPlaceholder":
-    "What should the agent do with a card landing here? Leave empty for the built-in behavior.",
+  "taskBoard.columnRules.automationsLabel": "Automations",
+  "taskBoard.columnRules.toggleAutomation":
+    "Run {name} on cards that land here",
+  "taskBoard.columnRules.noAutomations":
+    "Nothing runs on the cards that land here.",
+  "taskBoard.columnRules.addAutomation": "Add an automation",
   "taskBoard.columnRules.promptLabel": "Instructions",
   "taskBoard.columnRules.promptPlaceholder":
     "Conventions, tools to prefer, what never to touch",
