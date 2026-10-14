@@ -513,6 +513,7 @@ const projectsIndexRoute = createRoute({
    *  other route owns it. */
   validateSearch: legacyWorkspaceCompatibilitySearchSchema.extend({
     files: z.coerce.boolean().optional().catch(undefined),
+    analytics: z.coerce.boolean().optional().catch(undefined),
   }),
   component: lazyRouteComponent(
     () => import("./routes/workspace/flat-project.tsx"),
@@ -825,6 +826,22 @@ const agentAnalyticsRoute = createRoute({
   ),
 });
 
+/** The task board analytics, narrowed to this project's cards. */
+const projectTaskBoardAnalyticsRoute = createRoute({
+  pendingComponent: ChatLayoutPending,
+  errorComponent: ChatLayoutError,
+  getParentRoute: () => agentWorkspaceRoute,
+  path: "/taskboard-analytics",
+  staticData: {
+    pageTitle: "taskBoard.analytics.title",
+    defaultMain: "board",
+    mainView: "board",
+  },
+  component: lazyRouteComponent(
+    () => import("./routes/workspace/taskboard-analytics.tsx"),
+  ),
+});
+
 const agentExperimentsRoute = createRoute({
   pendingComponent: ChatLayoutPending,
   errorComponent: ChatLayoutError,
@@ -1049,7 +1066,7 @@ const tasksRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/workspace/tasks.tsx")),
 });
 
-/** The task board's Grafana dashboards, in-product. Admin orgs only. */
+/** The org board's analytics. Every member; the cross-org picker is admin-org only. */
 const taskBoardAnalyticsRoute = createRoute({
   pendingComponent: ChatLayoutPending,
   errorComponent: ChatLayoutError,
@@ -1568,6 +1585,7 @@ const agentWorkspaceWithChildren = agentWorkspaceRoute.addChildren([
   agentHostingRoute,
   agentE2eRoute,
   agentAnalyticsRoute,
+  projectTaskBoardAnalyticsRoute,
   agentExperimentsRoute,
   agentMonitorRoute,
   agentAppRoute,
