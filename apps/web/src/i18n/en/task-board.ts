@@ -85,9 +85,9 @@ export const taskBoard = {
   "taskBoard.agenticSetup.message":
     "Help me set up my board around the work I'm doing.",
   "taskBoard.agenticSetup.failed": "Couldn't start the board setup chat",
-  "taskBoard.columnRules.add": "Add instructions",
-  "taskBoard.columnRules.editAriaLabel": "Edit rules for {lane}",
-  "taskBoard.columnRules.skillsOnly": "{count} skills",
+  "taskBoard.dropHint.pickUp": "{names} will pick this card up",
+  "taskBoard.dropHint.pickUpMany": "{names} will pick these cards up",
+  "taskBoard.columnRules.menuItem": "Rules and automations",
   "taskBoard.columnRules.automationsLabel": "Automations",
   "taskBoard.columnRules.toggleAutomation":
     "Run {name} on cards that land here",
