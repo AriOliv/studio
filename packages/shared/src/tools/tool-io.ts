@@ -2153,11 +2153,123 @@ export interface StudioToolIO {
       )[];
     };
   };
+  BLOG_SITE_GROUND: {
+    input: {
+      purpose: "format" | "link" | "context" | "brand" | "campaign" | "post";
+      virtualMcpId?: string | undefined;
+      focus?: string | undefined;
+      language?: string | undefined;
+    };
+    output: {
+      report: string;
+      outcome: "ok" | "failed" | "no-site" | "no-tools" | "timeout";
+      toolNames: string[];
+      evidence: string;
+      evidenceUri: string | null;
+      evidenceChars: number;
+    };
+  };
+  BLOG_SITE_CATALOGUE: {
+    input: {
+      grounding?:
+        | {
+            report: string;
+            outcome?:
+              | "ok"
+              | "failed"
+              | "no-site"
+              | "no-tools"
+              | "timeout"
+              | undefined;
+            evidence?: string | undefined;
+            evidenceUri?: string | null | undefined;
+          }
+        | undefined;
+      storeUrl?: string | undefined;
+    };
+    output: {
+      products: {
+        id: string;
+        name: string;
+        category: string;
+        price: string;
+        slug: string;
+        url: string;
+        images: string[];
+        description: string;
+      }[];
+      targets: {
+        kind: "category" | "collection";
+        id: string;
+        name: string;
+        slug: string;
+        url: string;
+      }[];
+      read: boolean;
+    };
+  };
   BLOG_BRAND_EXTRACT: {
     input: {
       blocks: { key: string; content: string }[];
       seo?: { key: string; content: string }[] | undefined;
       virtualMcpId?: string | undefined;
+      grounding?:
+        | {
+            report: string;
+            outcome?:
+              | "ok"
+              | "failed"
+              | "no-site"
+              | "no-tools"
+              | "timeout"
+              | undefined;
+            evidence?: string | undefined;
+            evidenceUri?: string | null | undefined;
+          }
+        | undefined;
+    };
+    output: {
+      values: { name: string; value: string }[];
+      description: string;
+      language: string;
+      storeUrl: string;
+      companyName: string;
+      targetAudience: string;
+      competitors: { name: string; value: string }[];
+      keywords: string[];
+      commercialPolicies: { name: string; value: string }[];
+      sources: string[];
+    };
+  };
+  BLOG_BRAND_ENRICH: {
+    input: {
+      profile: {
+        values: { name: string; value: string }[];
+        description: string;
+        language: string;
+        storeUrl: string;
+        companyName: string;
+        targetAudience: string;
+        competitors: { name: string; value: string }[];
+        keywords: string[];
+        commercialPolicies: { name: string; value: string }[];
+      };
+      blocks: { key: string; content: string }[];
+      seo?: { key: string; content: string }[] | undefined;
+      grounding?:
+        | {
+            report: string;
+            outcome?:
+              | "ok"
+              | "failed"
+              | "no-site"
+              | "no-tools"
+              | "timeout"
+              | undefined;
+            evidence?: string | undefined;
+            evidenceUri?: string | null | undefined;
+          }
+        | undefined;
     };
     output: {
       companyName: string;
@@ -2170,7 +2282,6 @@ export interface StudioToolIO {
       keywords: string[];
       commercialPolicies: { name: string; value: string }[];
       specialDates: { name: string; value: string }[];
-      sources: string[];
       researchSources: string[];
       searched: boolean;
       discarded: number;
@@ -2233,6 +2344,20 @@ export interface StudioToolIO {
       guidance?: string | undefined;
       count?: number | undefined;
       virtualMcpId?: string | undefined;
+      grounding?:
+        | {
+            report: string;
+            outcome?:
+              | "ok"
+              | "failed"
+              | "no-site"
+              | "no-tools"
+              | "timeout"
+              | undefined;
+            evidence?: string | undefined;
+            evidenceUri?: string | null | undefined;
+          }
+        | undefined;
     };
     output: { formats: { name: string; value: string }[] };
   };
@@ -2240,9 +2365,9 @@ export interface StudioToolIO {
     input: {
       brand: {
         description?: string | undefined;
-        companyName?: string | undefined;
         language?: string | undefined;
         storeUrl?: string | undefined;
+        companyName?: string | undefined;
         targetAudience?: string | undefined;
         tone?: string | undefined;
         dos?: { name: string; value: string }[] | undefined;
@@ -2307,6 +2432,20 @@ export interface StudioToolIO {
       count?: number | undefined;
       fileConfigId?: string | undefined;
       virtualMcpId?: string | undefined;
+      grounding?:
+        | {
+            report: string;
+            outcome?:
+              | "ok"
+              | "failed"
+              | "no-site"
+              | "no-tools"
+              | "timeout"
+              | undefined;
+            evidence?: string | undefined;
+            evidenceUri?: string | null | undefined;
+          }
+        | undefined;
     };
     output: {
       posts: {
@@ -2315,7 +2454,7 @@ export interface StudioToolIO {
         excerpt: string;
         categorySlugs: string[];
         authorEmails: string[];
-        cover: { url: string; alt: string };
+        cover: { url: string; alt: string; prompt: string };
         sections: {
           type: string;
           props: Record<string, unknown>;
@@ -2334,12 +2473,39 @@ export interface StudioToolIO {
       }[];
     };
   };
+  BLOG_POST_ILLUSTRATE: {
+    input: {
+      requests: { id: string; prompt: string; alt?: string | undefined }[];
+      productImages?: string[] | undefined;
+      companyName?: string | undefined;
+      fileConfigId?: string | undefined;
+    };
+    output: {
+      images: { id: string; url: string }[];
+      outcome: "ok" | "failed" | "no-bucket" | "no-model";
+      referenced: number;
+    };
+  };
   BLOG_LINK_SUGGEST: {
     input: {
       body: string;
       posts: { title: string; slug: string }[];
       count?: number | undefined;
       virtualMcpId?: string | undefined;
+      grounding?:
+        | {
+            report: string;
+            outcome?:
+              | "ok"
+              | "failed"
+              | "no-site"
+              | "no-tools"
+              | "timeout"
+              | undefined;
+            evidence?: string | undefined;
+            evidenceUri?: string | null | undefined;
+          }
+        | undefined;
     };
     output: { suggestions: { quote: string; slug: string }[] };
   };
@@ -2367,6 +2533,41 @@ export interface StudioToolIO {
       existingNames?: string[] | undefined;
       count?: number | undefined;
       virtualMcpId?: string | undefined;
+      grounding?:
+        | {
+            report: string;
+            outcome?:
+              | "ok"
+              | "failed"
+              | "no-site"
+              | "no-tools"
+              | "timeout"
+              | undefined;
+            evidence?: string | undefined;
+            evidenceUri?: string | null | undefined;
+          }
+        | undefined;
+      catalogue?:
+        | {
+            products: {
+              id: string;
+              name: string;
+              category: string;
+              price: string;
+              slug: string;
+              url: string;
+              images: string[];
+              description: string;
+            }[];
+            targets: {
+              kind: "category" | "collection";
+              id: string;
+              name: string;
+              slug: string;
+              url: string;
+            }[];
+          }
+        | undefined;
     };
     output: {
       campaigns: {
