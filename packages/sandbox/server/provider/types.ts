@@ -201,6 +201,12 @@ export interface EnsureOptions {
    * config names none, and then installs.
    */
   cloneOnly?: boolean;
+  /**
+   * Start from a snapshot of `repo` with its dependencies installed and its
+   * dev server running, rebuilt whenever its default branch moves. Freestyle only; ignored
+   * elsewhere and without `repo`.
+   */
+  repoSnapshot?: boolean;
   /** Frozen for the sandbox's lifetime — changing requires recreate. */
   env?: Record<string, string>;
   /**
