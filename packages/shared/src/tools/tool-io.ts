@@ -6610,6 +6610,7 @@ export interface StudioToolIO {
             | "webhook"
             | "board_column_transition"
             | "board_pr_ready"
+            | "linked_chat_run"
             | "jira_transition";
           cron_expression: string | null;
           connection_id: string | null;
@@ -6688,6 +6689,7 @@ export interface StudioToolIO {
         | "webhook"
         | "board_column_transition"
         | "board_pr_ready"
+        | "linked_chat_run"
         | "jira_transition";
       cron_expression?: string | undefined;
       connection_id?: string | undefined;
@@ -6722,6 +6724,7 @@ export interface StudioToolIO {
         | "webhook"
         | "board_column_transition"
         | "board_pr_ready"
+        | "linked_chat_run"
         | "jira_transition";
       created_at: string;
       webhook?: { url: string; token: string } | null | undefined;
