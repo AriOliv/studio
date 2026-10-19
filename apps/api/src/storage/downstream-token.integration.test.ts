@@ -24,7 +24,7 @@ describe("DownstreamTokenStorage", () => {
 
     // Create test connections required by FK constraints
     const now = new Date().toISOString();
-    for (const connId of ["c1", "conn_atomic"]) {
+    for (const connId of ["c1", "conn_atomic", "conn_per_user"]) {
       await sql`
         INSERT INTO connections (id, organization_id, created_by, title, connection_type, connection_url, status, created_at, updated_at)
         VALUES (${connId}, 'org_test', 'user_test', ${connId}, 'HTTP', 'https://test.com', 'active', ${now}, ${now})
@@ -140,5 +140,77 @@ describe("DownstreamTokenStorage", () => {
       .where("connectionId", "=", "conn_atomic")
       .executeTakeFirst();
     expect(Number(count?.c)).toBe(1);
+  });
+
+  // Per-user tokens share a connectionId, so every upsert has to target the
+  // partial unique index for its own scope (migration 170-zz-per-user-oauth):
+  // there is no plain unique index on connectionId to land an ON CONFLICT on.
+  describe("per-user tokens", () => {
+    const perUser = (
+      userId: string | null,
+      accessToken: string,
+    ): DownstreamTokenData => ({
+      connectionId: "conn_per_user",
+      userId,
+      accessToken,
+      refreshToken: `refresh_${accessToken}`,
+      scope: null,
+      expiresAt: new Date(Date.now() + 3600000),
+      clientId: null,
+      clientSecret: null,
+      tokenEndpoint: null,
+    });
+
+    const rows = () =>
+      database.db
+        .selectFrom("downstream_tokens")
+        .select(["userId"])
+        .where("connectionId", "=", "conn_per_user")
+        .execute();
+
+    it("keeps one row per (connection, user) under concurrent upserts", async () => {
+      await Promise.all([
+        storage.upsert(perUser("user_1", "u1_a")),
+        storage.upsert(perUser("user_1", "u1_b")),
+        storage.upsert(perUser("user_1", "u1_c")),
+      ]);
+
+      const forUser = (await rows()).filter((r) => r.userId === "user_1");
+      expect(forUser).toHaveLength(1);
+      const token = await storage.get("conn_per_user", "user_1");
+      if (!token) throw new Error("expected a token for user_1");
+      expect(["u1_a", "u1_b", "u1_c"]).toContain(token.accessToken);
+    });
+
+    it("isolates members and the shared token on the same connection", async () => {
+      await Promise.all([
+        storage.upsert(perUser("user_123", "u123")),
+        storage.upsert(perUser(null, "shared")),
+        storage.upsert(perUser(null, "shared_2")),
+      ]);
+
+      expect(
+        (await storage.get("conn_per_user", "user_1"))?.accessToken,
+      ).toMatch(/^u1_/);
+      expect(
+        (await storage.get("conn_per_user", "user_123"))?.accessToken,
+      ).toBe("u123");
+      const shared = await storage.get("conn_per_user", null);
+      if (!shared) throw new Error("expected the shared token");
+      expect(["shared", "shared_2"]).toContain(shared.accessToken);
+      expect(shared.userId).toBeNull();
+
+      const all = await rows();
+      expect(all.filter((r) => r.userId === null)).toHaveLength(1);
+      expect(all).toHaveLength(3);
+    });
+
+    it("deletes only the targeted scope", async () => {
+      await storage.delete("conn_per_user", "user_123");
+
+      expect(await storage.get("conn_per_user", "user_123")).toBeNull();
+      expect(await storage.get("conn_per_user", "user_1")).not.toBeNull();
+      expect(await storage.get("conn_per_user", null)).not.toBeNull();
+    });
   });
 });
