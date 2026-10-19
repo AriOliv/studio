@@ -1,3 +1,4 @@
+import { codexEnvFromCredential } from "./codex-env";
 /**
  * Dispatches harnesses that run inside the hosted sandbox instead of in the
  * Studio process.
@@ -238,7 +239,7 @@ export function isUnreachableStatus(status: number): boolean {
 export function harnessRunsInSandbox(
   harnessId: string | null | undefined,
 ): boolean {
-  return harnessId === SANDBOX_HOSTED_HARNESS;
+  return harnessId === SANDBOX_HOSTED_HARNESS || harnessId === "codex";
 }
 
 export class SandboxDispatchClient {
@@ -400,7 +401,10 @@ export class SandboxDispatchClient {
       runKeyPermissions({
         toolNames: selfToolGrantsFor({
           ...authority,
-          toolNames: resolveThreadToolNames(thread),
+          toolNames: [
+            ...resolveThreadToolNames(thread),
+            ...(this.harnessId === "codex" ? ["CODEX_SUBSCRIPTION_SYNC"] : []),
+          ],
           runScoped: resolveRunScopedToolNames(thread),
         }),
         grants,
@@ -558,16 +562,29 @@ export class SandboxDispatchClient {
     // is a booted sandbox that dies on an opaque model error minutes later.
     const runMetadata = this.ctx.metadata?.runMetadata;
     // Task-board runs carry a run class and keep their per-class model.
-    const modelEnv = runMetadata?.[RUN_CLASS_METADATA_KEY]
-      ? claudeCodeEnvFromCredential(
-          this.credential,
-          modelClassFromMetadata(runMetadata[MODEL_CLASS_METADATA_KEY]),
-        )
-      : claudeCodeEnvFromCredential(
-          this.credential,
-          "chat",
-          input.models.thinking.id,
-        );
+    const modelEnv =
+      this.harnessId === "codex"
+        ? codexEnvFromCredential(this.credential, input.models.thinking.id)
+        : runMetadata?.[RUN_CLASS_METADATA_KEY]
+          ? claudeCodeEnvFromCredential(
+              this.credential,
+              modelClassFromMetadata(runMetadata[MODEL_CLASS_METADATA_KEY]),
+            )
+          : claudeCodeEnvFromCredential(
+              this.credential,
+              "chat",
+              input.models.thinking.id,
+            );
+    if (this.harnessId !== "codex") {
+      Object.assign(modelEnv, {
+        STUDIO_CODEX_AUTH_JSON: null,
+        CODEX_API_KEY: null,
+        OPENAI_API_KEY: null,
+        OPENAI_BASE_URL: null,
+        CODEX_ACCESS_TOKEN: null,
+        CODEX_MODEL: null,
+      });
+    }
     const organization = this.ctx.organization;
     if (!organization) {
       throw new Error(
@@ -646,6 +663,7 @@ export class SandboxDispatchClient {
     let warmPoolAdopted = false;
     const dispatchOnce = (
       resume: { reason: string } | null,
+      revalidate: boolean,
     ): AsyncIterable<UIMessageChunk> =>
       (async function* () {
         const sandbox = await ensureSandbox(
@@ -655,7 +673,7 @@ export class SandboxDispatchClient {
             // Headless loop, no preview — unless someone is watching it.
             purpose: interactive ? "interactive" : "harness-run",
             // A continuation lost this sandbox; its claim surviving proves nothing.
-            revalidate: resume !== null,
+            revalidate,
             // The longest silence in the run: pod boot, clone, and
             // (interactive) install. The chat has no per-thread stream here, so
             // this rides the org `/watch`. Only on a cold start — an
@@ -668,7 +686,7 @@ export class SandboxDispatchClient {
               markTurn(runId, "cold-start");
               return publishRunStatusStage({
                 streamBuffer,
-                harnessId: SANDBOX_HOSTED_HARNESS,
+                harnessId,
                 taskId: runId,
                 stage: "starting-sandbox",
               });
@@ -681,7 +699,7 @@ export class SandboxDispatchClient {
         // The daemon deep-merges its config, so re-running on an already-claimed
         // sandbox just rotates the credential.
         // A rebound daemon may have booted without the env the cache says it has.
-        if (resume)
+        if (revalidate)
           await pushSandboxEnv(provider, sandbox.sandboxHandle, runEnv);
         else await pushEnvIfChanged(provider, sandbox, runEnv);
         markTurn(runId, "env-pushed");
@@ -710,7 +728,7 @@ export class SandboxDispatchClient {
             signal: input.signal,
           }),
           // A continuation's `start` is dropped downstream, so don't re-stamp it.
-          resume ? null : modelEnv.CLAUDE_CODE_MODEL,
+          resume ? null : (modelEnv.CODEX_MODEL ?? modelEnv.CLAUDE_CODE_MODEL),
           credentialProviderId,
         );
       })();
@@ -787,6 +805,7 @@ export async function* dispatchWithContinuation(args: {
   aborted: () => boolean;
   dispatchOnce: (
     resume: { reason: string } | null,
+    revalidate: boolean,
   ) => AsyncIterable<UIMessageChunk>;
   /**
    * Ask the infrastructure why the sandbox went away, once it has. Answers the
@@ -815,7 +834,10 @@ export async function* dispatchWithContinuation(args: {
   for (let attempt = 1; ; attempt++) {
     let progressed = false;
     try {
-      for await (const chunk of args.dispatchOnce(resume)) {
+      for await (const chunk of args.dispatchOnce(
+        resume,
+        attempt > 1 || args.resume !== null,
+      )) {
         progressed = true;
         if ((chunk as { type?: string }).type === "start") {
           if (forwardedStart) continue;
@@ -852,7 +874,11 @@ export async function* dispatchWithContinuation(args: {
         reason: err.message,
         termination: infra,
       });
-      resume = { reason: resumeReason(err.message, infra) };
+      // A stale binding can fail before the harness starts. Preserve its saved
+      // conversation instead of treating an unstarted turn as interrupted.
+      if (forwardedStart) {
+        resume = { reason: resumeReason(err.message, infra) };
+      }
     }
   }
 }

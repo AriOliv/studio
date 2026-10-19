@@ -827,6 +827,7 @@ export function ActiveTaskProvider({
   const t = useT();
   const voiceEnabled = useOrgFlag("voice_mode");
   const sandboxOnlyChats = useSandboxOnlyChats();
+  const codexChats = useOrgFlag("chat_harness_codex");
   const { virtualMcpId, activeTask, currentBranch } = useChatTask();
   const hostedRuntimeBlocked = shouldBlockHostedRuntime(activeTask?.harness_id);
   const hostedRuntimeBlockedMessage = t("chat.input.codingAgentUnavailable");
@@ -1261,7 +1262,11 @@ export function ActiveTaskProvider({
     if (!activeTask?.harness_id) {
       manager.patchThread({
         id: capturedTaskId,
-        harness_id: sandboxOnlyChats ? "claude-code" : "decopilot",
+        harness_id: sandboxOnlyChats
+          ? codexChats
+            ? "codex"
+            : "claude-code"
+          : "decopilot",
         updated_at: new Date().toISOString(),
       });
     }
@@ -1293,7 +1298,7 @@ export function ActiveTaskProvider({
           stashPendingBody(capturedTaskId, message);
           const delivery = await conn.enqueue(message, requestOptions);
           if (delivery.kind === "live") {
-            // Delivered into the running claude-code turn: no queue entry. It
+            // Delivered into the running sandbox turn: no queue entry. It
             // shows in the body, and moves to where the agent read it once the
             // run says so (`data-live-message`).
             dropPendingBody(capturedTaskId, message.id);
@@ -1574,7 +1579,8 @@ export function ActiveTaskProvider({
       // Claude Code cannot take an injected tool result; the server resolves the part.
       if (
         action.kind === "toolOutput" &&
-        activeTask?.harness_id === "claude-code"
+        (activeTask?.harness_id === "claude-code" ||
+          activeTask?.harness_id === "codex")
       ) {
         const { response } = (action.output ?? {}) as { response?: unknown };
         await conn.submit(
