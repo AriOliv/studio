@@ -326,9 +326,7 @@ export async function getValidDownstreamAccessToken(params: {
   if (!accessToken) return { state: "refresh_failed", accessToken: null };
   // The refresh stored the new expiry; a store that failed keeps the old
   // one, which only understates the new token's life.
-  const stored = await tokenStorage
-    .get(connectionId, userId)
-    .catch(() => null);
+  const stored = await tokenStorage.get(connectionId, userId).catch(() => null);
   return {
     state: "refreshed",
     accessToken,

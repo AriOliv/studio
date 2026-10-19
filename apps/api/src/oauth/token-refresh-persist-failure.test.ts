@@ -89,3 +89,68 @@ describe("refreshAndStore — storage failures don't throw", () => {
     expect(expiresAt.getTime()).toBeLessThanOrEqual(Date.now());
   });
 });
+
+describe("refreshAndStore — per-user single-flight", () => {
+  // Two members of one per-user connection share its connectionId. Their
+  // refreshes must not collapse into one in-flight promise: that would hand
+  // one member the other's access token.
+  it("never resolves one member's refresh with another member's token", async () => {
+    const releases: Array<() => void> = [];
+    mockRefreshAccessToken.mockImplementation(async (...args: unknown[]) => {
+      const token = args[0] as DownstreamToken;
+      await new Promise<void>((resolve) => releases.push(resolve));
+      return {
+        success: true,
+        accessToken: `new-for-${token.userId}`,
+        expiresIn: 3600,
+      };
+    });
+    const storage = fakeStorage({ upsert: vi.fn().mockResolvedValue({}) });
+    const memberA = { ...baseToken, userId: "user_a", refreshToken: "ra" };
+    const memberB = { ...baseToken, userId: "user_b", refreshToken: "rb" };
+
+    const a = refreshAndStore(memberA, storage);
+    const b = refreshAndStore(memberB, storage);
+    // Both are in flight at once: each must have made its own IdP call.
+    expect(mockRefreshAccessToken).toHaveBeenCalledTimes(2);
+    for (const release of releases) release();
+
+    await expect(a).resolves.toBe("new-for-user_a");
+    await expect(b).resolves.toBe("new-for-user_b");
+  });
+
+  it("still collapses concurrent refreshes of the same member", async () => {
+    let release: () => void = () => {};
+    mockRefreshAccessToken.mockImplementation(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { success: true, accessToken: "once", expiresIn: 3600 };
+    });
+    const storage = fakeStorage({ upsert: vi.fn().mockResolvedValue({}) });
+    const member = { ...baseToken, userId: "user_a" };
+
+    const first = refreshAndStore(member, storage);
+    const second = refreshAndStore(member, storage);
+    expect(mockRefreshAccessToken).toHaveBeenCalledTimes(1);
+    release();
+
+    await expect(first).resolves.toBe("once");
+    await expect(second).resolves.toBe("once");
+  });
+
+  it("clears every member's backoff when the connection's is cleared", async () => {
+    mockRefreshAccessToken.mockResolvedValue({ success: false });
+    const storage = fakeStorage({});
+    const member = { ...baseToken, userId: "user_a" };
+
+    await refreshAndStore(member, storage);
+    // Inside the window: no second IdP call.
+    await refreshAndStore(member, storage);
+    expect(mockRefreshAccessToken).toHaveBeenCalledTimes(1);
+
+    clearRefreshBackoff(baseToken.connectionId);
+    await refreshAndStore(member, storage);
+    expect(mockRefreshAccessToken).toHaveBeenCalledTimes(2);
+  });
+});
