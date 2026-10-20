@@ -142,11 +142,13 @@ describe("looksLikeOAuthWwwAuthenticate", () => {
       ),
     ).toBe(true);
   });
-  test("true for standard OAuth hints (invalid_token / oauth)", () => {
+  test("false for a bare RFC 6750 invalid_token or OAuth realm", () => {
+    // A static-bearer MCP (e.g. ComfyUI) answers this way. Treating it as OAuth
+    // sent the client into AS discovery, which 502'd and broke the connection UI.
     expect(looksLikeOAuthWwwAuthenticate('Bearer error="invalid_token"')).toBe(
-      true,
+      false,
     );
-    expect(looksLikeOAuthWwwAuthenticate("OAuth realm=mcp")).toBe(true);
+    expect(looksLikeOAuthWwwAuthenticate("OAuth realm=mcp")).toBe(false);
   });
   test("false for a bare Bearer/API-key challenge", () => {
     expect(looksLikeOAuthWwwAuthenticate('Bearer realm="api"')).toBe(false);

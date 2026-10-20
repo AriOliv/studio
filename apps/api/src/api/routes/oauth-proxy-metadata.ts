@@ -115,9 +115,9 @@ export function isAuthServerMetadata(data: Record<string, unknown>): boolean {
 }
 
 /**
- * Whether a `WWW-Authenticate` value is a *meaningful* OAuth challenge. MCP
- * OAuth uses RFC 9728 `resource_metadata=` (strong signal); we also accept
- * standard OAuth error hints for servers that don't implement RFC 9728.
+ * Whether a `WWW-Authenticate` value is a *meaningful* OAuth challenge: only an
+ * RFC 9728 `resource_metadata=` counts. OAuth servers that don't send it are
+ * still found by `checkHasOAuthMetadata`.
  */
 export function looksLikeOAuthWwwAuthenticate(wwwAuth: string): boolean {
   // Only RFC 9728 `resource_metadata=` reliably signals an OAuth-protected MCP
