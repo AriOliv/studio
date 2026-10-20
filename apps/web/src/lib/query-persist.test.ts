@@ -17,10 +17,11 @@ import {
 } from "./query-persist";
 import { KEYS } from "./query-keys";
 
-// Vite `define`s this at build time; bun test has no such pass.
-declare const __STUDIO_VERSION__: string;
-(globalThis as unknown as Record<string, string>).__STUDIO_VERSION__ ??=
-  "test-version";
+// Vite `define`s this at build time; bun test has no such pass. It is the
+// persisted cache's buster (a per-build id, so every deploy invalidates).
+declare const __STUDIO_BUILD_ID__: string;
+(globalThis as unknown as Record<string, string>).__STUDIO_BUILD_ID__ ??=
+  "test-build";
 
 // readCachedOrg/writeCachedOrg early-return when `window` is undefined. Bun's
 // test runtime has no DOM, so stub a minimal window + localStorage.
@@ -193,7 +194,7 @@ describe("hydrateQueryClient", () => {
     localStorageStub.setItem(
       "studio:rq-cache",
       JSON.stringify({
-        buster: __STUDIO_VERSION__,
+        buster: __STUDIO_BUILD_ID__,
         timestamp: Date.now(),
         state: dehydrate(source, { shouldDehydrateQuery: () => true }),
       }),

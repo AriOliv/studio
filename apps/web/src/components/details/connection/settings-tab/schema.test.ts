@@ -1,9 +1,13 @@
 import { expect, test } from "bun:test";
 import { configurationScopesFor, connectionFormSchema } from "./schema";
 
+// The form always hydrates auth_mode (index.tsx defaults it to "shared"), so
+// every fixture carries it — otherwise a rejection could come from the missing
+// field instead of the property under test.
 const base = {
   title: "My connection",
   ui_type: "HTTP" as const,
+  auth_mode: "shared" as const,
 };
 
 test("rejects a non-URL connection_url for HTTP connections", () => {
@@ -27,8 +31,19 @@ test("does not require a URL shape for non-HTTP ui_types", () => {
     title: "My command",
     ui_type: "STDIO",
     stdio_command: "node server.js",
+    auth_mode: "shared",
   });
   expect(result.success).toBe(true);
+});
+
+test("requires auth_mode to be shared or per_user", () => {
+  const ok = { ...base, connection_url: "https://example.com/mcp" };
+  expect(
+    connectionFormSchema.safeParse({ ...ok, auth_mode: "per_user" }).success,
+  ).toBe(true);
+  expect(
+    connectionFormSchema.safeParse({ ...ok, auth_mode: "everyone" }).success,
+  ).toBe(false);
 });
 
 test("adds a declared scope once its binding is set", () => {
