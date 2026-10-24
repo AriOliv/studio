@@ -203,9 +203,18 @@ export const ConnectionCreateDataSchema = ConnectionEntitySchema.omit({
 export type ConnectionCreateData = z.infer<typeof ConnectionCreateDataSchema>;
 
 /**
- * Input schema for updating connections
+ * Input schema for updating connections.
+ *
+ * `auth_mode` is re-declared WITHOUT the entity default: `.partial()` keeps
+ * `.default("shared")`, and the MCP SDK hands the handler the *parsed* input,
+ * so any update that omitted the field (status toggle, the post-OAuth tools
+ * refetch, a config save) silently flipped every `per_user` connection back
+ * to `shared`. An update must only carry `auth_mode` when the caller sent it.
  */
-export const ConnectionUpdateDataSchema = ConnectionEntitySchema.partial();
+export const ConnectionUpdateDataSchema =
+  ConnectionEntitySchema.partial().extend({
+    auth_mode: z.enum(["shared", "per_user"]).optional(),
+  });
 
 export type ConnectionUpdateData = z.infer<typeof ConnectionUpdateDataSchema>;
 

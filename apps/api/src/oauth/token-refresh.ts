@@ -61,10 +61,22 @@ export function needsTokenEndpointReresolution(
   }
 }
 
+/**
+ * In-process single-flight and backoff are keyed per grant, not per
+ * connection: a `per_user` connection holds one grant per member, and one
+ * member's dead refresh token must not suppress (or be collapsed into)
+ * another member's refresh.
+ */
+function grantKey(token: Pick<DownstreamToken, "connectionId" | "userId">) {
+  return token.userId
+    ? `${token.connectionId}\u0000${token.userId}`
+    : token.connectionId;
+}
+
 const inflightRefreshes = new Map<string, Promise<string | null>>();
 
 /**
- * Negative-cache for failed refreshes, keyed by connection. Single-flight
+ * Negative-cache for failed refreshes, keyed by grant. Single-flight
  * (`inflightRefreshes`) only collapses *concurrent* refreshes; without this a
  * down token endpoint (e.g. an upstream Cloudflare 525) is re-hit on every
  * *sequential* proxy request — N requests = N network calls + N error logs.
@@ -81,52 +93,101 @@ const refreshBackoff = new Map<
   { attempt: number; nextAttemptAt: number }
 >();
 
-/** Drop the suppression window for a connection (or all). Test/reconnect hook. */
+/**
+ * Drop the suppression window for a connection (every member's grant on it)
+ * or for all connections. Test/reconnect hook.
+ */
 export function clearRefreshBackoff(connectionId?: string): void {
-  if (connectionId) refreshBackoff.delete(connectionId);
-  else refreshBackoff.clear();
+  if (!connectionId) {
+    refreshBackoff.clear();
+    return;
+  }
+  for (const key of refreshBackoff.keys()) {
+    if (key === connectionId || key.startsWith(`${connectionId}\u0000`)) {
+      refreshBackoff.delete(key);
+    }
+  }
 }
 
+/**
+ * Redeem the refresh token and persist the result. Runs under the
+ * cross-process grant lock: upstream refresh tokens are single-use and
+ * rotate, so two replicas redeeming the same one in parallel leave the loser
+ * with `invalid_grant`. Inside the lock we re-read the row first — if another
+ * process already rotated it, its access token is reused and the upstream is
+ * not called at all.
+ */
 async function refreshAndStoreOnce(
   token: DownstreamToken,
   tokenStorage: DownstreamTokenStorage,
 ): Promise<string | null> {
-  const result = await refreshAccessToken(token);
-  if (!result.success || !result.accessToken) {
-    // Only delete the cached row when the OAuth server told us the
-    // refresh_token is permanently invalid (RFC 6749: 400 invalid_grant).
-    // Transient failures (5xx, network, parse errors, non-spec status codes)
-    // must not nuke the user's auth — that turns every blip in the upstream
-    // OAuth server into a forced manual reconnect.
-    if (result.permanent === true) {
-      await tokenStorage.delete(token.connectionId, token.userId);
-    }
-    return null;
-  }
-  await tokenStorage.upsert({
-    connectionId: token.connectionId,
-    userId: token.userId,
-    accessToken: result.accessToken,
-    refreshToken: result.refreshToken ?? token.refreshToken,
-    scope: result.scope ?? token.scope,
-    expiresAt: result.expiresIn
-      ? new Date(Date.now() + result.expiresIn * 1000)
-      : null,
-    clientId: token.clientId,
-    clientSecret: token.clientSecret,
-    tokenEndpoint: token.tokenEndpoint,
-  });
-  return result.accessToken;
+  return await tokenStorage.withGrantLock(
+    token.connectionId,
+    token.userId,
+    async (locked) => {
+      const current = await locked.get(token.connectionId, token.userId);
+      if (!current) {
+        // Deleted while we waited (revoked upstream / user disconnected).
+        return null;
+      }
+      if (
+        current.refreshToken !== token.refreshToken &&
+        !locked.isExpired(current, PROACTIVE_REFRESH_BUFFER_MS)
+      ) {
+        // Another process already rotated this grant; use its result.
+        return current.accessToken;
+      }
+
+      // The caller may have re-resolved the token endpoint (see
+      // `needsTokenEndpointReresolution`); the stored one is the fallback.
+      const toRefresh: DownstreamToken = {
+        ...current,
+        tokenEndpoint: token.tokenEndpoint ?? current.tokenEndpoint,
+      };
+      const result = await refreshAccessToken(toRefresh);
+      if (!result.success || !result.accessToken) {
+        // Only delete the cached row when the OAuth server told us the
+        // refresh_token is permanently invalid (RFC 6749: 400 invalid_grant),
+        // and only if the row still holds the token that was rejected.
+        // Transient failures (5xx, network, parse errors, non-spec status
+        // codes) must not nuke the user's auth — that turns every blip in
+        // the upstream OAuth server into a forced manual reconnect.
+        if (result.permanent === true && current.refreshToken) {
+          await locked.deleteIfRefreshTokenMatches(
+            current.connectionId,
+            current.userId,
+            current.refreshToken,
+          );
+        }
+        return null;
+      }
+      await locked.upsert({
+        connectionId: current.connectionId,
+        userId: current.userId,
+        accessToken: result.accessToken,
+        refreshToken: result.refreshToken ?? current.refreshToken,
+        scope: result.scope ?? current.scope,
+        expiresAt: result.expiresIn
+          ? new Date(Date.now() + result.expiresIn * 1000)
+          : null,
+        clientId: current.clientId,
+        clientSecret: current.clientSecret,
+        tokenEndpoint: toRefresh.tokenEndpoint,
+      });
+      return result.accessToken;
+    },
+  );
 }
 
 export function refreshAndStore(
   token: DownstreamToken,
   tokenStorage: DownstreamTokenStorage,
 ): Promise<string | null> {
-  const existing = inflightRefreshes.get(token.connectionId);
+  const key = grantKey(token);
+  const existing = inflightRefreshes.get(key);
   if (existing) return existing;
 
-  const backoff = refreshBackoff.get(token.connectionId);
+  const backoff = refreshBackoff.get(key);
   if (backoff && Date.now() < backoff.nextAttemptAt) {
     // Still inside the suppression window from a recent failure — skip the
     // network call (and its log) and report failure to the caller as usual.
@@ -136,9 +197,9 @@ export function refreshAndStore(
   const refresh = refreshAndStoreOnce(token, tokenStorage)
     .then((accessToken) => {
       if (accessToken) {
-        refreshBackoff.delete(token.connectionId);
+        refreshBackoff.delete(key);
       } else {
-        const attempt = refreshBackoff.get(token.connectionId)?.attempt ?? 0;
+        const attempt = refreshBackoff.get(key)?.attempt ?? 0;
         const delay = exponentialBackoffWithJitter(
           REFRESH_BACKOFF_CAP_MS,
           REFRESH_BACKOFF_BASE_MS,
@@ -146,7 +207,7 @@ export function refreshAndStore(
           2,
           0.5,
         );
-        refreshBackoff.set(token.connectionId, {
+        refreshBackoff.set(key, {
           attempt: attempt + 1,
           nextAttemptAt: Date.now() + delay,
         });
@@ -154,9 +215,9 @@ export function refreshAndStore(
       return accessToken;
     })
     .finally(() => {
-      inflightRefreshes.delete(token.connectionId);
+      inflightRefreshes.delete(key);
     });
-  inflightRefreshes.set(token.connectionId, refresh);
+  inflightRefreshes.set(key, refresh);
   return refresh;
 }
 
