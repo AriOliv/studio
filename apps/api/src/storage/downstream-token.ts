@@ -14,10 +14,25 @@
  * (see migration 170-zz-per-user-oauth).
  */
 
-import type { Kysely } from "kysely";
+import { createHash } from "node:crypto";
+import { type Kysely, sql } from "kysely";
 import type { CredentialVault } from "../encryption/credential-vault";
 import type { Database, DownstreamToken } from "./types";
 import { generatePrefixedId } from "@decocms/shared/utils/generate-id";
+
+/**
+ * Hash `(connectionId, userId)` to a signed int64 for `pg_advisory_xact_lock`.
+ * Shared and per-user grants of the same connection get different keys.
+ */
+function grantLockKey(connectionId: string, userId: string | null): bigint {
+  return createHash("sha256")
+    .update("downstream-token:")
+    .update(connectionId)
+    .update("\x00")
+    .update(userId ?? "")
+    .digest()
+    .readBigInt64BE(0);
+}
 
 /**
  * Data for creating/updating a downstream token
@@ -148,6 +163,82 @@ export class DownstreamTokenStorage {
       ? base.where("userId", "=", userId)
       : base.where("userId", "is", null)
     ).execute();
+  }
+
+  /**
+   * Delete the row only if it still holds `expectedRefreshToken`. Returns
+   * true when a row was deleted.
+   *
+   * Used after an `invalid_grant`: with rotating refresh tokens, that answer
+   * can also mean "another process already redeemed this token and stored the
+   * successor". Deleting unconditionally would wipe the fresh row and force
+   * the member to reconnect; comparing first keeps the successor.
+   */
+  async deleteIfRefreshTokenMatches(
+    connectionId: string,
+    userId: string | null,
+    expectedRefreshToken: string,
+  ): Promise<boolean> {
+    return await this.transactional(async (trx) => {
+      const base = trx
+        .selectFrom("downstream_tokens")
+        .select(["id", "refreshToken"])
+        .where("connectionId", "=", connectionId)
+        .forUpdate();
+      const row = await (userId
+        ? base.where("userId", "=", userId)
+        : base.where("userId", "is", null)
+      ).executeTakeFirst();
+      if (!row?.refreshToken) return false;
+      let stored: string;
+      try {
+        stored = await this.vault.decrypt(row.refreshToken);
+      } catch {
+        // Undecryptable row (key rotation): it's useless either way.
+        stored = expectedRefreshToken;
+      }
+      if (stored !== expectedRefreshToken) return false;
+      await trx
+        .deleteFrom("downstream_tokens")
+        .where("id", "=", row.id)
+        .execute();
+      return true;
+    });
+  }
+
+  /**
+   * Serialize `fn` across every process of this deployment for one
+   * (connection, user) grant. Postgres advisory lock, transaction-scoped: it
+   * is released on commit, rollback or connection drop, so a crashed pod never
+   * strands a grant. The callback receives a storage view bound to the lock's
+   * transaction so its reads see what the previous holder committed.
+   *
+   * Needed because the upstream refresh_token is single-use and rotates: two
+   * replicas redeeming the same token in parallel leaves the loser with
+   * `invalid_grant` and, before this lock, with the winner's fresh row
+   * deleted.
+   */
+  async withGrantLock<T>(
+    connectionId: string,
+    userId: string | null,
+    fn: (store: DownstreamTokenStorage) => Promise<T>,
+  ): Promise<T> {
+    const key = grantLockKey(connectionId, userId);
+    return await this.transactional(async (trx) => {
+      await sql`select pg_advisory_xact_lock(${key}::bigint)`.execute(trx);
+      return await fn(new DownstreamTokenStorage(trx, this.vault));
+    });
+  }
+
+  /**
+   * Run `fn` in a transaction, reusing the current one when this storage was
+   * built on a transaction (Kysely rejects nested `transaction()` calls).
+   */
+  private transactional<T>(
+    fn: (trx: Kysely<Database>) => Promise<T>,
+  ): Promise<T> {
+    if (this.db.isTransaction) return fn(this.db);
+    return this.db.transaction().execute(fn);
   }
 
   /**

@@ -239,6 +239,12 @@ export const ConnectionUpdateDataSchema =
   ConnectionEntitySchema.partial().extend({
     // null keeps the current slug, so a fetched entity can be sent back as is.
     url_slug: UrlSlugSchema.nullish(),
+    // Re-declared WITHOUT the entity default: `.partial()` keeps
+    // `.default("shared")`, and the MCP SDK hands the handler the *parsed*
+    // input, so any update that omitted the field (status toggle, the
+    // post-OAuth tools refetch, a config save) silently flipped every
+    // `per_user` connection back to `shared`.
+    auth_mode: z.enum(["shared", "per_user"]).optional(),
   });
 
 export type ConnectionUpdateData = z.infer<typeof ConnectionUpdateDataSchema>;

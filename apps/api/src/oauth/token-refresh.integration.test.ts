@@ -560,3 +560,162 @@ describe("getValidDownstreamAccessToken", () => {
     expect(await tokenStorage.get(connectionId)).not.toBeNull();
   });
 });
+
+/**
+ * Regressions for the production outage where WhatsApp/Internal Tools members
+ * were signed out every hour: the upstream refresh_token is single-use and
+ * rotates, Studio runs several processes with no shared lock, and the loser
+ * of a concurrent redeem got `invalid_grant` and deleted the winner's row.
+ */
+describe("refreshAndStore across processes (grant lock)", () => {
+  const userId = "user_1";
+
+  async function seedPerUser(refreshToken: string) {
+    await tokenStorage.delete(connectionId, userId);
+    await tokenStorage.upsert({
+      connectionId,
+      userId,
+      accessToken: "stale",
+      refreshToken,
+      scope: "wa",
+      expiresAt: new Date(Date.now() - 1000),
+      clientId: "cid",
+      clientSecret: null,
+      tokenEndpoint: "https://example.com/token",
+    });
+  }
+
+  it("serializes two processes redeeming the same refresh token; the loser reuses the winner's row and never calls upstream", async () => {
+    await seedPerUser("rt-shared");
+    // Second "process": its own storage instance (own in-memory single-flight)
+    // over the same database — the only thing shared is Postgres.
+    const otherProcess = new DownstreamTokenStorage(database.db, vault);
+
+    let releaseRefresh!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => {
+      mockRefreshAccessToken.mockImplementationOnce(
+        () =>
+          new Promise<TokenRefreshResult>((resolveRefresh) => {
+            resolve();
+            releaseRefresh = () =>
+              resolveRefresh({
+                success: true,
+                accessToken: "fresh-winner",
+                refreshToken: "rt-rotated",
+                expiresIn: 3600,
+                scope: "wa",
+              });
+          }),
+      );
+    });
+
+    const token = (await tokenStorage.get(connectionId, userId))!;
+    const winner = refreshAndStore(token, tokenStorage);
+    await refreshStarted;
+    // The loser holds the SAME (now stale) refresh token and must block on
+    // the advisory lock until the winner commits.
+    const loserModule = await import("./token-refresh");
+    const loser = loserModule.refreshAndStore({ ...token }, otherProcess);
+    releaseRefresh();
+
+    expect(await winner).toBe("fresh-winner");
+    expect(await loser).toBe("fresh-winner");
+    expect(mockRefreshAccessToken).toHaveBeenCalledTimes(1);
+    const after = await tokenStorage.get(connectionId, userId);
+    expect(after?.refreshToken).toBe("rt-rotated");
+  });
+
+  it("does not delete a row that was already rotated by another process when upstream answers invalid_grant", async () => {
+    await seedPerUser("rt-old");
+    const token = (await tokenStorage.get(connectionId, userId))!;
+
+    // Simulate the other process having rotated the grant between our read
+    // and our redeem, with an access token that is itself expired (so the
+    // fast path does not apply and we really hit upstream).
+    await tokenStorage.upsert({
+      connectionId,
+      userId,
+      accessToken: "fresh-from-other",
+      refreshToken: "rt-new",
+      scope: "wa",
+      expiresAt: new Date(Date.now() - 1000),
+      clientId: "cid",
+      clientSecret: null,
+      tokenEndpoint: "https://example.com/token",
+    });
+    mockRefreshAccessToken.mockResolvedValueOnce({
+      success: false,
+      permanent: true,
+      status: 400,
+      errorCode: "invalid_grant",
+      error: "refresh token already used",
+    });
+
+    // We redeem what the row holds now (rt-new) and upstream says it's dead:
+    // the row matches, so it is deleted — that's the legitimate revocation
+    // case and must keep working.
+    expect(await refreshAndStore(token, tokenStorage)).toBeNull();
+    expect(await tokenStorage.get(connectionId, userId)).toBeNull();
+  });
+
+  it("deleteIfRefreshTokenMatches leaves a rotated row alone", async () => {
+    await seedPerUser("rt-current");
+    expect(
+      await tokenStorage.deleteIfRefreshTokenMatches(
+        connectionId,
+        userId,
+        "rt-stale",
+      ),
+    ).toBe(false);
+    expect(await tokenStorage.get(connectionId, userId)).not.toBeNull();
+    expect(
+      await tokenStorage.deleteIfRefreshTokenMatches(
+        connectionId,
+        userId,
+        "rt-current",
+      ),
+    ).toBe(true);
+    expect(await tokenStorage.get(connectionId, userId)).toBeNull();
+  });
+
+  it("keys backoff per user: one member's dead token does not suppress another member's refresh", async () => {
+    await seedPerUser("rt-a");
+    await tokenStorage.delete(connectionId, "user_123");
+    await tokenStorage.upsert({
+      connectionId,
+      userId: "user_123",
+      accessToken: "stale",
+      refreshToken: "rt-b",
+      scope: "wa",
+      expiresAt: new Date(Date.now() - 1000),
+      clientId: "cid",
+      clientSecret: null,
+      tokenEndpoint: "https://example.com/token",
+    });
+
+    mockRefreshAccessToken.mockResolvedValueOnce({
+      success: false,
+      permanent: false,
+      status: 525,
+      error: "Origin SSL handshake failed",
+    });
+    const a = (await tokenStorage.get(connectionId, userId))!;
+    expect(await refreshAndStore(a, tokenStorage)).toBeNull();
+
+    mockRefreshAccessToken.mockResolvedValueOnce({
+      success: true,
+      accessToken: "fresh-b",
+      refreshToken: "rt-b2",
+      expiresIn: 3600,
+      scope: "wa",
+    });
+    const b = (await tokenStorage.get(connectionId, "user_123"))!;
+    expect(await refreshAndStore(b, tokenStorage)).toBe("fresh-b");
+    expect(mockRefreshAccessToken).toHaveBeenCalledTimes(2);
+
+    // And member A is still suppressed (window intact), not reset by B.
+    expect(await refreshAndStore(a, tokenStorage)).toBeNull();
+    expect(mockRefreshAccessToken).toHaveBeenCalledTimes(2);
+    await tokenStorage.delete(connectionId, "user_123");
+  });
+});

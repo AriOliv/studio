@@ -18,6 +18,7 @@ import { CircuitOpenError, resetAll } from "./circuit-breaker";
 import { createLazyClient } from "./lazy-client";
 import type { ConnectionEntity } from "../tools/connection/schema";
 import type { StudioContext } from "../core/studio-context";
+import { PerUserAuthorizationRequiredError } from "./outbound/errors";
 
 // Mock clientFromConnection — we control when it succeeds/fails
 const clientFromConnectionMock = mock(() =>
@@ -464,5 +465,87 @@ describe("lazy-client on the self connection", () => {
 
     expect(tools.map((t) => t.name)).toEqual(["echo"]);
     expect(listManagementToolsMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Regression for the production outage where three members with stale tokens
+ * opened the breaker and every member then got 503 for 30s: an auth rejection
+ * is a credential problem for one caller, never evidence of an outage.
+ */
+describe("lazy-client circuit breaker ignores downstream auth errors", () => {
+  beforeEach(() => {
+    resetAll();
+    clientFromConnectionMock.mockReset();
+  });
+
+  const authErrors: Array<[string, () => Error]> = [
+    [
+      "StreamableHTTPError 401",
+      () =>
+        Object.assign(
+          new Error(
+            "Streamable HTTP error: Error POSTing to endpoint (HTTP 401): Unauthorized",
+          ),
+          { code: 401 },
+        ),
+    ],
+    [
+      "StreamableHTTPError 403",
+      () =>
+        Object.assign(new Error("Streamable HTTP error: forbidden"), {
+          code: 403,
+        }),
+    ],
+    [
+      "SDK UnauthorizedError",
+      () =>
+        Object.assign(new Error("Unauthorized"), { name: "UnauthorizedError" }),
+    ],
+    [
+      "PerUserAuthorizationRequiredError",
+      () =>
+        new PerUserAuthorizationRequiredError({
+          connectionId: fakeConnection.id,
+          connectionTitle: "WhatsApp",
+          authorizeUrl: "https://studio.example/authorize",
+        }),
+    ],
+    [
+      "error carrying status 401",
+      () => Object.assign(new Error("request failed"), { status: 401 }),
+    ],
+  ];
+
+  for (const [label, make] of authErrors) {
+    it(`${label}: five in a row keep the circuit closed`, async () => {
+      clientFromConnectionMock.mockImplementation(() => Promise.reject(make()));
+      for (let i = 0; i < 5; i++) {
+        const lazy = createLazyClient(fakeConnection, fakeCtx, false);
+        await expect(lazy.listTools()).rejects.toThrow();
+      }
+      // A real downstream recovers immediately — no CircuitOpenError.
+      const realClient = await createWorkingClient();
+      clientFromConnectionMock.mockResolvedValue(realClient);
+      const lazy = createLazyClient(fakeConnection, fakeCtx, false);
+      const result = await lazy.listTools();
+      expect(result.tools).toHaveLength(1);
+    });
+  }
+
+  it("a genuine outage (ECONNREFUSED) still opens the circuit after 3 failures", async () => {
+    clientFromConnectionMock.mockImplementation(() =>
+      Promise.reject(
+        Object.assign(new Error("fetch failed: ECONNREFUSED"), {
+          code: "ECONNREFUSED",
+        }),
+      ),
+    );
+    for (let i = 0; i < 3; i++) {
+      const lazy = createLazyClient(fakeConnection, fakeCtx, false);
+      await expect(lazy.listTools()).rejects.toThrow("ECONNREFUSED");
+    }
+    const lazy = createLazyClient(fakeConnection, fakeCtx, false);
+    await expect(lazy.listTools()).rejects.toThrow(CircuitOpenError);
   });
 });

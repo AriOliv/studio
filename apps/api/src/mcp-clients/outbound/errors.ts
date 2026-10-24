@@ -43,6 +43,36 @@ export function isPerUserAuthorizationRequiredError(
 }
 
 /**
+ * A downstream 401/403 is a credential problem for THIS caller (expired or
+ * revoked token, member not yet connected), not evidence that the server is
+ * down. The circuit breaker exists to bound latency on an unreachable server;
+ * counting auth rejections opens it after three members with stale tokens and
+ * then 503s everyone, including members whose tokens are fine.
+ *
+ * Covers our own `PerUserAuthorizationRequiredError`, the MCP SDK's
+ * `UnauthorizedError` / `StreamableHTTPError(401|403)` / `SseError(401)`, and
+ * any error carrying an HTTP status or `401` in its message (the SDK formats
+ * transport failures as "Error POSTing to endpoint (HTTP 401): ...").
+ */
+export function isDownstreamAuthError(error: unknown): boolean {
+  if (isPerUserAuthorizationRequiredError(error)) return true;
+  if (!(error instanceof Error)) return false;
+  const code = (error as { code?: unknown }).code;
+  const status = (error as { status?: unknown }).status;
+  if (code === 401 || code === 403 || status === 401 || status === 403) {
+    return true;
+  }
+  const message = error.message.toLowerCase();
+  return (
+    error.name === "UnauthorizedError" ||
+    message.includes("http 401") ||
+    message.includes("http 403") ||
+    message.includes("unauthorized") ||
+    message.includes("invalid_token")
+  );
+}
+
+/**
  * Render a `PerUserAuthorizationRequiredError` as an HTTP 401 response that
  * non-browser MCP clients (Claude Desktop, Cursor, etc.) can surface to the
  * end user. The body is intentionally simple and the authorize URL is also

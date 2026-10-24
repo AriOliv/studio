@@ -32,7 +32,25 @@ export type { TokenRefreshResult } from "./refresh-access-token";
 export type OAuthGrantStore = Pick<
   DownstreamTokenStorage,
   "get" | "delete" | "isExpired"
-> & { upsert(data: DownstreamTokenData): Promise<unknown> };
+> & {
+  upsert(data: DownstreamTokenData): Promise<unknown>;
+  /**
+   * Cross-process serialization of one grant's refresh (see
+   * `DownstreamTokenStorage.withGrantLock`). Stores without it refresh
+   * unlocked, as before.
+   */
+  withGrantLock?<T>(
+    connectionId: string,
+    userId: string | null,
+    fn: (store: OAuthGrantStore) => Promise<T>,
+  ): Promise<T>;
+  /** Delete only if the row still holds this refresh token (rotation-safe). */
+  deleteIfRefreshTokenMatches?(
+    connectionId: string,
+    userId: string | null,
+    expectedRefreshToken: string,
+  ): Promise<boolean>;
+};
 
 export const PROACTIVE_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 
@@ -157,27 +175,83 @@ export function isRefreshBackedOff(connectionId: string): boolean {
   return !!backoff && Date.now() < backoff.nextAttemptAt;
 }
 
+/**
+ * Redeem the refresh token and persist the result. When the store supports
+ * it, runs under the cross-process grant lock: upstream refresh tokens are
+ * single-use and rotate, so two replicas redeeming the same one in parallel
+ * leave the loser with `invalid_grant`. Inside the lock we re-read the row
+ * first — if another process already rotated it, its access token is reused
+ * and the upstream is not called at all.
+ */
 async function refreshAndStoreOnce(
   token: DownstreamToken,
+  tokenStorage: OAuthGrantStore,
+): Promise<{ accessToken: string | null; permanent: boolean }> {
+  if (!tokenStorage.withGrantLock) {
+    return redeemAndPersist(token, token, tokenStorage);
+  }
+  return await tokenStorage.withGrantLock(
+    token.connectionId,
+    token.userId ?? null,
+    async (locked) => {
+      const current = await locked.get(
+        token.connectionId,
+        token.userId ?? null,
+      );
+      if (!current) {
+        // Deleted while we waited (revoked upstream / user disconnected).
+        return { accessToken: null, permanent: false };
+      }
+      if (
+        current.refreshToken !== token.refreshToken &&
+        !locked.isExpired(current, PROACTIVE_REFRESH_BUFFER_MS)
+      ) {
+        // Another process already rotated this grant; use its result.
+        return { accessToken: current.accessToken, permanent: false };
+      }
+      // The caller may have re-resolved the token endpoint (see
+      // `needsTokenEndpointReresolution`); the stored one is the fallback.
+      return redeemAndPersist(
+        {
+          ...current,
+          tokenEndpoint: token.tokenEndpoint ?? current.tokenEndpoint,
+        },
+        current,
+        locked,
+      );
+    },
+  );
+}
+
+async function redeemAndPersist(
+  token: DownstreamToken,
+  stored: DownstreamToken,
   tokenStorage: OAuthGrantStore,
 ): Promise<{ accessToken: string | null; permanent: boolean }> {
   const result = await refreshAccessToken(token);
   if (!result.success || !result.accessToken) {
     // Only delete the cached row when the OAuth server told us the
-    // refresh_token is permanently invalid (RFC 6749: 400 invalid_grant).
+    // refresh_token is permanently invalid (RFC 6749: 400 invalid_grant),
+    // and only if the row still holds the token that was rejected.
     // Transient failures (5xx, network, parse errors, non-spec status codes)
     // must not nuke the user's auth — that turns every blip in the upstream
     // OAuth server into a forced manual reconnect.
     if (result.permanent === true) {
       // Don't let a storage blip surface as an uncaught rejection to callers.
-      await tokenStorage
-        .delete(token.connectionId, token.userId ?? null)
-        .catch((error) => {
-          console.warn("[TokenRefresh] failed to delete dead token row", {
-            connectionId: token.connectionId,
-            message: error instanceof Error ? error.message : String(error),
-          });
+      const remove =
+        tokenStorage.deleteIfRefreshTokenMatches && stored.refreshToken
+          ? tokenStorage.deleteIfRefreshTokenMatches(
+              token.connectionId,
+              token.userId ?? null,
+              stored.refreshToken,
+            )
+          : tokenStorage.delete(token.connectionId, token.userId ?? null);
+      await remove.catch((error) => {
+        console.warn("[TokenRefresh] failed to delete dead token row", {
+          connectionId: token.connectionId,
+          message: error instanceof Error ? error.message : String(error),
         });
+      });
     }
     return { accessToken: null, permanent: result.permanent === true };
   }
