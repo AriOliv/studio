@@ -59,7 +59,7 @@ import {
   ContextFactory,
   createStudioContextFactory,
 } from "../core/context-factory";
-import type { StudioContext } from "../core/studio-context";
+import { getUserId, type StudioContext } from "../core/studio-context";
 import { startSSEHub } from "../event-bus";
 import {
   closeDatabase,
@@ -811,7 +811,24 @@ const oauthProxyHandler: MiddlewareHandler<Env> = async (c) => {
         expires_in?: unknown;
         scope?: unknown;
       };
-      if (typeof parsed.access_token === "string" && parsed.access_token) {
+      // Same scoping rule as POST /connections/:id/oauth-token: a per_user
+      // connection stores the token under the authenticated caller, never in
+      // the shared row — otherwise one member's identity would be served to
+      // every other member (or, in per_user mode, to nobody at all). Without
+      // a caller to attribute the grant to, don't persist: the browser still
+      // receives the token response and posts it back through the
+      // authenticated oauth-token route.
+      const callerId = getUserId(ctx) ?? null;
+      const isPerUser = connection.auth_mode === "per_user";
+      if (isPerUser && !callerId) {
+        console.warn(
+          "[oauth-proxy] per_user token exchange without an authenticated caller — not persisting",
+          { connectionId },
+        );
+      } else if (
+        typeof parsed.access_token === "string" &&
+        parsed.access_token
+      ) {
         const expiresAt =
           typeof parsed.expires_in === "number"
             ? new Date(Date.now() + parsed.expires_in * 1000)
@@ -828,6 +845,7 @@ const oauthProxyHandler: MiddlewareHandler<Env> = async (c) => {
         }
         const tokenData: DownstreamTokenData = {
           connectionId,
+          userId: isPerUser ? callerId : null,
           accessToken: parsed.access_token,
           refreshToken:
             typeof parsed.refresh_token === "string"
